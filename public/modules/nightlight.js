@@ -23,15 +23,29 @@ function parseHHMM(s) {
     return h * 60 + mm;
 }
 
-const startMin = parseHHMM(params.nightlightstart);
-const endMin = parseHHMM(params.nightlightend);
-const enabled = startMin !== null && endMin !== null && startMin !== endMin;
+// Schedule is parsed lazily on first call: config.js imports
+// `isNightLightActive` from this module while this module imports
+// `params` from config.js, so reading `params` at top level would hit
+// the circular-import TDZ and throw.
+let cached = null;
+function schedule() {
+    if (cached) return cached;
+    const startMin = parseHHMM(params.nightlightstart);
+    const endMin = parseHHMM(params.nightlightend);
+    cached = {
+        startMin,
+        endMin,
+        enabled: startMin !== null && endMin !== null && startMin !== endMin,
+    };
+    return cached;
+}
 
 function nowMin(d = new Date()) {
     return d.getHours() * 60 + d.getMinutes();
 }
 
 export function isNightLightActive() {
+    const { enabled, startMin, endMin } = schedule();
     if (!enabled) return false;
     const m = nowMin();
     // Cross-midnight window (e.g. 22:00–06:00) wraps; same-day window
@@ -41,6 +55,7 @@ export function isNightLightActive() {
 }
 
 function msUntilNextBoundary() {
+    const { startMin, endMin } = schedule();
     const d = new Date();
     const m = nowMin(d);
     const target = isNightLightActive() ? endMin : startMin;
@@ -50,7 +65,7 @@ function msUntilNextBoundary() {
 }
 
 export function initNightLight(onBoundary) {
-    if (!enabled) return;
+    if (!schedule().enabled) return;
     console.log(`Night light: ${params.nightlightstart}–${params.nightlightend} (currently ${isNightLightActive() ? 'active' : 'idle'})`);
     const tick = () => {
         try { onBoundary?.(); } catch (e) { console.warn('nightlight onBoundary threw:', e); }
