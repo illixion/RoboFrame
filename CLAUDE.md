@@ -146,3 +146,9 @@ the deadline) is the canary for the wake-advance class of bug.
   protocol, update that block as well as `docs/protocol.md`.
 - `'use strict'` on every server-side `.js` file.
 - Skip transitional language in code comments, write them as if it always worked that way. The Git history is the source of truth for how things evolved.
+
+## Privacy
+
+- Avoid reading user's configuration or data from the DuckDB to preserve data privacy, you are allowed to check schemas and metadata, but never real user data. This applies to all data storage written by this project, including the `data.json` file.
+- Any code that adds calls to external services is expressly forbidden without a clear opt-in from the user. This includes analytics, error reporting, or any third-party API calls. If you want to add such a feature, it must be behind a configuration flag that is disabled by default, and the user must explicitly enable it with a clear understanding of what data is being shared and with whom.
+
