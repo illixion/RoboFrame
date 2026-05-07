@@ -184,7 +184,16 @@ function connectWebSocket() {
       return;
     }
 
-    console.log('Received message of type:', message.action + ' with payload:', message.payload);
+    // Only log actions node-display actually handles. The broker fans out
+    // many slideshow-related frames (playback, tagLists, blockedIds,
+    // displaySync, ...) that this daemon ignores; logging them is noise.
+    const HANDLED = new Set([
+      'displayState', 'setWebcam', 'setBrightness',
+      'setBrightnessStateAware', 'displayDisconnect',
+    ]);
+    if (HANDLED.has(message.action)) {
+      console.log('Received message of type:', message.action + ' with payload:', message.payload);
+    }
 
     switch (message.action) {
       case 'pong':
