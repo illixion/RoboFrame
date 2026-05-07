@@ -120,6 +120,22 @@ the deadline) is the canary for the wake-advance class of bug.
   goes through MQTT discovery.
 - **One DuckDB writer.** `packages/cli` is the only writer. The server
   opens read-only; future schema migrations ship as `packages/cli/sql/*.sql`.
+- **`/get` outputs JPEG, not WebP.** VideoCore on Pi-class hardware has
+  hardware JPEG decode (via MMAL) but no WebP path — software-decoding
+  WebP at 1080p saturates the ARM cores and freezes the kiosk. The
+  `convert` path emits JPEG q95 with a black flatten (covers alpha
+  PNGs); `lowmem=1` re-encodes non-JXL sources too. Don't reintroduce
+  WebP output without a Pi 3 reproducibility check.
+- **`bright` is direct RGB multiply, not alpha.** The old alpha-modulation
+  path was equivalent (alpha-over-black ≡ RGB×α) but JPEG-incompatible.
+  `applyDimAndConvertToJpeg` uses `.linear(dim, 0)`. No contrast bump —
+  it was clipping highlights on already-bright photos.
+- **Night light is a kiosk-side schedule.** `?nightlightstart=HH:MM&
+  nightlightend=HH:MM` on the kiosk URL toggles `bright` on/off at the
+  boundaries via [`public/modules/nightlight.js`](public/modules/nightlight.js).
+  Boundary fires `slideshow.invalidateMediaCache()` because the media
+  cache is keyed by `post.id`, not URL — without invalidation the
+  stale-bright blob would be served on the next playback tick.
 
 ## Style conventions in this repo
 

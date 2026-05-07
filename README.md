@@ -246,8 +246,9 @@ On WebSocket connect, every client receives two initial frames: `tagLists`, `cur
 | `delay` | Initial slideshow interval, seconds (default 15). The orchestrator can override this at runtime. |
 | `noclock` | Boolean (0/1). Hides the clock and date overlay and repositions the corner buttons. |
 | `nosensors` | Boolean (0/1). Hides the sensor readout overlay. |
-| `lowmem` | Boolean (0/1). Collapses the slideshow prefetch window to next-image-only for low-RAM kiosks. |
-| `static`, `ratio`, `convert`, `bright`, `nobutton`, `nobg` | Boolean flags (0/1) |
+| `lowmem` | Boolean (0/1). Collapses the slideshow prefetch window to next-image-only and forces `/get` to re-encode non-JXL sources to JPEG q85. Required for Pi-class kiosks — WebP/PNG software decode at 1080p saturates the ARM cores. |
+| `nightlightstart`, `nightlightend` | `HH:MM` clock window (24h, kiosk local time). While inside the window the kiosk auto-enables `bright` mode. Cross-midnight (e.g. `22:00`–`06:00`) is supported. Either missing or equal disables the schedule. |
+| `static`, `ratio`, `convert`, `bright`, `nobutton`, `nobg` | Boolean flags (0/1). `bright` ambient-dims the image at the server (used for night-light or any always-dim deployment); a manual `bright=1` is OR-ed with the night-light schedule. |
 | `width`, `height` | Screen dimensions used when fetching `/get` |
 | `top-offset` | CSS top padding (notch / overscan) |
 | `list` | Initial tag list index |
@@ -256,14 +257,14 @@ On WebSocket connect, every client receives two initial frames: `tagLists`, `cur
 
 ### imagemirror
 
-`GET /get?id=&convert=&bright=&width=&height=`
-Returns the binary image. `convert=1` decodes JXL → WebP via `djxl`+`sharp`. `bright=1` overlays an opacity layer for low-light viewing.
+`GET /get?id=&convert=&bright=&width=&height=&lowmem=`
+Returns the binary image. `convert=1` decodes JXL via `djxl` and re-encodes to JPEG q95 with a black background flatten. `bright=1` ambient-dims the result for low-light viewing (RGB multiply by 0.32 / 0.20 depending on average image brightness). `lowmem=1` re-encodes non-JXL sources to JPEG q85 so kiosks without WebP/PNG hardware decode (Pi 3 etc.) don't saturate their ARM cores. Animated PNGs always come back as APNG.
 
 `GET /save?id=&ext=`
 Copies the file from `IMAGE_DB_PATH` (or `IMAGE_MIRROR_PATH` fallback) to `SAVE_PATH`. **Local-only**: 404 if not on disk. No third-party fetches, ever.
 
-`GET /history`
-HTML page rendering the last 25 image requests. Thumbnails load via `/get` in parallel from the browser.
+`GET /history?lowmem=`
+HTML page rendering the last 25 image requests. Thumbnails load via `/get` in parallel from the browser. `lowmem=1` propagates into the in-page `/get` URLs for Pi-class kiosks viewing their own history.
 
 `GET /addtohistory?id=`
 Records a post ID in the rolling history without fetching its bytes.

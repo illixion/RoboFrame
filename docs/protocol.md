@@ -232,7 +232,10 @@ mod-tag change, tag-list change, or visibility-driven resume.
 - `mergeDriver` is the deviceId of the active displaySync claimer, or
   `null` when no merge is active.
 - `current` / `next` / `upcoming` are id+ext only — fetch with
-  `GET /get?id=<id>&convert=&bright=&width=&height=`.
+  `GET /get?id=<id>&convert=&bright=&width=&height=&lowmem=`. Server
+  returns JPEG (q95) on the `convert` path and APNG for animated PNG
+  posts; `lowmem=1` re-encodes non-JXL sources to JPEG q85 for kiosks
+  without WebP hardware decode.
 - A new `current.id` is your cue to start loading. Send `imageReady`
   when the transition completes.
 
