@@ -9,6 +9,8 @@ User-facing docs live in [README.md](README.md). This file is for
 Claude — repo orientation, how-to-run, and the few rules that aren't
 obvious from the code.
 
+Spatialstash is a separate app that implements the same protocol in Swift, it is located in the parent folder of this repo, make sure to keep it up-to-date with any protocol changes.
+
 ## Layout
 
 - `imagemirror/` — the server (Express + WebSocket on `/rpc/ws`, MQTT
