@@ -92,6 +92,7 @@
 
     <script>
       const TOKEN = <%- JSON.stringify(token || '') %>;
+      const LOWMEM = <%- JSON.stringify(Number(lowmem) === 1 ? 1 : 0) %>;
       const tokenParam = TOKEN ? '&token=' + encodeURIComponent(TOKEN) : '';
       // Resolve sibling endpoints relative to this page so reverse-proxy
       // subpaths (e.g. /myslideshow/history) keep working.
@@ -107,7 +108,7 @@
           if (!img) return;
           img.onload = () => { img.classList.add('loaded'); if (spinner) spinner.remove(); };
           img.onerror = () => { if (spinner) spinner.textContent = 'Failed'; };
-          img.src = endpoint('get', 'id=' + encodeURIComponent(id) + '&convert=1&bright=0&width=640&height=480' + tokenParam);
+          img.src = endpoint('get', 'id=' + encodeURIComponent(id) + '&convert=1&bright=0&width=640&height=480&lowmem=' + LOWMEM + tokenParam);
         });
       })();
 

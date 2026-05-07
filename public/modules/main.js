@@ -7,8 +7,11 @@ import { state } from './state.js';
 import './tags.js';
 import { connectWebSocket } from './ws-client.js';
 import { bootUi } from './ui.js';
+import { initNightLight } from './nightlight.js';
+import { invalidateMediaCache } from './slideshow.js';
 
 bootUi();
+initNightLight(invalidateMediaCache);
 
 if (params.ws) {
     state.deviceID = params.ws;

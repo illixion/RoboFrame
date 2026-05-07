@@ -155,112 +155,86 @@ async function isImageDark(imageBuffer, sampleStep = 10) {
 }
 
 /**
- * Apply CSS-like filters to an image
- * @param {Buffer|ArrayBuffer} imageBuffer - Raw image data (Buffer from fs.readFile)
- * @param {number} opacity - Opacity between 0 and 1
- * @param {number} width - Target width (optional)
- * @param {number} height - Target height (optional)
- * @returns {Promise<Buffer>} A promise that resolves with the modified image buffer in WebP format
+ * Dim an image for ambient/night-light viewing and emit JPEG.
+ *
+ * Multiplying RGB by `dim` is mathematically equivalent to alpha-blending
+ * the source over a black page background — which is what the kiosk does
+ * — so the dim is applied in colour space directly and the result needs
+ * no alpha channel. JPEG output then plays nicely with hardware decode
+ * on Pi-class hardware.
+ *
+ * @param {Buffer|ArrayBuffer} imageBuffer
+ * @param {number} dim - RGB multiplier in (0, 1].
+ * @param {number} width
+ * @param {number} height
+ * @returns {Promise<Buffer>}
  */
-async function applyFiltersAndConvertToWebp(imageBuffer, opacity, width, height) {
+async function applyDimAndConvertToJpeg(imageBuffer, dim, width, height) {
     if (imageBuffer instanceof ArrayBuffer) {
         imageBuffer = Buffer.from(imageBuffer);
     }
-
-    if (opacity < 0 || opacity > 1) {
-        throw new RangeError('Opacity must be between 0 and 1');
+    if (dim <= 0 || dim > 1) {
+        throw new RangeError('dim must be in (0, 1]');
     }
 
-    // Step 1: Apply contrast adjustment using .modulate()
-    // Note: contrast 1.2 => multiply saturation by 1, brightness by 1, contrast by 1.2
-    const { data, info } = await sharp(imageBuffer)
-        .ensureAlpha()
-        .modulate({ contrast: 1.2 }) // Apply desired contrast
-        .raw()
-        .toBuffer({ resolveWithObject: true });
-
-    // Step 2: Adjust alpha channel to apply desired opacity
-    for (let i = 0; i < data.length; i += 4) {
-        data[i + 3] = Math.round(data[i + 3] * opacity); // modify A channel
-    }
-
-    // Step 3: Rebuild and resize, then output as WebP
-    return sharp(data, {
-        raw: {
-            width: info.width,
-            height: info.height,
-            channels: 4
-        }
-    })
-    .resize(width, height, {
-        fit: 'inside',
-        withoutEnlargement: true
-    })
-    .webp({ lossless: true })
-    .toBuffer();
+    return sharp(imageBuffer)
+        .resize(width, height, { fit: 'inside', withoutEnlargement: true })
+        .flatten({ background: '#000000' })
+        .linear(dim, 0)
+        .jpeg({ quality: 95, mozjpeg: true })
+        .toBuffer();
 }
 /**
- * Convert a JPEG-XL image to WebP format in lossless mode with specified width and height.
- * @param {Buffer} imageData - The raw JXL image data.
- * @param {number} width - The desired width.
- * @param {number} height - The desired height.
- * @param {boolean} bright - Whether to brighten the image.
- * @returns {Promise<Buffer>} A promise that resolves with the converted image buffer.
+ * Decode a JPEG-XL image and emit JPEG (q95, black-flattened). When
+ * `bright` is set, also dim the image for ambient/night-light viewing —
+ * the dim factor is chosen by image brightness so already-bright photos
+ * don't go invisible at the same multiplier as dark ones.
+ *
+ * @param {Buffer} imageData - Raw JXL bytes.
+ * @param {number} width
+ * @param {number} height
+ * @param {boolean} bright - Apply ambient dim.
+ * @returns {Promise<Buffer>}
  */
-async function convertFromJxlToWebP(imageData, width, height, bright = false) {
+async function convertFromJxl(imageData, width, height, bright = false) {
   return new Promise((resolve, reject) => {
-    let outputChunks = [];
-
-    // Spawn djxl to decode JXL and output PNG
-    const djxl = spawn(DJXL_PATH, ['-', '-', '--output_format', 'apng']);
-
-    // Write input image data (JXL) to stdin of djxl
+    const outputChunks = [];
+    const djxl = spawn(DJXL_PATH, ['-', '-', '--output_format', 'png']);
     djxl.stdin.write(imageData);
     djxl.stdin.end();
-
-    // Collect stdout (PNG output)
     djxl.stdout.on('data', (chunk) => outputChunks.push(chunk));
-
-    // Handle process completion
     djxl.on('close', async (code) => {
-      if (code === 0) {
-        try {
-          const pngBuffer = Buffer.concat(outputChunks);
-          let sharpInstance, webpBuffer;
-
-          // This will be used in overlays
-          if (bright) {
-            const isDark = await isImageDark(pngBuffer);
-            if (isDark) {
-              // If the image is dark, apply 30% opacity
-              webpBuffer = await applyFiltersAndConvertToWebp(pngBuffer, 0.3, width, height);
-            } else {
-              // If the image is bright, apply 15% opacity
-              webpBuffer = await applyFiltersAndConvertToWebp(pngBuffer, 0.15, width, height);
-            }
-          } else {
-            sharpInstance = sharp(pngBuffer, { animated: true });
-            webpBuffer = await sharpInstance
-              .resize(width, height, {
-                fit: 'inside', // Preserve aspect ratio
-                withoutEnlargement: true, // Do not enlarge if the dimensions are smaller
-              })
-              .webp({ animated: true, lossless: true }) // Use lossless compression
-              .toBuffer();
-          }
-
-          resolve(webpBuffer);
-        } catch (error) {
-          reject(new Error(`Sharp processing failed: ${error.message}`));
+      if (code !== 0) return reject(new Error(`djxl failed with exit code ${code}`));
+      try {
+        const pngBuffer = Buffer.concat(outputChunks);
+        if (bright) {
+          // Bumped from 0.30/0.15 since the prior contrast-bump (which is
+          // gone now — it was clipping highlights on already-bright
+          // images) made the perceived dim feel stronger.
+          const dim = (await isImageDark(pngBuffer)) ? 0.32 : 0.20;
+          resolve(await applyDimAndConvertToJpeg(pngBuffer, dim, width, height));
+        } else {
+          resolve(await convertBufferToJpeg(pngBuffer, width, height, 95));
         }
-      } else {
-        reject(new Error(`djxl failed with exit code ${code}`));
+      } catch (e) {
+        reject(new Error(`Sharp processing failed: ${e.message}`));
       }
     });
-
-    // Handle errors
     djxl.on('error', (err) => reject(new Error(`Failed to start djxl: ${err.message}`)));
   });
+}
+
+// Pi-class kiosks can't sustain WebP software decode at 1080p — JPEG
+// hits VideoCore's hardware decoder via MMAL and is ~5× cheaper. Alpha
+// is flattened to black so PNG/transparent sources don't render with
+// the JPEG default white. `?lowmem=1` lowers quality further to keep
+// the kiosk's per-image blob memory down on the prefetch side.
+async function convertBufferToJpeg(imageBuffer, width, height, quality = 95) {
+  return sharp(imageBuffer, { animated: false })
+    .resize(width, height, { fit: 'inside', withoutEnlargement: true })
+    .flatten({ background: '#000000' })
+    .jpeg({ quality, mozjpeg: true })
+    .toBuffer();
 }
 
 function processRequestV2(req, res) {
@@ -275,6 +249,7 @@ function processRequestV2(req, res) {
   const screenWidth = Number(req.query.width) || 3840;
   const screenHeight = Number(req.query.height) || 2160;
   const bright = Boolean(Number(req.query.bright) || 0);
+  const lowmem = Boolean(Number(req.query.lowmem) || 0);
 
   if (!postId) {
     if (!res.headersSent) res.status(400).send('Missing post ID');
@@ -353,15 +328,18 @@ function processRequestV2(req, res) {
         try {
           if (cancelled) return;
           // if bright is set, we will convert the image to WebP with opacity always
-          if (bright) {
-            finalBuffer = await convertFromJxlToWebP(data, screenWidth, screenHeight, bright);
-            finalMimeType = 'image/webp';
-          } else if (apngMode) {
+          if (apngMode) {
             finalBuffer = await convertToAPNG(data);
             finalMimeType = 'image/apng';
           } else if (convert) {
-            finalBuffer = await convertFromJxlToWebP(data, screenWidth, screenHeight);
-            finalMimeType = 'image/webp';
+            finalBuffer = await convertFromJxl(data, screenWidth, screenHeight, bright);
+            finalMimeType = 'image/jpeg';
+          } else if (lowmem) {
+            // Non-JXL source on a memory-tight kiosk: re-encode to JPEG
+            // so the browser hits VideoCore's hardware decoder instead
+            // of software-decoding WebP/PNG.
+            finalBuffer = await convertBufferToJpeg(data, screenWidth, screenHeight, 85);
+            finalMimeType = 'image/jpeg';
           } else {
             finalMimeType = returnMimeType || finalMimeType;
           }
@@ -502,7 +480,8 @@ app.get('/get', (req, res) => {
 app.get('/history', (req, res) => {
   const previewList = requestHistory.map((post) => ({ id: post.id }));
   const token = req.query.token || req.headers['x-roboframe-token'] || '';
-  res.render('history', { history: previewList, token });
+  const lowmem = Number(req.query.lowmem) === 1 ? 1 : 0;
+  res.render('history', { history: previewList, token, lowmem });
 });
 
 // This endpoint allows the user to send a post ID to insert it into requestHistory as the newest item

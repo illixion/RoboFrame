@@ -33,6 +33,21 @@ let currentRenderToken = 0;
 // because state.currentPost still points at the previous post.
 let inFlightPostId = null;
 
+// Drop every cached blob and abort in-flight prefetch. Used when a
+// kiosk-side parameter that affects the /get URL (e.g. bright) flips
+// after URLs were already built — the cache is keyed by post.id, not
+// URL, so stale-variant blobs would otherwise be served on the next
+// playback tick.
+export function invalidateMediaCache() {
+    for (const inflight of pendingPrefetch.values()) {
+        try { inflight.controller.abort(); } catch (_) {}
+    }
+    pendingPrefetch.clear();
+    prefetchQueue = [];
+    for (const entry of mediaCache.values()) revokeCacheEntry(entry);
+    mediaCache.clear();
+}
+
 export function preloadPostsToCache(posts) {
     if (!posts || posts.length === 0) return;
     syncMediaBuffer(posts);

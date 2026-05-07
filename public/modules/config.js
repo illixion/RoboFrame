@@ -56,13 +56,20 @@ export function calculateDisplayRatioRange(width, height) {
     return `${(ratio - range).toFixed(2)}..${(ratio + range).toFixed(2)}`;
 }
 
+import { isNightLightActive } from './nightlight.js';
+
 export function getRenderParams() {
     const { width, height } = getScreenSize();
+    const manualBright = Number(params.bright) ? 1 : 0;
     return {
         screenWidth: width,
         screenHeight: height,
-        bright: Number(params.bright) ? 1 : 0,
+        // Manual `?bright=1` forces ambient mode on; the night-light
+        // schedule can also turn it on but never overrides a manual
+        // off.
+        bright: (manualBright || isNightLightActive()) ? 1 : 0,
         convert: Number(params.convert) ? 1 : 0,
+        lowmem: Number(params.lowmem) === 1 ? 1 : 0,
         ratio: Number(params.ratio) ? calculateDisplayRatioRange(width, height) : null,
     };
 }
@@ -71,8 +78,8 @@ export function getRenderParams() {
 // in playback frames; the kiosk supplies its own screen dimensions.
 export function buildGetUrl(post) {
     if (!post || !post.id) return null;
-    const { screenWidth, screenHeight, bright, convert } = getRenderParams();
-    return api(`/get?id=${post.id}&convert=${convert}&bright=${bright}&width=${screenWidth}&height=${screenHeight}`);
+    const { screenWidth, screenHeight, bright, convert, lowmem } = getRenderParams();
+    return api(`/get?id=${post.id}&convert=${convert}&bright=${bright}&width=${screenWidth}&height=${screenHeight}&lowmem=${lowmem}`);
 }
 
 export function isVideoExt(ext) {
