@@ -244,7 +244,10 @@ On WebSocket connect, every client receives two initial frames: `tagLists`, `cur
 | `wsurl` | WebSocket URL override. Default: derived from `endpoint`, or same-origin `/rpc/ws`. |
 | `ws` | Device ID for WebSocket identification — required to receive `playback` and `displayState` |
 | `delay` | Initial slideshow interval, seconds (default 15). The orchestrator can override this at runtime. |
-| `noclock`, `static`, `ratio`, `convert`, `bright`, `nobutton`, `nobg` | Boolean flags (0/1) |
+| `noclock` | Boolean (0/1). Hides the clock and date overlay and repositions the corner buttons. |
+| `nosensors` | Boolean (0/1). Hides the sensor readout overlay. |
+| `lowmem` | Boolean (0/1). Collapses the slideshow prefetch window to next-image-only for low-RAM kiosks. |
+| `static`, `ratio`, `convert`, `bright`, `nobutton`, `nobg` | Boolean flags (0/1) |
 | `width`, `height` | Screen dimensions used when fetching `/get` |
 | `top-offset` | CSS top padding (notch / overscan) |
 | `list` | Initial tag list index |

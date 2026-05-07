@@ -221,11 +221,14 @@ function applyParamFlags() {
     if (Number(params.noclock)) {
         const clockEl = document.getElementById('clock');
         const dateEl = document.getElementById('date');
-        const sensorsEl = document.getElementById('sensors');
         if (clockEl) clockEl.style.display = 'none';
         if (dateEl) dateEl.style.display = 'none';
-        if (sensorsEl) sensorsEl.style.display = 'none';
         moveButtonsToTop('15px', '15px');
+    }
+
+    if (Number(params.nosensors)) {
+        const sensorsEl = document.getElementById('sensors');
+        if (sensorsEl) sensorsEl.style.display = 'none';
     }
 
     if (Number(params.nobutton)) {
