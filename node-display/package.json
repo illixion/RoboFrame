@@ -1,0 +1,19 @@
+{
+  "name": "node-display",
+  "version": "1.0.0",
+  "description": "Display client for RoboFrame - controls brightness and display state",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["display", "brightness", "raspberry-pi"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@roboframe/shared": "*",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "ws": "^8.18.3"
+  }
+}

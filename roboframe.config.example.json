@@ -1,0 +1,59 @@
+{
+  "_comment": "Copy this to roboframe.config.json and fill in your values. The file is gitignored. Per-service .env files keep working — env vars override anything in this file.",
+
+  "accessToken": "REPLACE_ME_DIFFERENT_FROM_RPC_TOKEN",
+  "_accessTokenComment": "Read-mostly token shared by every WebSocket consumer (kiosks, node-display, spatialstash). Required to connect to /rpc/ws but cannot call privileged `rpcsend`. Top-level so the same value can be copied to client and server configs.",
+
+  "server": {
+    "_comment": "The merged Node server: image API + WebSocket broker + optional Home Assistant bridge, all in one process on one port.",
+    "port": 3123,
+    "host": "localhost",
+    "rpcToken": "REPLACE_ME_GENERATE_VIA_OPENSSL_RAND_HEX_16",
+    "dataPath": null,
+    "imageDbPath": "/path/to/your/images",
+    "imageMirrorPath": "/path/to/optional/mirror",
+    "savePath": "/tmp",
+    "duckdbPath": "./posts.duckdb",
+    "djxlPath": "djxl",
+    "chunkSize": 0,
+    "ha": {
+      "_comment": "Read-only sensor forwarder. With url+token set, the broker subscribes to the listed HA entities and pushes their state to kiosks via the `update` action so the frontend can render outdoor temperature, humidity, etc. Set enabled:false to force-disable.",
+      "url": "",
+      "token": "",
+      "filterEntities": []
+    },
+    "mqtt": {
+      "_comment": "MQTT auto-discovery. With url set, the broker connects to the broker (typically the HA Mosquitto add-on), publishes retained discovery for each kiosk's light/binary_sensor/sensor entities, and bridges command-topic writes from HA into setBrightness/displayState messages back to the kiosk. Disabled when url is empty.",
+      "url": "",
+      "username": "",
+      "password": "",
+      "discoveryPrefix": "homeassistant",
+      "topicPrefix": "roboframe"
+    }
+  },
+
+  "display": {
+    "_comment": "On-device daemon (per kiosk). Connects to the server's WebSocket and drives backlight / brightness from the messages it pushes.",
+    "wsUrl": "ws://localhost:3123/rpc/ws",
+    "screenWatcherPath": null,
+    "pirHttp": {
+      "port": 8765
+    },
+    "nightLight": {
+      "_comment": "Optional. While the local clock falls inside [start, end), PIR-driven wake applies this brightness (user scale 0–255, mapped to DDC % on Pi). Outside the window, PIR wake leaves brightness alone. Set enabled:false to disable.",
+      "enabled": false,
+      "start": "00:00",
+      "end": "06:00",
+      "brightness": 64
+    },
+    "webcam": {
+      "_comment": "Optional. When enabled, node-display captures MJPG from the named V4L2 device and serves it at http://<host>:<port>/stream.mjpg (multipart) and /snapshot.jpg. Toggleable from HA via the auto-discovered switch entity (roboframe/switch/<deviceId>/webcam/set). Linux-only; the camera process only runs while a client is attached.",
+      "enabled": false,
+      "device": "/dev/video0",
+      "width": 1280,
+      "height": 720,
+      "framerate": 30,
+      "port": 8082
+    }
+  }
+}

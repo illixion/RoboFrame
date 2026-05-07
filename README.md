@@ -1,0 +1,355 @@
+# RoboFrame
+
+A modular digital photo frame system. Browser kiosks pull images from a local DuckDB-indexed library, optionally synchronise across devices, and integrate with Home Assistant.
+
+## Quick start (5 minutes)
+
+```bash
+git clone https://github.com/illixion/roboframe.git
+cd roboframe
+npm install --workspaces
+
+# 1. Build a posts.duckdb from any folder of images.
+node packages/cli/src/index.mjs bootstrap ~/Pictures --output ./posts.duckdb
+
+# 2. Start the server (image API + WebSocket broker + optional HA bridge in one process).
+RPC_TOKEN=$(openssl rand -hex 16) DUCKDB_PATH=./posts.duckdb IMAGE_DB_PATH=~/Pictures npm start
+```
+
+Open `http://localhost:3123/index.html` in a browser. That's it — one origin,
+one process, serves the page, the API, and the WebSocket.
+
+## Architecture
+
+There is **one server process**. It runs from the `imagemirror/` workspace
+(historical name; absorbs everything formerly split across `rpcserver/`):
+- serves the kiosk frontend (`public/index.html`, `sobel.js`, `auth-overlay.{js,css}`),
+- serves the image API (`/search`, `/get`, `/save`, `/history`, `/addtohistory`),
+- runs the WebSocket broker on `/rpc/ws` and HTTP RPC routes (`/rpc/send`, `/rpc/deviceDC`, `/rpc/tags.json`),
+- optionally bridges to Home Assistant — auto-enabled when both `HA_URL` and `HA_TOKEN` are set.
+
+`node-display` is a separate on-device daemon (per kiosk) that connects to
+the server's WebSocket to drive backlight / brightness based on what the
+server pushes.
+
+### nginx — root deployment
+
+One block, one upstream:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:3123;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    add_header Cache-Control "no-cache, no-store, must-revalidate";
+    add_header Pragma "no-cache";
+    add_header Expires 0;
+    # WebSocket connections are long-lived; bump nginx's defaults.
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_connect_timeout 3600s;
+}
+```
+
+### nginx — mounting under a sub-path
+
+Serve the kiosk at, e.g., `/mywallpaperpage/` while another app owns `/`.
+The kiosk auto-detects its base path from `location.pathname`, so API calls
+(`/mywallpaperpage/search`) and the WebSocket (`/mywallpaperpage/rpc/ws`)
+both use the prefix without any URL parameters. nginx just needs one
+location with the prefix stripped on the way through:
+
+```nginx
+location /mywallpaperpage/ {
+    proxy_pass http://127.0.0.1:3123/;     # trailing slash strips /mywallpaperpage
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    add_header Cache-Control "no-cache, no-store, must-revalidate";
+    add_header Pragma "no-cache";
+    add_header Expires 0;
+    # WebSocket connections are long-lived; bump nginx's defaults.
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_connect_timeout 3600s;
+}
+```
+
+For dev / split deployments where the kiosk is on a different host than the
+backend, the page accepts URL params:
+
+- `?endpoint=https://my-backend` — overrides the API base for `/search`, `/get`, `/save`, `/addtohistory`, and (derived) `/rpc/ws`.
+- `?wsurl=wss://...` — overrides the WebSocket URL only.
+
+Without those params, everything is same-origin and relative.
+
+## Components
+
+| Component | Port | Purpose |
+|---|---|---|
+| `imagemirror` (the server) | 3123 | One process. Serves the kiosk, the image API (`/search`, `/get`, `/save`, `/history`, `/addtohistory`), the WebSocket broker (`/rpc/ws`) and HTTP RPC routes (`/rpc/send`, `/rpc/deviceDC`, `/rpc/tags.json`), and the optional Home Assistant bridge (auto-enabled when `HA_URL` + `HA_TOKEN` are set). Reads `posts.duckdb` read-only. |
+| `node-display` | — | On-device daemon (per kiosk). Turns the display on/off and adjusts brightness based on WebSocket messages, PIR motion, ambient light. macOS / Raspberry Pi (DDC/CI) / generic Linux. |
+| `public/index.html` | — | Slideshow frontend, served by the server. Configurable via URL params. |
+| `packages/cli` | — | `roboframe-cli bootstrap` (build a DB) and `roboframe-cli doctor` (validate one). |
+
+## The bootstrap CLI
+
+`packages/cli/src/index.mjs bootstrap` walks a directory, probes each image (via `sharp`) and video (via `ffprobe` if available), and writes a `posts.duckdb` matching the schema imagemirror expects.
+
+```
+roboframe-cli bootstrap <imageDir> [options]
+
+  --output ./posts.duckdb    target DB path
+  --tags-from-folders        derive tags from ancestor folder names (default: on)
+  --tags-from-sidecar        read <stem>.tags.json sidecars (default: off)
+  --include-videos           probe videos via ffprobe (default: on if ffprobe present)
+  --extensions <csv>         file extensions to include
+  --start-id <n>             first _id to assign (default: 1)
+  --batch-size <n>           rows per INSERT batch (default: 500)
+  --resume                   skip files already present in the DB
+  --dry-run                  print summary, don't write
+```
+
+Folder structure → tags. Given `~/Pictures/landscape/sunset/IMG_0001.jpg`, the post gets tags `["landscape", "sunset", "_imported"]`. Numeric folder names (`0/`, `1/`, ...) are skipped because they're chunk subfolders, not meaningful tags. Videos additionally get `_videos`.
+
+Sidecars are optional and disabled by default. If enabled, `IMG_0001.tags.json` next to an image gets merged in:
+
+```json
+{ "tags": ["beach", "vacation"], "rating": "s", "score": 50 }
+```
+
+After bootstrapping, validate with:
+
+```bash
+node packages/cli/src/index.mjs doctor --db ./posts.duckdb
+```
+
+The CLI is the **only** writer to the DB; imagemirror opens it read-only. Future schema changes ship as additional `packages/cli/sql/*.sql` files.
+
+## DuckDB schema
+
+The CLI creates two tables:
+
+```sql
+posts(_id INTEGER PRIMARY KEY, tags VARCHAR[], file_ext VARCHAR,
+      score INTEGER, fav_count INTEGER, rating VARCHAR,
+      image_width INTEGER, image_height INTEGER, ratio DOUBLE,
+      duration DOUBLE, change_seq INTEGER, parent_id INTEGER)
+posts_paths(_id INTEGER, path VARCHAR)
+```
+
+If you already have a database from another source, it just needs to expose those columns. imagemirror's full schema dependencies are `_id, tags, file_ext, score, fav_count, rating, image_width, image_height, ratio, duration, change_seq, parent_id` on `posts`, plus `_id, path` on `posts_paths`.
+
+## Configuration
+
+All three services read from a single `roboframe.config.json` at the repo
+root. Copy the example to start:
+
+```bash
+cp roboframe.config.example.json roboframe.config.json
+$EDITOR roboframe.config.json
+```
+
+The file is gitignored. Environment variables override anything in it (so
+existing systemd units with `Environment=PORT=...` keep working as-is).
+Resolution order: **env var → config file → built-in default**.
+
+The loader walks up from the working directory looking for the file, or you
+can point it explicitly via `ROBOFRAME_CONFIG=/path/to/file`.
+
+The keys below show the env-var name and the corresponding nested path in
+the config file (e.g. `IMAGE_DB_PATH` ↔ `imagemirror.imageDbPath`).
+
+### Server (`server.*`)
+The merged Node server: image API + WebSocket broker + optional Home Assistant bridge, all in one process on one port.
+
+| Env var | Config key | Default | Description |
+|---|---|---|---|
+| `PORT` | `server.port` | `3123` | Listen port (the single front-door port) |
+| `SERVER_HOST` | `server.host` | `localhost` | Listen host. Keep `localhost` for local-only access, or set `0.0.0.0` to accept connections from other machines. |
+| `RPC_TOKEN` | `server.rpcToken` | *(required)* | Privileged token. Required to call `rpcsend` over the WebSocket and the HTTP `/rpc/send` endpoint, both of which can broadcast arbitrary actions. |
+| `ACCESS_TOKEN` | `accessToken` *(top-level)* | *(required)* | Read-mostly token shared by every consumer (kiosks, node-display, spatialstash). Required to connect to `/rpc/ws` (kiosk tier — broadcasts + kiosk-scoped actions, not `rpcsend`) and to call the image API routes (`/get`, `/save`, `/history`, `/addtohistory`, `/rpc/tags.json`) via `?token=` or the `X-RoboFrame-Token` header. Top-level so the same value can be copied to client configs. Must differ from `rpcToken`. |
+| `DATA_PATH` | `server.dataPath` | `imagemirror/data.json` | Hand-editable JSON store: `blockedIds`, `blockedTags`, `tagLists`. Pre-created with empty arrays on first launch; file-watched. Tag-list edits rebroadcast to clients; blocklist edits apply server-side only (no client-visible frame). |
+| `IMAGE_DB_PATH` | `server.imageDbPath` | `/Volumes/HDD/imagedb` | Folder where image files live |
+| `IMAGE_MIRROR_PATH` | `server.imageMirrorPath` | `/Volumes/HDD/imagedb_mirror` | Fallback folder if a file is missing |
+| `SAVE_PATH` | `server.savePath` | `/tmp` | Where `/save` copies files to |
+| `DUCKDB_PATH` | `server.duckdbPath` | `posts.duckdb` | Path to the DuckDB file |
+| `DJXL_PATH` | `server.djxlPath` | `djxl` | Path to the JPEG-XL decoder |
+| `CHUNK_SIZE` | `server.chunkSize` | `0` | If >0, files are organised in `<chunk>/<id>.<ext>` subfolders |
+| `HA_URL` | `server.ha.url` | *(none)* | Home Assistant WebSocket URL — sensor forwarding auto-enables when set with token |
+| `HA_TOKEN` | `server.ha.token` | *(none)* | Home Assistant long-lived access token |
+| `HA_FILTER_ENTITIES` | `server.ha.filterEntities` | *(none)* | Sensor entity_ids to forward to kiosks (CSV in env, array in JSON) |
+| — | `server.mqtt.url` | *(none)* | MQTT broker URL (e.g. `mqtt://homeassistant.local:1883`). Empty = MQTT bridge disabled. |
+| — | `server.mqtt.username` / `password` | *(none)* | MQTT credentials |
+| — | `server.mqtt.discoveryPrefix` | `homeassistant` | HA MQTT-discovery topic prefix |
+| — | `server.mqtt.topicPrefix` | `roboframe` | Per-device state/command topic prefix |
+
+### Display daemon (`display.*`)
+On-device daemon (per kiosk). Lives in `node-display/`.
+
+| Env var | Config key | Default | Description |
+|---|---|---|---|
+| `WS_URL` | `display.wsUrl` | `ws://localhost:3123/rpc/ws` | Server WebSocket URL |
+| `ACCESS_TOKEN` | `accessToken` *(top-level)* | *(required)* | Read-mostly access token; appended as `?token=` on connect. Must match the server's `ACCESS_TOKEN`. |
+| `SCREEN_WATCHER_PATH` | `display.screenWatcherPath` | *(none)* | Optional macOS screensaver event script |
+| `PIR_HTTP_PORT` | `display.pirHttp.port` | `8765` | Local HTTP listener for the on-device PIR agent (Linux/Pi) |
+
+## PIR motion (Linux / Raspberry Pi)
+
+`node-display` runs a small HTTP listener on `127.0.0.1:8765` and turns the kiosk display on/off in response to two endpoints. This is the integration point for any GPIO-attached PIR sensor — bring your own agent.
+
+```
+POST /pir/motion    -> display on  + reports state to HA via MQTT
+POST /pir/clear     -> display off + reports state to HA via MQTT
+```
+
+Body is optional; if present and JSON, an explicit `{"state":"motion"|"clear"}` overrides the URL-derived state. Listener is bound to localhost only.
+
+## Local data store
+
+The broker keeps three pieces of per-install state in a single JSON file at `imagemirror/data.json` (override via `DATA_PATH` env / `server.dataPath` config):
+
+```json
+{
+  "blockedIds": [],
+  "blockedTags": [],
+  "tagLists": []
+}
+```
+
+- `blockedIds` — array of post IDs the orchestrator filters out of every channel's queue. Mutated by the broker when a `block` action arrives; safe to add/remove entries by hand. Server-only — clients never see this list.
+- `blockedTags` — array of tag strings to filter out. Hand-edited; same server-only treatment.
+- `tagLists` — the named groups your kiosk cycles through. Canonical shape is array-of-arrays of strings (`[["robot","solo"], ["dragon","rating:s"]]`); the broker also accepts the looser space-separated form (`["robot solo", "dragon rating:s"]`).
+
+The file is created with empty arrays on first launch if missing, so a fresh install starts up cleanly without manual setup.
+
+The broker watches the file. Any external edit to `tagLists` re-broadcasts a `tagLists` frame. Edits to `blockedIds` / `blockedTags` apply server-side only — the orchestrator drops the newly blocked posts from every channel's queue and advances any channel that was just showing one, but no `blocked` frame is sent to clients. No reload, no nginx cache.
+
+On WebSocket connect, every client receives two initial frames: `tagLists`, `currentTagList`. For non-WebSocket clients the catalog is available at `GET /rpc/tags.json`.
+
+## Frontend (kiosk) URL parameters
+
+| Param | Description |
+|---|---|
+| `endpoint` | Backend base URL. Default: same origin (no prefix). Useful for split deployments. |
+| `homeendpoint` | Home Assistant URL for an iframe overlay |
+| `wsurl` | WebSocket URL override. Default: derived from `endpoint`, or same-origin `/rpc/ws`. |
+| `ws` | Device ID for WebSocket identification — required to receive `playback` and `displayState` |
+| `delay` | Initial slideshow interval, seconds (default 15). The orchestrator can override this at runtime. |
+| `noclock`, `static`, `ratio`, `convert`, `bright`, `nobutton`, `nobg` | Boolean flags (0/1) |
+| `width`, `height` | Screen dimensions used when fetching `/get` |
+| `top-offset` | CSS top padding (notch / overscan) |
+| `list` | Initial tag list index |
+
+## API reference
+
+### imagemirror
+
+`GET /get?id=&convert=&bright=&width=&height=`
+Returns the binary image. `convert=1` decodes JXL → WebP via `djxl`+`sharp`. `bright=1` overlays an opacity layer for low-light viewing.
+
+`GET /save?id=&ext=`
+Copies the file from `IMAGE_DB_PATH` (or `IMAGE_MIRROR_PATH` fallback) to `SAVE_PATH`. **Local-only**: 404 if not on disk. No third-party fetches, ever.
+
+`GET /history`
+HTML page rendering the last 25 image requests. Thumbnails load via `/get` in parallel from the browser.
+
+`GET /addtohistory?id=`
+Records a post ID in the rolling history without fetching its bytes.
+
+The server is the single DuckDB reader; clients receive posts via the `playback` channel below rather than a search HTTP endpoint.
+
+### Server WebSocket `/rpc/ws`
+
+The full client protocol — every action, every payload shape, the
+playback / readiness / displaySync / visibility flows, and the gotchas
+that bit the existing clients — lives in [docs/protocol.md](docs/protocol.md).
+Read that before writing a new client.
+
+WebSocket auth: connections to `/rpc/ws` must present `?token=<ACCESS_TOKEN>`
+(access tier — broadcasts + kiosk actions) or `?token=<RPC_TOKEN>` (rpc
+tier — adds `rpcsend`). Browser kiosks pass it via `?token=` on the page
+URL; node-display reads `ACCESS_TOKEN` from env/config.
+
+### Home Assistant MQTT entities
+
+When `server.mqtt.url` is set, the broker connects to the configured MQTT broker and publishes retained discovery. Per kiosk it sees:
+
+- `light.roboframe_<deviceId>_backlight` — on/off + brightness (0–255). HA writes flow back to the kiosk via the WebSocket `setBrightness` / `displayState` actions.
+- `binary_sensor.roboframe_<deviceId>_motion` — driven by the kiosk's `visibility` action (web frontend / spatialstash) and the on-device PIR HTTP endpoints.
+- `sensor.roboframe_<deviceId>_als` — ambient light reading, published when the kiosk reports one.
+
+Server-wide:
+
+- `button.roboframe_dismiss` — clears any active video / text / audio overlay on every connected kiosk. Press it from a dashboard or call `button.press` from an automation.
+
+There is no manual entity setup in HA: a freshly-connected kiosk shows up on its own.
+
+### MQTT RPC topic
+
+`<topicPrefix>/rpc/cmd` (default `roboframe/rpc/cmd`) accepts arbitrary `{action, payload}` JSON; the broker rebroadcasts it to every connected client. This is the recommended path for HA-driven actions like `playVideo` and `showText` — fire-and-forget, no token, no HTTP.
+
+```yaml
+# Show a notification banner on every kiosk for 10 seconds.
+service: mqtt.publish
+data:
+  topic: roboframe/rpc/cmd
+  payload: >-
+    {"action":"showText","payload":{"text":"Doorbell","bgColorHex":"#3344ff"}}
+```
+
+```yaml
+# Dismiss any active overlay (equivalent to pressing the dismiss button).
+service: button.press
+target:
+  entity_id: button.roboframe_dismiss
+```
+
+### Server HTTP RPC
+
+`GET /rpc/send?action=&payload=&token=` — token-auth'd HTTP→WS bridge.
+`GET /rpc/tags.json` — fallback for non-WebSocket clients.
+`POST /rpc/deviceDC` — `navigator.sendBeacon` target for kiosk page-unload notifications.
+
+## Tests
+
+```bash
+npm test
+# 14 cases in imagemirror/test/parseQuery.test.js — query parser security/correctness.
+```
+
+## Deployment
+
+A minimal systemd unit for the display daemon:
+
+```ini
+[Unit]
+Description=RoboFrame Display Client
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/roboframe/node-display
+Environment=WS_URL=ws://your-server-host:3123/rpc/ws
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The Pi build of `node-display` requires `ddcutil` for backlight brightness control via DDC/CI. The default DDC bus index is `2` (Pi 3B+ HDMI-A-1).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

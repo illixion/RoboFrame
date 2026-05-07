@@ -1,0 +1,35 @@
+{
+  "name": "imagemirror",
+  "version": "1.0.0",
+  "description": "Image search and conversion API for RoboFrame",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test 'test/**/*.test.js'"
+  },
+  "keywords": [
+    "image",
+    "duckdb",
+    "jpeg-xl",
+    "webp"
+  ],
+  "author": "",
+  "license": "MIT",
+  "overrides": {
+    "node-gyp": "^10.0.0"
+  },
+  "dependencies": {
+    "@roboframe/shared": "*",
+    "axios": "^1.7.2",
+    "body-parser": "^1.20.2",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "duckdb": "^1.2.1",
+    "ejs": "^3.1.10",
+    "express": "^4.19.2",
+    "mqtt": "^5.10.1",
+    "sharp": "^0.33.5",
+    "ws": "^8.18.1"
+  }
+}

@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Photo Frame</title>
+
+  <!-- sobel.js exposes a global `Sobel` used by modules/sobel-focus.js. -->
+  <script src="sobel.js"></script>
+  <link rel="stylesheet" href="auth-overlay.css">
+
+  <style>
+    :root {
+      --top-offset: 0px;
+    }
+
+    body {
+      background-color: #000;
+      margin: 0;
+      overflow: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+    }
+
+    .fullscreen-container {
+      position: fixed;
+      top: var(--top-offset);
+      left: 0;
+      width: 100vw;
+      height: calc(100vh - var(--top-offset));
+      overflow: hidden;
+    }
+
+    .fullscreen-layer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      transition: opacity 0.5s ease-in-out;
+      opacity: 0;
+    }
+
+    .fullscreen-layer.current {
+      opacity: 1;
+      z-index: 2;
+    }
+
+    .fullscreen-layer.next {
+      z-index: 1;
+    }
+
+    .fullscreen-media {
+      position: fixed;
+      top: var(--top-offset);
+      left: 50%;
+      height: calc(100vh - var(--top-offset));
+      width: auto;
+    }
+
+    .fullscreen-media.alt-fit {
+      position: fixed;
+      top: var(--top-offset);
+      left: 0;
+      width: 100vw;
+      height: calc(100vh - var(--top-offset));
+      transform: none !important;
+      object-fit: contain;
+    }
+
+    .rpc-video-container,
+    .rpc-text-container {
+      top: var(--top-offset);
+      height: calc(100vh - var(--top-offset));
+    }
+
+    @keyframes kenburns-zoom {
+      from { transform: translateX(-50%) scale(1); }
+      to   { transform: translateX(-50%) scale(1.3); }
+    }
+
+    .container {
+      height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      flex-direction: column;
+    }
+
+    time {
+      color: white;
+      font-size: 40px;
+      z-index: 10;
+    }
+
+    #clock {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      padding: 10px;
+      margin: 15px;
+      background-color: rgba(0, 0, 0, 0.7);
+      color: #dedede;
+      z-index: 10;
+      border-radius: 10px;
+    }
+
+    #date {
+      position: fixed;
+      bottom: 0;
+      right: 0;
+      padding: 10px;
+      margin: 15px;
+      background-color: rgba(0, 0, 0, 0.7);
+      color: #dedede;
+      z-index: 10;
+      border-radius: 10px;
+    }
+
+    #sensors {
+      display: none;
+      position: fixed;
+      top: 0;
+      right: 0;
+      padding: 10px;
+      margin: 10px;
+      background-color: rgba(0, 0, 0, 0.7);
+      color: #dedede;
+      z-index: 10;
+      border-radius: 10px;
+      font-size: 16pt;
+      text-align: right;
+    }
+
+    #sensors:not(:empty) { display: block; }
+
+    #toast-container {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      z-index: 1000;
+    }
+
+    .toast {
+      display: flex;
+      align-items: center;
+      background-color: #333;
+      color: #fff;
+      font-size: 18;
+      padding: 10px 20px;
+      margin-bottom: 10px;
+      border-radius: 5px;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+      opacity: 0;
+      transform: translateY(-20px);
+      transition: opacity 0.3s, transform 0.3s;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .fullscreen-iframe {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      border: none;
+      background: white;
+      z-index: 20;
+      display: none;
+    }
+
+    .toggle-button {
+      position: fixed;
+      top: 15px;
+      left: 15px;
+      padding: 15px 15px;
+      background: #000000b3;
+      color: white;
+      border: 2px solid rgba(255, 255, 255, 0.7);
+      cursor: pointer;
+      font-size: 16px;
+      border-radius: 5px;
+      z-index: 50;
+    }
+
+    .block-picture-button {
+      position: fixed;
+      top: 80px;
+      left: 15px;
+      padding: 15px 15px;
+      background: #000000b3;
+      color: white;
+      border: 2px solid rgba(255, 255, 255, 0.7);
+      cursor: pointer;
+      font-size: 16px;
+      border-radius: 5px;
+      z-index: 10;
+    }
+
+    .change-tagset-button {
+      position: fixed;
+      top: 145px;
+      left: 15px;
+      padding: 15px 15px;
+      background: #000000b3;
+      color: white;
+      border: 2px solid rgba(255, 255, 255, 0.7);
+      cursor: pointer;
+      font-size: 16px;
+      border-radius: 5px;
+      z-index: 10;
+    }
+
+    .rpc-video-container {
+      position: fixed;
+      top: var(--top-offset);
+      left: 0;
+      width: 100%;
+      height: calc(100vh - var(--top-offset));
+      background-color: black;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 15;
+    }
+
+    .rpc-video-element {
+      max-width: 100%;
+      max-height: 100%;
+    }
+
+    .rpc-text-container {
+      position: fixed;
+      top: var(--top-offset);
+      left: 0;
+      width: 100%;
+      height: calc(100vh - var(--top-offset));
+      background-color: var(--bg-color, #000000);
+      color: #ffffff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 15;
+      padding: 20px;
+      box-sizing: border-box;
+      text-align: center;
+      overflow: hidden;
+    }
+
+    .rpc-text-container img {
+      max-width: 25%;
+      margin-bottom: 20px;
+    }
+
+    .rpc-text-element {
+      font-size: 10px;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+
+<body>
+  <canvas id="analysisCanvas" style="display:none"></canvas>
+  <time id="clock"></time>
+  <time id="date"></time>
+  <div id="sensors"></div>
+  <div id="toast-container"></div>
+  <button class="toggle-button" onmousedown="this.blur()" onclick="toggleIframe()">🏠</button>
+  <button class="block-picture-button" onmousedown="this.blur()" onclick="blockPost()">🛑</button>
+  <button class="change-tagset-button" onmousedown="this.blur()" onclick="tags.switch()">🔄</button>
+  <iframe id="ha-iframe" class="fullscreen-iframe"></iframe>
+
+  <div class="fullscreen-container">
+    <div class="fullscreen-layer current">
+      <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="Fullscreen Image"
+        class="fullscreen-media">
+    </div>
+    <div class="fullscreen-layer next"></div>
+  </div>
+
+  <div id="auth-overlay"></div>
+
+  <script src="auth-overlay.js"></script>
+  <script type="module" src="modules/main.js"></script>
+</body>
+
+</html>

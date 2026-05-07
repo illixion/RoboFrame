@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Environment files (contain secrets)
+.env
+*.env.local
+
+# Unified config (contains rpcToken, HA token, etc.)
+roboframe.config.json
+
+# Database files
+*.duckdb
+*.duckdb.wal
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+
+# Device-specific files
+node-display/id
+
+# Local data store: blocked posts/tags + tag list catalog. Single
+# hand-editable JSON file, per-install, never committed.
+imagemirror/data.json
+
+# Build artifacts
+dist/
+build/

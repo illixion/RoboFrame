@@ -1,0 +1,8 @@
+{
+  "name": "@roboframe/shared",
+  "version": "1.0.0",
+  "description": "Shared utilities for RoboFrame services (config loader, etc.).",
+  "main": "./src/index.js",
+  "private": true,
+  "license": "MIT"
+}

@@ -1,0 +1,35 @@
+{
+  "name": "roboframe",
+  "version": "1.0.0",
+  "description": "Digital photo frame solution with image search, display control, and optional Home Assistant integration",
+  "private": true,
+  "workspaces": [
+    "imagemirror",
+    "node-display",
+    "packages/*"
+  ],
+  "scripts": {
+    "install:all": "npm install --workspaces",
+    "start": "npm start --workspace=imagemirror",
+    "start:server": "npm start --workspace=imagemirror",
+    "start:node-display": "npm start --workspace=node-display",
+    "cli": "npm start --workspace=@roboframe/cli --",
+    "test": "npm test --workspace=imagemirror"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/illixion/roboframe"
+  },
+  "keywords": [
+    "photo-frame",
+    "digital-signage",
+    "home-assistant",
+    "raspberry-pi",
+    "slideshow"
+  ],
+  "author": "",
+  "license": "MIT",
+  "overrides": {
+    "node-gyp": "^10.0.0"
+  }
+}

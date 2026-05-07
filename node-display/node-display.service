@@ -1,0 +1,21 @@
+# /etc/systemd/system/node-display.service
+
+[Unit]
+Description=Node.js Display Control Server
+After=graphical.target
+Requires=graphical.target
+
+[Service]
+ExecStart=/usr/bin/npm start --workspace=node-display
+WorkingDirectory=/home/user/RoboFrame
+Restart=always
+RestartSec=3
+User=user
+Group=user
+Environment=DISPLAY=:0
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=node-display
+
+[Install]
+WantedBy=default.target
