@@ -2,16 +2,20 @@
 //
 // Raspberry Pi Display backend.
 //
-// xrandr drives output on/off; ddcutil drives the monitor's real
-// backlight via DDC/CI VCP 0x10 (Brightness, 0–100 percent). State
-// transitions go through a serialised queue so a websocket burst can't
-// race a fresh `state:'on'` against a delayed `state:false` echo.
+// DPMS (xset) drives output power on/off; ddcutil drives the monitor's
+// real backlight via DDC/CI VCP 0x10 (Brightness, 0–100 percent). DPMS
+// is preferred over `xrandr --output … --off` because xrandr does a
+// full modeset — when the only output goes away X collapses the
+// framebuffer to its minimum size and the browser resizes twice per
+// cycle, which left the kiosk visibility state desynced from display
+// state. DPMS just signals HDMI sleep without touching the modeline.
+// State transitions go through a serialised queue so a websocket burst
+// can't race a fresh `state:'on'` against a delayed `state:false` echo.
 
 const { exec } = require('child_process');
 
 function create() {
     const XRANDR_DISPLAY = ':0';
-    const XRANDR_OUTPUT = 'HDMI-1';
     // The DDC bus index is stable enough to hard-code (Pi 3B+ HDMI-A-1 = i2c-2).
     // Pinning avoids a per-call detect (~1s) and prevents stalls if EDID
     // readback flaps.
@@ -45,32 +49,16 @@ function create() {
     let _stateQueue = Promise.resolve();
     let _stateRequestId = 0;
 
-    function _isHdmiActive(cb) {
-        exec(`xrandr --display ${XRANDR_DISPLAY} --query`, (err, stdout) => {
-            if (err) return cb(err, false);
-            const re = new RegExp(`^${XRANDR_OUTPUT}\\s+connected[^\\n]*?(\\d+x\\d+\\+\\d+\\+\\d+)`, 'm');
-            cb(null, re.test(stdout));
-        });
-    }
-
     function _doTurnOn(cb) {
-        exec(`xrandr --display ${XRANDR_DISPLAY} --output ${XRANDR_OUTPUT} --auto`, (err1) => {
-            _isHdmiActive((_e, active) => {
-                const finish = (e) => {
-                    if (e) return cb(e);
-                    currentState = true;
-                    applyBrightness(lastOnBrightness, cb);
-                };
-                if (active) return finish(null);
-                exec(`xrandr --display ${XRANDR_DISPLAY} --output ${XRANDR_OUTPUT} --preferred --pos 0x0 --rotate normal`, (err2) => {
-                    finish(err2 || err1 || null);
-                });
-            });
+        exec(`xset -display ${XRANDR_DISPLAY} dpms force on`, (err) => {
+            if (err) return cb(err);
+            currentState = true;
+            applyBrightness(lastOnBrightness, cb);
         });
     }
 
     function _doTurnOff(cb) {
-        exec(`xrandr --display ${XRANDR_DISPLAY} --output ${XRANDR_OUTPUT} --off`, (err) => {
+        exec(`xset -display ${XRANDR_DISPLAY} dpms force off`, (err) => {
             currentState = false;
             cb(err || null);
         });
@@ -97,30 +85,25 @@ function create() {
     function setGovernor(_gov, cb) { process.nextTick(cb); }
 
     function initializeState(callback) {
-        // Determine on/off via xrandr (mode-string presence), then read
-        // brightness via DDC.
-        exec(`xrandr --display ${XRANDR_DISPLAY} --verbose`, (err, stdout) => {
-            let isOn = true;
-            if (!err) {
-                const lines = stdout.split('\n');
-                let inSection = false;
-                for (const line of lines) {
-                    if (line.startsWith(`${XRANDR_OUTPUT} `)) {
-                        inSection = true;
-                        isOn = /\d+x\d+\+\d+\+\d+/.test(line);
-                        continue;
+        // Ensure DPMS is enabled (some X configs ship with it off, in
+        // which case `dpms force off` is a no-op), then determine the
+        // current monitor power state and cached brightness.
+        exec(`xset -display ${XRANDR_DISPLAY} +dpms`, () => {
+            exec(`xset -display ${XRANDR_DISPLAY} q`, (err, stdout) => {
+                let isOn = true;
+                if (!err) {
+                    const m = stdout.match(/Monitor is\s+(\w+)/i);
+                    if (m) isOn = /^On$/i.test(m[1]);
+                }
+                currentState = isOn;
+                if (!isOn) return callback(null, false);
+                exec(`ddcutil --bus=${DDC_BUS} getvcp 10`, (e2, out2) => {
+                    if (!e2) {
+                        const m2 = out2.match(/current value\s*=\s*(\d+)/);
+                        if (m2) lastOnBrightness = clampPct(parseInt(m2[1], 10));
                     }
-                    if (inSection && /^\S/.test(line)) break;
-                }
-            }
-            currentState = isOn;
-            if (!isOn) return callback(null, false);
-            exec(`ddcutil --bus=${DDC_BUS} getvcp 10`, (e2, out2) => {
-                if (!e2) {
-                    const m = out2.match(/current value\s*=\s*(\d+)/);
-                    if (m) lastOnBrightness = clampPct(parseInt(m[1], 10));
-                }
-                callback(null, true);
+                    callback(null, true);
+                });
             });
         });
     }
