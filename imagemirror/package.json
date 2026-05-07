@@ -15,21 +15,18 @@
   ],
   "author": "",
   "license": "MIT",
-  "overrides": {
-    "node-gyp": "^10.0.0"
-  },
   "dependencies": {
     "@roboframe/shared": "*",
-    "axios": "^1.7.2",
-    "body-parser": "^1.20.2",
-    "cookie-parser": "^1.4.6",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.7",
+    "axios": "^1.16.0",
+    "body-parser": "^2.2.2",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
     "duckdb": "^1.2.1",
     "ejs": "^3.1.10",
-    "express": "^4.19.2",
-    "mqtt": "^5.10.1",
-    "sharp": "^0.33.5",
-    "ws": "^8.18.1"
+    "express": "^5.2.1",
+    "mqtt": "^5.15.1",
+    "sharp": "^0.34.5",
+    "ws": "^8.20.0"
   }
 }

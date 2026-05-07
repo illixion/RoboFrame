@@ -12,8 +12,8 @@
   "license": "MIT",
   "dependencies": {
     "@roboframe/shared": "*",
-    "axios": "^1.7.9",
-    "dotenv": "^16.4.7",
-    "ws": "^8.18.3"
+    "axios": "^1.16.0",
+    "dotenv": "^17.4.2",
+    "ws": "^8.20.0"
   }
 }
