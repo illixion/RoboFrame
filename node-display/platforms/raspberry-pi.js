@@ -49,11 +49,22 @@ function create() {
     let _stateQueue = Promise.resolve();
     let _stateRequestId = 0;
 
+    // After HDMI re-link the panel's DDC channel takes a moment to come
+    // back; the first setvcp can fail with an i2c read error. Retry a
+    // few times before giving up.
+    function _applyBrightnessWithRetry(pct, attemptsLeft, cb) {
+        applyBrightness(pct, (err) => {
+            if (!err) return cb(null);
+            if (attemptsLeft <= 0) return cb(err);
+            setTimeout(() => _applyBrightnessWithRetry(pct, attemptsLeft - 1, cb), 500);
+        });
+    }
+
     function _doTurnOn(cb) {
         exec(`xset -display ${XRANDR_DISPLAY} dpms force on`, (err) => {
             if (err) return cb(err);
             currentState = true;
-            applyBrightness(lastOnBrightness, cb);
+            _applyBrightnessWithRetry(lastOnBrightness, 4, cb);
         });
     }
 
