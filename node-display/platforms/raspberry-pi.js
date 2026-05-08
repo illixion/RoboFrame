@@ -24,7 +24,11 @@ function create() {
     // Pinning avoids a per-call detect (~1s) and prevents stalls if EDID
     // readback flaps.
     const DDC_BUS = '2';
-    const BRIGHTNESS_FLOOR = 5; // percent; below this the AOC panel is effectively black
+    // VCP 0x10 minimum. The AOC panel rejects setvcp 10 0 (some firmwares
+    // treat 0 as an invalid value rather than "off"), so the dim stage and
+    // every brightness clamp floor at 1. Powering the panel down is the
+    // job of the DPMS stage, not of a zero brightness write.
+    const BRIGHTNESS_FLOOR = 1;
     // Two-stage power-down delay (seconds before escalating dim → DPMS off).
     //   positive: seconds before escalation
     //   0:        skip dim, go straight to DPMS off (legacy behaviour)
