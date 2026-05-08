@@ -2,17 +2,21 @@
 //
 // Raspberry Pi Display backend.
 //
-// DPMS (xset) drives output power on/off; ddcutil drives the monitor's
-// real backlight via DDC/CI VCP 0x10 (Brightness, 0–100 percent). DPMS
-// is preferred over `xrandr --output … --off` because xrandr does a
-// full modeset — when the only output goes away X collapses the
-// framebuffer to its minimum size and the browser resizes twice per
-// cycle, which left the kiosk visibility state desynced from display
-// state. DPMS just signals HDMI sleep without touching the modeline.
-// State transitions go through a serialised queue so a websocket burst
-// can't race a fresh `state:'on'` against a delayed `state:false` echo.
+// Power-down is two-staged. Stage 1 ("dim") drops the DDC backlight
+// (VCP 0x10) to the floor — instant, panel goes black, HDMI link and
+// DDC channel stay alive so a subsequent wake is a single setvcp with
+// no retry. Stage 2 ("off") escalates to `xset dpms force off` after
+// DIM_TO_OFF_DELAY_MS of continued inactivity to actually power the
+// panel down. DPMS is preferred over `xrandr --off` because xrandr
+// does a full modeset — when the only output goes away X collapses
+// the framebuffer to its minimum size and the browser resizes twice
+// per cycle, desyncing kiosk visibility from display state. State
+// transitions go through a serialised queue so a websocket burst
+// can't race a fresh `state:'on'` against a delayed `state:false`
+// echo.
 
 const { exec } = require('child_process');
+const { loadConfig, pickEnv } = require('@roboframe/shared');
 
 function create() {
     const XRANDR_DISPLAY = ':0';
@@ -21,7 +25,18 @@ function create() {
     // readback flaps.
     const DDC_BUS = '2';
     const BRIGHTNESS_FLOOR = 5; // percent; below this the AOC panel is effectively black
+    // Two-stage power-down delay (seconds before escalating dim → DPMS off).
+    //   positive: seconds before escalation
+    //   0:        skip dim, go straight to DPMS off (legacy behaviour)
+    //   null / non-finite: never escalate; stay in dim forever
+    const _cfgDisplay = (loadConfig().display) || {};
+    const _dimToOffSecondsRaw = pickEnv('DIM_TO_OFF_SECONDS', _cfgDisplay.dimToOffSeconds, 120, { type: 'number' });
+    const _dimEscalates = Number.isFinite(_dimToOffSecondsRaw) && _dimToOffSecondsRaw > 0;
+    const _skipDimStage = _dimToOffSecondsRaw === 0;
+    const DIM_TO_OFF_DELAY_MS = _dimEscalates ? Math.round(_dimToOffSecondsRaw * 1000) : 0;
     let currentState = true;
+    let _powerStage = 'on'; // 'on' | 'dim' | 'off'
+    let _dimToOffTimer = null;
     let lastOnBrightness = 100;
 
     function clampPct(v) {
@@ -42,12 +57,18 @@ function create() {
         });
     }
 
-    // All on/off transitions go through `_scheduleState` so they serialise
-    // and coalesce: only the most recently requested state actually runs.
-    // After --auto we verify the output came up; if X has a stale
-    // "disconnected" view we fall back to --preferred + explicit pos.
+    // All on/off transitions go through `_scheduleState` so they
+    // serialise and coalesce: only the most recently requested state
+    // actually runs.
     let _stateQueue = Promise.resolve();
     let _stateRequestId = 0;
+
+    function _clearDimTimer() {
+        if (_dimToOffTimer) {
+            clearTimeout(_dimToOffTimer);
+            _dimToOffTimer = null;
+        }
+    }
 
     // After HDMI re-link the panel's DDC channel takes a moment to come
     // back; the first setvcp can fail with an i2c read error. Retry a
@@ -61,17 +82,73 @@ function create() {
     }
 
     function _doTurnOn(cb) {
+        _clearDimTimer();
+        if (_powerStage === 'on') {
+            currentState = true;
+            return cb(null);
+        }
+        if (_powerStage === 'dim') {
+            // DDC channel is alive; a single setvcp with no retry is
+            // enough and the wake is near-instant.
+            applyBrightness(lastOnBrightness, (err) => {
+                if (err) return cb(err);
+                _powerStage = 'on';
+                currentState = true;
+                cb(null);
+            });
+            return;
+        }
+        // _powerStage === 'off' — DPMS wake, then retry brightness while
+        // the DDC channel comes back up.
         exec(`xset -display ${XRANDR_DISPLAY} dpms force on`, (err) => {
             if (err) return cb(err);
+            _powerStage = 'on';
             currentState = true;
             _applyBrightnessWithRetry(lastOnBrightness, 4, cb);
         });
     }
 
-    function _doTurnOff(cb) {
+    function _dpmsOff(cb) {
         exec(`xset -display ${XRANDR_DISPLAY} dpms force off`, (err) => {
+            _powerStage = 'off';
             currentState = false;
             cb(err || null);
+        });
+    }
+
+    function _doTurnOff(cb) {
+        _clearDimTimer();
+        if (_powerStage === 'off') {
+            currentState = false;
+            return cb(null);
+        }
+        // dimToOffSeconds === 0: skip dim, go straight to DPMS off.
+        if (_skipDimStage) return _dpmsOff(cb);
+        // Stage 1: DDC dim. Bypass applyBrightness so lastOnBrightness
+        // is preserved for wake.
+        exec(`ddcutil --bus=${DDC_BUS} setvcp 10 ${BRIGHTNESS_FLOOR}`, (err) => {
+            if (err) return cb(err);
+            _powerStage = 'dim';
+            currentState = false;
+            // Stage 2: escalate to DPMS off after the inactivity window —
+            // unless dimToOffSeconds is null/non-finite, in which case
+            // we stay in dim forever. The escalation runs via the state
+            // queue so it serialises with any racing wake; if turnOn
+            // ran first, _powerStage will be 'on' here and this is a
+            // no-op.
+            if (_dimEscalates) {
+                _dimToOffTimer = setTimeout(() => {
+                    _dimToOffTimer = null;
+                    _stateQueue = _stateQueue.then(() => new Promise((resolve) => {
+                        if (_powerStage !== 'dim') return resolve();
+                        exec(`xset -display ${XRANDR_DISPLAY} dpms force off`, () => {
+                            _powerStage = 'off';
+                            resolve();
+                        });
+                    }));
+                }, DIM_TO_OFF_DELAY_MS);
+            }
+            cb(null);
         });
     }
 
@@ -107,6 +184,7 @@ function create() {
                     if (m) isOn = /^On$/i.test(m[1]);
                 }
                 currentState = isOn;
+                _powerStage = isOn ? 'on' : 'off';
                 if (!isOn) return callback(null, false);
                 exec(`ddcutil --bus=${DDC_BUS} getvcp 10`, (e2, out2) => {
                     if (!e2) {

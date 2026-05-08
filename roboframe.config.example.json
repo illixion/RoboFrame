@@ -39,6 +39,8 @@
     "pirHttp": {
       "port": 8765
     },
+    "dimToOffSeconds": 120,
+    "_dimToOffSecondsComment": "Pi only. Two-stage power-down. A `display off` first dims the panel via DDC (instant, HDMI stays linked, wake is a single setvcp); after this many seconds of continued inactivity it escalates to `xset dpms force off`. Set to 0 to skip the dim stage and go straight to DPMS off. Set to null to never escalate — the display stays in the dim stage indefinitely.",
     "nightLight": {
       "_comment": "Optional. While the local clock falls inside [start, end), PIR-driven wake applies this brightness (user scale 0–255, mapped to DDC % on Pi). Outside the window, PIR wake leaves brightness alone. Set enabled:false to disable.",
       "enabled": false,

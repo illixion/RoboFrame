@@ -201,6 +201,7 @@ On-device daemon (per kiosk). Lives in `node-display/`.
 | `ACCESS_TOKEN` | `accessToken` *(top-level)* | *(required)* | Read-mostly access token; appended as `?token=` on connect. Must match the server's `ACCESS_TOKEN`. |
 | `SCREEN_WATCHER_PATH` | `display.screenWatcherPath` | *(none)* | Optional macOS screensaver event script |
 | `PIR_HTTP_PORT` | `display.pirHttp.port` | `8765` | Local HTTP listener for the on-device PIR agent (Linux/Pi) |
+| `DIM_TO_OFF_SECONDS` | `display.dimToOffSeconds` | `120` | Pi only. Two-stage power-down: a `display off` first drops the DDC backlight (instant, panel black, HDMI link stays alive — wake is a single setvcp). After this many seconds of continued inactivity, escalates to `xset dpms force off` so the panel actually sleeps. `0` disables the dim stage and goes straight to DPMS off (the previous behaviour). `null` disables the escalation — the display stays in the dim stage indefinitely, wake is always fast but the panel is never fully powered down. |
 
 ## PIR motion (Linux / Raspberry Pi)
 
