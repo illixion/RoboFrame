@@ -15,15 +15,28 @@
 // can't race a fresh `state:'on'` against a delayed `state:false`
 // echo.
 
-const { exec } = require('child_process');
+const { exec, execSync } = require('child_process');
 const { loadConfig, pickEnv } = require('@roboframe/shared');
+
+// HDMI-A-1's i2c bus index varies by Pi generation (Pi 3B+ = 2, Pi 4 = 20,
+// CM4/Pi 5 = different again). Discover it once at startup via
+// `ddcutil detect --terse`; fall back to 2 if detection fails so an
+// unplugged-at-boot panel still gets a sensible default. DDC_BUS env
+// overrides discovery.
+function discoverDdcBus() {
+    const override = process.env.DDC_BUS;
+    if (override) return override;
+    try {
+        const out = execSync('ddcutil detect --terse', { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+        const m = out.match(/I2C bus:\s*\/dev\/i2c-(\d+)/);
+        if (m) return m[1];
+    } catch (_) { /* fall through */ }
+    return '2';
+}
 
 function create() {
     const XRANDR_DISPLAY = ':0';
-    // The DDC bus index is stable enough to hard-code (Pi 3B+ HDMI-A-1 = i2c-2).
-    // Pinning avoids a per-call detect (~1s) and prevents stalls if EDID
-    // readback flaps.
-    const DDC_BUS = '2';
+    const DDC_BUS = discoverDdcBus();
     // VCP 0x10 minimum. The AOC panel rejects setvcp 10 0 (some firmwares
     // treat 0 as an invalid value rather than "off"), so the dim stage and
     // every brightness clamp floor at 1. Powering the panel down is the
