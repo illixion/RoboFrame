@@ -87,7 +87,11 @@ class Tags {
         try { localStorage.setItem('modTags', JSON.stringify(this.modTags)); }
         catch (_) { /* quota or private-mode failure — keep in-memory copy */ }
         if (state.socket && state.socket.readyState === WebSocket.OPEN) {
-            state.socket.send(JSON.stringify({ action: 'setModTags', payload: { tags: this.modTags } }));
+            state.socket.send(JSON.stringify({
+                sessionId: 'main',
+                action: 'setModTags',
+                payload: { tags: this.modTags },
+            }));
         }
     }
 

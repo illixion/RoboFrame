@@ -307,7 +307,20 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
             let parsed;
             try { parsed = JSON.parse(message); }
             catch (err) { console.warn(`Malformed JSON from ${clientId}: ${err.message}`); return; }
-            const { action, payload, token } = parsed;
+            const { action, payload, token, sessionId } = parsed;
+            // sessionId is the per-session multiplexing key. Required for
+            // every action that the orchestrator routes through a session
+            // (slideshowConfig, setModTags, requestNext, reshuffle,
+            // imageReady, displaySync). Connection-wide actions (block,
+            // setTagList, visibility, getDisplayState, ping, the various
+            // report* frames, rpcsend) ignore it.
+            function requireSessionId(label) {
+                if (typeof sessionId !== 'string' || !sessionId) {
+                    console.warn(`Missing sessionId on ${label} from ${clientId}; ignoring`);
+                    return false;
+                }
+                return true;
+            }
 
             if (action === 'block') {
                 // Blocklist is server-only state. We persist the new id and
@@ -415,21 +428,33 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 }
 
             } else if (action === 'slideshowConfig') {
-                if (orchestrator) orchestrator.register(ws, payload || {});
+                if (!requireSessionId('slideshowConfig')) return;
+                if (orchestrator) orchestrator.register(ws, sessionId, payload || {});
                 attachDeviceId(ws, payload?.deviceId);
 
+            } else if (action === 'sessionEnd') {
+                // Optional teardown for one logical session without closing
+                // the underlying ws. Useful when a multiplexing client
+                // closes one of N viewer windows but keeps others open.
+                if (!requireSessionId('sessionEnd')) return;
+                if (orchestrator) orchestrator.unregisterSession(ws, sessionId);
+
             } else if (action === 'setModTags') {
-                if (orchestrator) orchestrator.setModTags(ws, payload?.tags);
+                if (!requireSessionId('setModTags')) return;
+                if (orchestrator) orchestrator.setModTags(ws, sessionId, payload?.tags);
 
             } else if (action === 'requestNext') {
-                if (orchestrator) orchestrator.requestAdvance(ws);
+                if (!requireSessionId('requestNext')) return;
+                if (orchestrator) orchestrator.requestAdvance(ws, sessionId);
 
             } else if (action === 'reshuffle') {
-                if (orchestrator) orchestrator.requestReshuffle(ws);
+                if (!requireSessionId('reshuffle')) return;
+                if (orchestrator) orchestrator.requestReshuffle(ws, sessionId);
 
             } else if (action === 'imageReady') {
+                if (!requireSessionId('imageReady')) return;
                 if (orchestrator && payload?.id != null) {
-                    orchestrator.notifyImageReady(ws, payload.id);
+                    orchestrator.notifyImageReady(ws, sessionId, payload.id);
                 }
 
             } else if (action === 'setTagList') {
@@ -445,12 +470,12 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
 
             } else if (action === 'displaySync') {
                 // displaySync merges every channel into one for the duration
-                // of the claim. `enabled: true` makes the sender the merge
-                // driver (every other display mirrors the sender's channel);
-                // `enabled: false` releases the merge and each channel
-                // resumes its own cadence.
+                // of the claim. `enabled: true` makes the sender's channel
+                // the merge driver (every other display mirrors that
+                // channel); `enabled: false` releases the merge.
+                if (!requireSessionId('displaySync')) return;
                 if (typeof payload?.enabled === 'boolean' && orchestrator) {
-                    orchestrator.claimDisplaySync(ws, payload.enabled);
+                    orchestrator.claimDisplaySync(ws, sessionId, payload.enabled);
                 }
 
             } else if (action === 'rpcsend') {

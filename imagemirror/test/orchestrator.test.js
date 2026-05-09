@@ -28,6 +28,38 @@ function makeFakeWs() {
     };
 }
 
+// Most existing tests treat each ws as a single-session client. The
+// orchestrator's real API is multiplexed — every method takes a sessionId.
+// This shim auto-assigns a stable sessionId per ws so the existing call
+// sites stay readable; multi-session tests use `orch.raw` to bypass it.
+function withDefaultSession(orch) {
+    const idFor = new WeakMap();
+    let counter = 0;
+    function sid(ws) {
+        let id = idFor.get(ws);
+        if (!id) { id = `s${++counter}`; idFor.set(ws, id); }
+        return id;
+    }
+    return {
+        raw: orch,
+        sid,
+        register: (ws, payload) => orch.register(ws, sid(ws), payload),
+        setModTags: (ws, tags) => orch.setModTags(ws, sid(ws), tags),
+        requestAdvance: (ws) => orch.requestAdvance(ws, sid(ws)),
+        requestReshuffle: (ws) => orch.requestReshuffle(ws, sid(ws)),
+        notifyImageReady: (ws, id) => orch.notifyImageReady(ws, sid(ws), id),
+        claimDisplaySync: (ws, enabled) => orch.claimDisplaySync(ws, sid(ws), enabled),
+        notifyVisibility: (...args) => orch.notifyVisibility(...args),
+        notifyTagListChange: (...args) => orch.notifyTagListChange(...args),
+        notifyBlockedChange: (...args) => orch.notifyBlockedChange(...args),
+        unregister: (...args) => orch.unregister(...args),
+        unregisterSession: (...args) => orch.unregisterSession(...args),
+        close: () => orch.close(),
+        get _channels() { return orch._channels; },
+        _state: () => orch._state(),
+    };
+}
+
 // `pages` is consumed shared across all channels (the fake search returns
 // the next page on each call regardless of which channel asked). Tests that
 // need per-channel isolation provide explicit pages or override.
@@ -41,7 +73,7 @@ function harness({ tagLists = [['cats']], pages, blockedIds = [], blockedTags = 
     let currentList = 0;
     let blockIds = blockedIds.slice();
     let blockTags = blockedTags.slice();
-    const orch = createOrchestrator({
+    const rawOrch = createOrchestrator({
         search,
         broadcast,
         getCurrentTagsList: () => currentList,
@@ -50,6 +82,7 @@ function harness({ tagLists = [['cats']], pages, blockedIds = [], blockedTags = 
         getBlockedIds: () => blockIds,
         getBlockedTags: () => blockTags,
     });
+    const orch = withDefaultSession(rawOrch);
     return {
         orch,
         broadcasts,
@@ -68,8 +101,13 @@ function reportAllReady(orch, deviceId) {
     const channel = orch._channels.get(deviceId);
     if (!channel) return null;
     const id = channel.currentId;
-    for (const ws of channel.expectedReady) {
-        orch.notifyImageReady(ws, id);
+    // expectedReady holds session keys; resolve to the underlying ws/sessionId
+    // pair via channel.sessions and call the wrapper, which stamps the
+    // right sessionId.
+    for (const sess of channel.sessions.values()) {
+        if (channel.expectedReady.has(`${sess.ws.__rfWsId}:${sess.sessionId}`)) {
+            orch.notifyImageReady(sess.ws, id);
+        }
     }
     return id;
 }
@@ -394,6 +432,65 @@ test('reconnect within grace window restores channel state without slideshowConf
         'mod tags survived the disconnect');
 });
 
+test('multiplex: two sessions on one ws share a channel and get a single playback frame', async (t) => {
+    // Drives the raw API (sessionId as a first-class arg) since the
+    // shim is one-sessionId-per-ws. Two windows in one room sharing a
+    // device id and one connection is the canonical use case.
+    const { orch } = harness({
+        pages: [{
+            results: [
+                { _id: 1, file_ext: 'jpg' }, { _id: 2, file_ext: 'jpg' },
+                { _id: 3, file_ext: 'jpg' }, { _id: 4, file_ext: 'jpg' },
+                { _id: 5, file_ext: 'jpg' },
+            ],
+            nextCursor: 0,
+        }],
+    });
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    const raw = orch.raw;
+    raw.register(ws, 'win1', { deviceId: 'room', interval: 5000 });
+    raw.register(ws, 'win2', { deviceId: 'room', interval: 5000 });
+    await tick(); await tick(); await tick();
+
+    const channel = orch._channels.get('room');
+    assert.equal(channel.sessions.size, 2, 'both sessions live in the same channel');
+
+    // Force a fresh playback broadcast by walking the readiness barrier.
+    ws.sent.length = 0;
+    raw.notifyImageReady(ws, 'win1', channel.currentId);
+    raw.notifyImageReady(ws, 'win2', channel.currentId);
+    // Timer fires immediately when the barrier completes; the next advance
+    // is what we want to count broadcast frames against.
+    await tick(); await tick();
+    raw.requestAdvance(ws, 'win1');
+    await tick(); await tick();
+
+    const playbacks = ws.sent.filter((m) => m.action === 'playback');
+    assert.ok(playbacks.length >= 1, 'received at least one playback frame');
+    const last = playbacks[playbacks.length - 1];
+    assert.deepEqual(last.sessionIds.sort(), ['win1', 'win2'],
+        'one frame carries both sessionIds — no duplication on the wire');
+});
+
+test('multiplex: per-session unregister removes only that session from the channel', async (t) => {
+    const { orch } = harness();
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.raw.register(ws, 'win1', { deviceId: 'room', interval: 5000 });
+    orch.raw.register(ws, 'win2', { deviceId: 'room', interval: 5000 });
+    await tick(); await tick();
+    assert.equal(orch._channels.get('room').sessions.size, 2);
+
+    orch.raw.unregisterSession(ws, 'win1');
+    await tick();
+    const ch = orch._channels.get('room');
+    assert.equal(ch.sessions.size, 1, 'only win1 dropped');
+    // The remaining session still belongs to win2.
+    const survivor = Array.from(ch.sessions.values())[0];
+    assert.equal(survivor.sessionId, 'win2');
+});
+
 test('register with modTags bundles them into the first refill query', async (t) => {
     const queries = [];
     const search = {
@@ -403,13 +500,13 @@ test('register with modTags bundles them into the first refill query', async (t)
         },
         clearCache() {},
     };
-    const orch = createOrchestrator({
+    const orch = withDefaultSession(createOrchestrator({
         search,
         broadcast: () => {},
         getCurrentTagsList: () => 0,
         setCurrentTagsList: () => {},
-        getTagLists: () => [['baseTag']],
-    });
+        getTagLists: () => [["baseTag"]],
+    }));
     t.after(() => orch.close());
     const ws = makeFakeWs();
     orch.register(ws, {
@@ -468,13 +565,13 @@ test('setModTags clears queue and refills with the new query', async (t) => {
         },
         clearCache() {},
     };
-    const orch = createOrchestrator({
+    const orch = withDefaultSession(createOrchestrator({
         search,
         broadcast: () => {},
         getCurrentTagsList: () => 0,
         setCurrentTagsList: () => {},
-        getTagLists: () => [['baseTag']],
-    });
+        getTagLists: () => [["baseTag"]],
+    }));
     t.after(() => orch.close());
     const ws = makeFakeWs();
     orch.register(ws, { deviceId: 'kiosk1', interval: 5000 });
@@ -497,13 +594,13 @@ test('notifyTagListChange refills every active channel with the new list', async
         },
         clearCache() {},
     };
-    const orch = createOrchestrator({
+    const orch = withDefaultSession(createOrchestrator({
         search,
         broadcast: () => {},
         getCurrentTagsList: () => listIdx,
         setCurrentTagsList: (n) => { listIdx = n; },
         getTagLists: () => lists,
-    });
+    }));
     t.after(() => orch.close());
     const ws = makeFakeWs();
     orch.register(ws, { deviceId: 'kiosk1', interval: 5000 });

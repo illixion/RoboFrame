@@ -42,9 +42,15 @@ function showFatalBanner(text) {
     banner.textContent = text;
 }
 
+// Single-session client — every session-scoped action carries this
+// constant id. Multiplexing clients (Spatialstash multi-window) generate
+// per-window ids; the kiosk only ever has one slideshow per page.
+export const KIOSK_SESSION_ID = 'main';
+
 function sendSlideshowConfig() {
     const r = getRenderParams();
     state.socket.send(JSON.stringify({
+        sessionId: KIOSK_SESSION_ID,
         action: 'slideshowConfig',
         payload: {
             deviceId: state.deviceID,
@@ -196,7 +202,11 @@ export function connectWebSocket() {
 
 export function sendDisplaySync(enabled) {
     if (state.socket && state.socket.readyState === WebSocket.OPEN) {
-        state.socket.send(JSON.stringify({ action: 'displaySync', payload: { enabled } }));
+        state.socket.send(JSON.stringify({
+            sessionId: KIOSK_SESSION_ID,
+            action: 'displaySync',
+            payload: { enabled },
+        }));
     }
 }
 

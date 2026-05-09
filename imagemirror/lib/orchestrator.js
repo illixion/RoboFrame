@@ -4,8 +4,9 @@
 //
 // One channel per `deviceId`. Sessions joining a channel render the same
 // queue and advance in lockstep. A channel is created when the first session
-// for that deviceId calls `slideshowConfig`; it disappears when the last
-// session leaves (unless it's the merge driver — see displaySync below).
+// for that deviceId calls `slideshowConfig`; it lingers in a 2-minute grace
+// window when its last session leaves and is fully evicted at end-of-grace
+// (unless a session reconnects in time).
 //
 // Cadence is gated on a readiness barrier: after a `playback` frame is sent,
 // the channel waits until every visible session reports `imageReady { id }`
@@ -14,29 +15,34 @@
 // — they wouldn't render the image anyway — so they don't stall the barrier.
 //
 // Visibility for a deviceId pauses/resumes the dwell timer using a wall-clock
-// deadline (`dwellDeadline`). It never resets the deadline. This is the fix
-// for "leaving and re-entering a room refreshes the 15 s interval forever":
-// a wake just resumes the remaining time. If the dwell already expired while
-// hidden, the next advance fires immediately on resume.
+// deadline (`dwellDeadline`). It never resets the deadline.
 //
 // `displaySync` merges every channel into one for the duration of the claim.
-// While merged, the driver's channel broadcasts to every WS regardless of
-// deviceId, and the readiness barrier waits on every visible WS across all
-// channels. Non-driver channels' timers are paused. Releasing the claim
-// unwinds the merge: each non-driver channel re-broadcasts and resumes its
-// own cadence.
+// While merged, the driver's channel broadcasts to every session regardless
+// of deviceId, and the readiness barrier waits on every visible session
+// across all channels. Non-driver channels' timers are paused.
 //
-// Wire protocol (client → server):
-//   slideshowConfig { deviceId, interval, ratio, width, height, bright, convert, modTags? }
-//   setModTags      { tags: string[] }
-//   requestNext     {}
-//   imageReady      { id }                  // mark this session ready for `id`
-//   displaySync     { enabled: boolean }    // claim/release merge driver
-//   setTagList      { listNumber }          // change tag list (any client)
-//   visibility      { deviceId, visible }   // pauses dwell when display off
+// Sessions and the wire protocol — see docs/protocol.md for the full surface.
+// Each WS connection can host multiple logical *sessions*, addressed by a
+// per-message `sessionId`. The orchestrator's session key is `(ws, sessionId)`,
+// and a single ws can have sessions in multiple channels at once. This is
+// what lets one Spatialstash app instance multiplex several remote-viewer
+// windows over a single TCP/TLS path.
 //
-// Server → clients:
-//   playback { deviceId, mergeDriver, interval, currentList, modTags, current, next, upcoming[] }
+//   slideshowConfig { sessionId, deviceId, interval, ratio, width, height, bright, convert, modTags? }
+//   setModTags      { sessionId, tags }
+//   requestNext     { sessionId }
+//   reshuffle       { sessionId }
+//   imageReady      { sessionId, id }
+//   displaySync     { sessionId, enabled }
+//
+// Server → clients (session-scoped):
+//   playback { sessionIds: [...], payload: { deviceId, mergeDriver, interval,
+//                                            currentList, modTags, current,
+//                                            next, upcoming[] } }
+//   The `sessionIds` array carries every session on the receiving ws that
+//   belongs to this channel. One frame can therefore satisfy N sessions
+//   when multiple windows on one device share a connection.
 
 function createOrchestrator({
     search,
@@ -63,47 +69,63 @@ function createOrchestrator({
     // to re-bind. Fully empties (server-driven cleanup) still happen, just
     // delayed.
     const CHANNEL_GRACE_MS = 2 * 60 * 1000;
-    // How often the watchdog checks for channels that wedged in `idle` with an
-    // empty queue (first refill returned nothing, transient DB error, etc.)
-    // and re-attempts the refill so the slideshow recovers without needing
+    // How often the watchdog checks for channels that wedged in `idle` with
+    // an empty queue (first refill returned nothing, transient DB error,
+    // etc.) and re-attempts the refill so the slideshow recovers without
     // an external nudge.
     const IDLE_REFILL_INTERVAL_MS = 15000;
 
     const channels = new Map();           // deviceId → channel
-    const wsToChannel = new Map();        // ws → channel
+    // Stable per-ws id used to build session keys. Stored on the ws object
+    // itself — the ws is the source of truth, we don't need a separate
+    // Map keeping it alive past close.
+    let wsIdCounter = 0;
+    function ensureWsId(ws) {
+        if (!ws.__rfWsId) ws.__rfWsId = `w${++wsIdCounter}`;
+        return ws.__rfWsId;
+    }
+    function sessionKeyOf(ws, sessionId) {
+        return `${ensureWsId(ws)}:${sessionId}`;
+    }
+
+    // (ws, sessionId) → { ws, sessionId, channel, params, modTags }
+    const sessionsByKey = new Map();
+    // ws → Set<sessionKey>; lets us drop every session for a ws on close.
+    const wsSessions = new Map();
     const visibility = new Map();         // deviceId → boolean (true if no report)
     // displaySync merge is tracked as a property of the *driver channel*,
-    // not a specific ws. All sessions on the driver channel are considered
-    // equal — any of them can release. The original claimer leaving doesn't
-    // tear down the merge; only the driver channel itself going fully empty
-    // (after grace) does.
+    // not a specific ws or session. All sessions on the driver channel are
+    // considered equal — any of them can release. Original claimer leaving
+    // doesn't tear down the merge; only the driver channel itself going
+    // fully empty (after grace) does.
     let mergeDriverChannel = null;
 
     function makeChannel(deviceId) {
         return {
             deviceId,
-            sessions: new Map(),         // ws → { params, modTags }
+            // sessionKey → { ws, sessionId, params, modTags } (modTags also
+            // mirrored on `channel.modTags` — last-write-wins, see register).
+            sessions: new Map(),
             queue: [],                   // [{ id, ext }]
-            // Seed each channel at a random point in the random_ranks order so
+            // Seed each channel at a random point in random_ranks order so
             // two channels coming up at the same time don't show the same
-            // dc=0 head of the queue. Deterministic queries ignore this shape
-            // (they read cursor.offset, which is absent here → treated as 0).
+            // dc=0 head of the queue. Deterministic queries ignore this
+            // shape (they read cursor.offset, which is absent here → 0).
             cursor: { dc: 0, rank: Math.random() },
             modTags: [],
             interval: DEFAULT_INTERVAL_MS,
             currentId: null,
-            // Readiness barrier for the current image: `expectedReady` is the
-            // set of ws snapshotted when we last advanced; `ready` accumulates
-            // as those ws send `imageReady { id: currentId }`. Hidden ws are
-            // auto-included in `ready` so they don't stall the barrier.
+            // Readiness barrier for the current image. expectedReady is
+            // the set of sessionKeys snapshotted when we last advanced;
+            // ready accumulates as those sessions send `imageReady`. Hidden
+            // sessions are auto-included so they don't stall the barrier.
             expectedReady: new Set(),
             ready: new Set(),
             phase: 'idle',               // 'idle' | 'loading' | 'displaying'
             timer: null,
             readinessTimer: null,
             // Wall-clock deadline for the dwell timer. Set when entering
-            // 'displaying'; survives visibility-driven pauses so a wake
-            // resumes the remaining dwell rather than restarting it.
+            // 'displaying'; survives visibility-driven pauses.
             dwellDeadline: null,
             refilling: false,
             lastDisplayedId: null,
@@ -132,9 +154,9 @@ function createOrchestrator({
         return visibility.get(deviceId) !== false;
     }
 
-    function wsVisible(ws) {
-        const ch = wsToChannel.get(ws);
-        return ch ? deviceVisible(ch.deviceId) : true;
+    function sessionVisible(sessionKey) {
+        const sess = sessionsByKey.get(sessionKey);
+        return sess ? deviceVisible(sess.channel.deviceId) : true;
     }
 
     function channelActive(channel) {
@@ -159,14 +181,14 @@ function createOrchestrator({
     }
 
     // Targets for a channel's playback frame. While merged, the driver
-    // channel broadcasts to every ws across all channels; non-driver channels
-    // are silenced (their members hear the driver instead).
+    // channel's frame goes to every session across all channels; non-driver
+    // channels are silenced (their members hear the driver instead).
     function broadcastTargets(channel) {
         if (isMergeActive()) {
             if (channel !== mergeDriverChannel) return [];
             const all = [];
             for (const c of channels.values()) {
-                for (const ws of c.sessions.keys()) all.push(ws);
+                for (const key of c.sessions.keys()) all.push(key);
             }
             return all;
         }
@@ -174,11 +196,26 @@ function createOrchestrator({
     }
 
     function expectedReadersFor(channel) {
-        // Hidden ws are auto-ready: their kiosks won't render while hidden,
-        // so demanding an imageReady from them would stall every cycle for
-        // the full 10 s timeout.
-        const targets = broadcastTargets(channel).filter(wsVisible);
+        // Hidden sessions are auto-ready: their displays won't render
+        // while hidden, so demanding an imageReady from them would stall
+        // every cycle for the full 10 s timeout.
+        const targets = broadcastTargets(channel).filter(sessionVisible);
         return new Set(targets);
+    }
+
+    // Group session keys by their owning ws so a single send call
+    // delivers one playback frame per ws (carrying every sessionId on
+    // that ws that belongs to this channel).
+    function groupKeysByWs(keys) {
+        const byWs = new Map();
+        for (const key of keys) {
+            const sess = sessionsByKey.get(key);
+            if (!sess) continue;
+            let arr = byWs.get(sess.ws);
+            if (!arr) { arr = []; byWs.set(sess.ws, arr); }
+            arr.push(sess.sessionId);
+        }
+        return byWs;
     }
 
     function broadcastPlayback(channel) {
@@ -189,15 +226,22 @@ function createOrchestrator({
             channel.lastDisplayedId = payload.current.id;
             if (incrementDisplayCount) incrementDisplayCount(payload.current.id);
         }
-        const data = JSON.stringify({ action: 'playback', payload });
-        for (const ws of targets) {
+        const byWs = groupKeysByWs(targets);
+        for (const [ws, sessionIds] of byWs) {
+            const data = JSON.stringify({ action: 'playback', sessionIds, payload });
             try { ws.send(data); } catch (_) { /* socket gone */ }
         }
     }
 
-    function sendPlaybackTo(ws, channel) {
+    function sendPlaybackTo(sessionKey, channel) {
+        const sess = sessionsByKey.get(sessionKey);
+        if (!sess) return;
         try {
-            ws.send(JSON.stringify({ action: 'playback', payload: snapshot(channel) }));
+            sess.ws.send(JSON.stringify({
+                action: 'playback',
+                sessionIds: [sess.sessionId],
+                payload: snapshot(channel),
+            }));
         } catch (_) { /* socket gone */ }
     }
 
@@ -287,8 +331,6 @@ function createOrchestrator({
         if (!channel.dwellDeadline) return;
         const remaining = channel.dwellDeadline - Date.now();
         if (remaining <= 0) {
-            // Dwell already expired (e.g., display was hidden long enough
-            // for the deadline to pass). Advance now.
             advance(channel);
             return;
         }
@@ -300,8 +342,8 @@ function createOrchestrator({
 
     function startTimerIfReady(channel) {
         if (channel.phase !== 'loading') return;
-        for (const ws of channel.expectedReady) {
-            if (!channel.ready.has(ws)) return;
+        for (const key of channel.expectedReady) {
+            if (!channel.ready.has(key)) return;
         }
         promoteToDisplaying(channel);
     }
@@ -321,8 +363,7 @@ function createOrchestrator({
         channel.readinessTimer = setTimeout(() => {
             channel.readinessTimer = null;
             // Bad-network fallback: anyone who hasn't reported by now is
-            // treated as ready so the channel doesn't stall forever on a
-            // wedged client.
+            // treated as ready so the channel doesn't stall forever.
             if (channel.phase === 'loading') promoteToDisplaying(channel);
         }, READINESS_TIMEOUT_MS);
     }
@@ -350,8 +391,7 @@ function createOrchestrator({
         if (channel.expectedReady.size === 0) {
             // No visible readers — short-circuit straight to displaying so
             // the channel's wall-clock keeps advancing even when every
-            // display on the channel is dark. (When a display wakes, it
-            // catches up to whatever is current at that moment.)
+            // display on the channel is dark.
             promoteToDisplaying(channel);
         } else {
             armReadinessTimeout(channel);
@@ -360,17 +400,21 @@ function createOrchestrator({
 
     // ----- public API ------------------------------------------------------
 
-    function register(ws, payload = {}) {
+    function register(ws, sessionId, payload = {}) {
+        if (typeof sessionId !== 'string' || !sessionId) {
+            console.warn('[orchestrator] slideshowConfig without sessionId; ignoring');
+            return;
+        }
         const deviceId = String(payload.deviceId || '');
         if (!deviceId) {
             console.warn('[orchestrator] slideshowConfig without deviceId; ignoring');
             return;
         }
-        // Move ws between channels if its deviceId changed (rare — usually a
-        // reload with a different ?ws=).
-        const prevChannel = wsToChannel.get(ws);
-        if (prevChannel && prevChannel.deviceId !== deviceId) {
-            removeFromChannel(ws, prevChannel);
+        const key = sessionKeyOf(ws, sessionId);
+        const existing = sessionsByKey.get(key);
+        // Move session between channels if its deviceId changed.
+        if (existing && existing.channel.deviceId !== deviceId) {
+            removeSession(key);
         }
         const channel = getOrCreateChannel(deviceId);
         // Reconnect within the grace window: cancel teardown so we keep
@@ -382,7 +426,10 @@ function createOrchestrator({
             clearTimeout(channel.teardownTimer);
             channel.teardownTimer = null;
         }
-        const sess = channel.sessions.get(ws) || { modTags: [] };
+        const sess = sessionsByKey.get(key) || { ws, sessionId, channel, modTags: [] };
+        sess.ws = ws;
+        sess.sessionId = sessionId;
+        sess.channel = channel;
         sess.params = {
             interval: clampInterval(payload.interval),
             ratio: payload.ratio || null,
@@ -394,20 +441,23 @@ function createOrchestrator({
         if (Array.isArray(payload.modTags)) {
             sess.modTags = payload.modTags.map(String).filter(Boolean);
         }
-        channel.sessions.set(ws, sess);
-        wsToChannel.set(ws, channel);
+        sessionsByKey.set(key, sess);
+        channel.sessions.set(key, sess);
+        let wsKeys = wsSessions.get(ws);
+        if (!wsKeys) { wsKeys = new Set(); wsSessions.set(ws, wsKeys); }
+        wsKeys.add(key);
 
         // Last-write-wins on per-channel knobs. Merging differing intervals
-        // across two displays of the same deviceId would be a misconfig
-        // anyway; pick the latest joiner's value.
+        // across two displays of the same deviceId is a misconfig anyway;
+        // pick the latest joiner's value.
         channel.interval = sess.params.interval;
         if (sess.modTags.length) channel.modTags = sess.modTags.slice();
 
         const isFirstSession = channel.sessions.size === 1;
-        // While merged, point the new ws at the driver channel's playback so
-        // it joins the merged audience immediately.
+        // While merged, point the new session at the driver channel's
+        // playback so it joins the merged audience immediately.
         const playbackSource = isMergeActive() ? mergeDriverChannel : channel;
-        sendPlaybackTo(ws, playbackSource);
+        sendPlaybackTo(key, playbackSource);
 
         if (isFirstSession) {
             if (channel.queue.length === 0) {
@@ -419,24 +469,34 @@ function createOrchestrator({
                 commitCurrent(channel);
             }
         } else {
-            // Existing channel — fold the new ws into the readiness barrier
-            // for the current image if we're still loading and it's visible.
+            // Existing channel — fold the new session into the readiness
+            // barrier for the current image if we're still loading and
+            // the session is visible.
             const target = isMergeActive() ? mergeDriverChannel : channel;
-            if (target.phase === 'loading' && wsVisible(ws)) {
-                target.expectedReady.add(ws);
+            if (target.phase === 'loading' && sessionVisible(key)) {
+                target.expectedReady.add(key);
             }
         }
     }
 
-    function removeFromChannel(ws, channel) {
-        channel.sessions.delete(ws);
-        channel.expectedReady.delete(ws);
-        channel.ready.delete(ws);
+    function removeSession(key) {
+        const sess = sessionsByKey.get(key);
+        if (!sess) return;
+        const { ws, channel } = sess;
+        sessionsByKey.delete(key);
+        channel.sessions.delete(key);
+        channel.expectedReady.delete(key);
+        channel.ready.delete(key);
+        const wsKeys = wsSessions.get(ws);
+        if (wsKeys) {
+            wsKeys.delete(key);
+            if (wsKeys.size === 0) wsSessions.delete(ws);
+        }
         if (channel.sessions.size === 0) {
             // Last session left — pause cadence and start the grace
             // window. State (queue, modTags, interval, currentId, merge
-            // claim) is preserved so a quick reconnect picks up where
-            // it left off without replaying slideshowConfig.
+            // claim) is preserved so a quick reconnect picks up where it
+            // left off without replaying slideshowConfig.
             stopDwellTimer(channel);
             if (channel.readinessTimer) {
                 clearTimeout(channel.readinessTimer);
@@ -454,9 +514,6 @@ function createOrchestrator({
         if (channel.teardownTimer) clearTimeout(channel.teardownTimer);
         channel.teardownTimer = setTimeout(() => {
             channel.teardownTimer = null;
-            // Re-check: a session may have joined just before the timer
-            // fired. (clearTimeout in `register` handles the common case,
-            // but JS timer semantics make the explicit guard worth it.)
             if (channel.sessions.size > 0) return;
             evictChannel(channel);
         }, CHANNEL_GRACE_MS);
@@ -474,30 +531,35 @@ function createOrchestrator({
         channels.delete(channel.deviceId);
         if (channel === mergeDriverChannel) {
             // Driver channel actually went away. Release the merge so
-            // remaining channels resume their own cadences instead of
-            // mirroring a ghost. (Until eviction, we deliberately keep
-            // the claim — see the displaySync comment in `unregister`.)
+            // remaining channels resume their own cadences.
             releaseMerge();
         }
     }
 
-    function unregister(ws) {
-        const channel = wsToChannel.get(ws);
-        wsToChannel.delete(ws);
-        if (channel) removeFromChannel(ws, channel);
-        // Note: the original claimer of displaySync leaving does NOT
-        // release the merge. All sessions on the driver channel are
-        // considered equal — any of them can release, and a transient
-        // disconnect of the claimer shouldn't disrupt the merge for
-        // everyone else. The merge only releases when the driver
-        // channel itself is evicted (after the grace window).
+    /// Drop a single session from this ws (per-sessionId teardown).
+    function unregisterSession(ws, sessionId) {
+        if (typeof sessionId !== 'string' || !sessionId) return;
+        const key = sessionKeyOf(ws, sessionId);
+        removeSession(key);
     }
 
-    function setModTags(ws, tags) {
-        const channel = wsToChannel.get(ws);
-        if (!channel) return;
-        const sess = channel.sessions.get(ws);
+    /// Drop every session attached to a ws (typically called from the
+    /// broker's `close` handler).
+    function unregister(ws) {
+        const wsKeys = wsSessions.get(ws);
+        if (!wsKeys) return;
+        // Iterate over a copy — removeSession mutates wsKeys via the
+        // sessionsByKey deletion path.
+        for (const key of Array.from(wsKeys)) removeSession(key);
+        // Note: a ws closing does NOT release a held merge claim. Only
+        // full eviction of the driver channel does that (after grace).
+    }
+
+    function setModTags(ws, sessionId, tags) {
+        const key = sessionKeyOf(ws, sessionId);
+        const sess = sessionsByKey.get(key);
         if (!sess) return;
+        const channel = sess.channel;
         sess.modTags = Array.isArray(tags) ? tags.map(String).filter(Boolean) : [];
         // While merged, only sessions on the driver channel can change
         // mod tags. Audience channels are borrowed and shouldn't override
@@ -508,33 +570,36 @@ function createOrchestrator({
         clearAndRefill(channel).then(() => commitCurrent(channel));
     }
 
-    function requestAdvance(ws) {
-        const channel = wsToChannel.get(ws);
-        if (!channel) return;
-        const target = isMergeActive() ? mergeDriverChannel : channel;
+    function requestAdvance(ws, sessionId) {
+        const key = sessionKeyOf(ws, sessionId);
+        const sess = sessionsByKey.get(key);
+        if (!sess) return;
+        const target = isMergeActive() ? mergeDriverChannel : sess.channel;
         advance(target);
     }
 
-    async function requestReshuffle(ws) {
-        const channel = wsToChannel.get(ws);
-        if (!channel) return;
+    async function requestReshuffle(ws, sessionId) {
+        const key = sessionKeyOf(ws, sessionId);
+        const sess = sessionsByKey.get(key);
+        if (!sess) return;
         if (reshuffle) {
             try { await reshuffle(); }
             catch (err) { console.warn(`[orchestrator] reshuffle failed: ${err.message}`); }
         }
-        const target = isMergeActive() ? mergeDriverChannel : channel;
+        const target = isMergeActive() ? mergeDriverChannel : sess.channel;
         await clearAndRefill(target);
         commitCurrent(target);
     }
 
-    function notifyImageReady(ws, id) {
-        const wsChannel = wsToChannel.get(ws);
-        if (!wsChannel) return;
-        const target = isMergeActive() ? mergeDriverChannel : wsChannel;
+    function notifyImageReady(ws, sessionId, id) {
+        const key = sessionKeyOf(ws, sessionId);
+        const sess = sessionsByKey.get(key);
+        if (!sess) return;
+        const target = isMergeActive() ? mergeDriverChannel : sess.channel;
         if (target.phase !== 'loading') return;
         if (Number(id) !== Number(target.currentId)) return;
-        if (!target.expectedReady.has(ws)) return;
-        target.ready.add(ws);
+        if (!target.expectedReady.has(key)) return;
+        target.ready.add(key);
         startTimerIfReady(target);
     }
 
@@ -550,17 +615,13 @@ function createOrchestrator({
         const affected = isMergeActive()
             ? (deviceId === mergeDriverChannel.deviceId ? [mergeDriverChannel] : [])
             : Array.from(channels.values()).filter((c) => c.deviceId === deviceId
-                || broadcastTargets(c).some((w) => wsToChannel.get(w)?.deviceId === deviceId));
+                || broadcastTargets(c).some((k) => sessionsByKey.get(k)?.channel.deviceId === deviceId));
 
         for (const channel of affected) {
             if (channel.phase === 'loading') {
-                // Visible→hidden: drop hidden ws from the barrier. Hidden→visible
-                // for a ws that's now expected: kiosk re-renders on wake and
-                // will report imageReady; add it back to the barrier.
                 channel.expectedReady = expectedReadersFor(channel);
-                // Drop ready entries for ws no longer expected (keeps sets aligned).
-                for (const ws of Array.from(channel.ready)) {
-                    if (!channel.expectedReady.has(ws)) channel.ready.delete(ws);
+                for (const key of Array.from(channel.ready)) {
+                    if (!channel.expectedReady.has(key)) channel.ready.delete(key);
                 }
                 if (channel.expectedReady.size === 0) {
                     promoteToDisplaying(channel);
@@ -568,8 +629,6 @@ function createOrchestrator({
                     startTimerIfReady(channel);
                 }
             } else if (channel.phase === 'displaying') {
-                // Pause/resume the dwell timer. Hidden → cancel timer but
-                // keep dwellDeadline; visible → reschedule with remaining.
                 if (channelActive(channel)) {
                     if (!channel.timer) scheduleDwell(channel);
                 } else {
@@ -595,8 +654,6 @@ function createOrchestrator({
         for (const channel of channels.values()) {
             const before = channel.queue.length;
             channel.queue = channel.queue.filter((entry) => !blockedIdSet.has(Number(entry.id)));
-            // Tag-block requires re-querying since post tags aren't in the
-            // queue entries. ID-only blocks can re-use the existing queue.
             if (blockedTagSet.size > 0 && search?.clearCache) search.clearCache();
             if (isMergeActive() && channel !== mergeDriverChannel) continue;
             const dropped = channel.queue.length !== before;
@@ -608,9 +665,11 @@ function createOrchestrator({
         }
     }
 
-    function claimDisplaySync(ws, enabled) {
-        const channel = wsToChannel.get(ws);
-        if (!channel) return;
+    function claimDisplaySync(ws, sessionId, enabled) {
+        const key = sessionKeyOf(ws, sessionId);
+        const sess = sessionsByKey.get(key);
+        if (!sess) return;
+        const channel = sess.channel;
         if (enabled) {
             if (mergeDriverChannel === channel) return;
             mergeDriverChannel = channel;
@@ -624,8 +683,6 @@ function createOrchestrator({
                 c.phase = 'idle';
                 c.dwellDeadline = null;
             }
-            // Re-enter loading on the driver, now expecting reports from the
-            // merged audience (every visible WS across all channels).
             channel.expectedReady = expectedReadersFor(channel);
             channel.ready = new Set();
             channel.phase = 'loading';
@@ -642,8 +699,6 @@ function createOrchestrator({
         const wasDriver = mergeDriverChannel;
         mergeDriverChannel = null;
         if (!wasDriver) return;
-        // Each non-driver channel resumes its own playback. Driver shrinks
-        // its audience back to its own sessions.
         for (const channel of channels.values()) {
             if (channel === wasDriver) {
                 channel.expectedReady = expectedReadersFor(channel);
@@ -666,14 +721,6 @@ function createOrchestrator({
         }
     }
 
-    // Watchdog: any channel that's in `idle` with an empty queue is wedged —
-    // its first refill returned nothing (empty DB, mismatched tag list,
-    // transient search error). Without this tick, nothing in the orchestrator
-    // would ever try the refill again, so the slideshow stays dead until an
-    // external event (`requestNext`, `setTagList`, displaySync claim) kicks
-    // it. Re-attempt the refill on a coarse interval so the queue recovers
-    // automatically once the underlying issue clears (DB attached, tag list
-    // edited, network restored).
     const idleRefillTimer = setInterval(() => {
         for (const channel of channels.values()) {
             if (channel.phase !== 'idle') continue;
@@ -703,13 +750,15 @@ function createOrchestrator({
             channel.queue.length = 0;
         }
         channels.clear();
-        wsToChannel.clear();
+        sessionsByKey.clear();
+        wsSessions.clear();
         mergeDriverChannel = null;
     }
 
     return {
         register,
         unregister,
+        unregisterSession,
         setModTags,
         requestAdvance,
         requestReshuffle,

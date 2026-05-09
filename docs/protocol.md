@@ -34,28 +34,65 @@ imageReady, sensor) only.
 
 ## Channels and sessions
 
-A **session** is one WebSocket connection that has called `slideshowConfig`.
-A session belongs to the **channel** for the `deviceId` it registered
-with. Two sessions on the same `deviceId` (e.g., a browser kiosk and a
-Spatialstash window both pointed at `screen1`) share one channel and
+A **session** is one logical slideshow audience addressed by a `sessionId`
+on a WebSocket connection. Each WS can carry many sessions — this is how
+a single Spatialstash app instance multiplexes ten remote-viewer windows
+over one TCP/TLS path. Each session calls `slideshowConfig` independently
+to join the **channel** for its `deviceId`. Two sessions on the same
+`deviceId` (whether on one ws or across many) share one channel and
 lockstep on the same image. Different `deviceId`s get independent
 channels with independent queues, intervals, and tag lists.
 
-A WebSocket that *never* sends `slideshowConfig` (e.g., node-display) is
-not a session — it can still send `visibility`, `reportDisplay`, etc.
-to drive hardware state, but it isn't expected to render images and is
+A WebSocket that *never* sends `slideshowConfig` (e.g., node-display) has
+no sessions — it can still send `visibility`, `reportDisplay`, etc. to
+drive hardware state, but it isn't expected to render images and is
 ignored by playback timing.
+
+### Session ids
+
+Every session-scoped action (the ones that route through the orchestrator
+— `slideshowConfig`, `setModTags`, `requestNext`, `reshuffle`,
+`imageReady`, `displaySync`, plus the optional `sessionEnd`) carries a
+top-level `sessionId` string that names the session within the
+connection:
+
+```json
+{ "sessionId": "win1", "action": "...", "payload": { ... } }
+```
+
+Single-session clients (web kiosk, node-display) use a constant id like
+`"main"`. The id only needs to be unique *within* a connection; the
+server scopes it under the ws. Connection-wide actions (`block`,
+`setTagList`, `visibility`, `getDisplayState`, `ping`, `report*`,
+`rpcsend`) ignore `sessionId`.
+
+A session is created the first time the server sees `slideshowConfig`
+for a `(ws, sessionId)` pair. Closing the underlying ws drops every
+session attached to it; sending `sessionEnd { sessionId }` drops just
+that one without disturbing the others.
+
+### Channel grace window
+
+When the last session on a channel disconnects (or is `sessionEnd`-ed)
+the channel is *not* deleted immediately — its queue, cursor, mod tags,
+interval, currentId, and any held merge claim linger for 2 minutes. A
+reconnecting client (typical sleep/wake on a visionOS window) is rebound
+to the surviving channel automatically when its `slideshowConfig` lands.
+Cadence is paused for the duration; if no session rejoins by 2 min the
+channel is fully evicted and any held merge claim is released.
 
 ## Client → server messages
 
-Every message is `{ "action": "<name>", "payload": { ... } }`. Unknown
-actions are logged and dropped.
+Every message is `{ "sessionId"?: "<id>", "action": "<name>", "payload": { ... } }`.
+Unknown actions are logged and dropped. `sessionId` is required on
+session-scoped actions (see [Session ids](#session-ids) above).
 
-### `slideshowConfig` (required)
-Joins this session to the channel for `deviceId`. Send on every (re)connect.
+### `slideshowConfig` (required, session-scoped)
+Joins this session to the channel for `deviceId`. Send on every
+(re)connect — the server uses it as the session-create signal.
 
 ```json
-{ "action": "slideshowConfig", "payload": {
+{ "sessionId": "win1", "action": "slideshowConfig", "payload": {
   "deviceId": "screen1",
   "interval": 15000,
   "ratio": "16:9",
@@ -72,11 +109,11 @@ Joins this session to the channel for `deviceId`. Send on every (re)connect.
   query already includes them — without that the initial query is
   discarded a few ms later when a separate `setModTags` arrives.
 
-### `imageReady` (required for slideshow sessions)
+### `imageReady` (required for slideshow sessions, session-scoped)
 Tell the server the channel's current image is fully on screen.
 
 ```json
-{ "action": "imageReady", "payload": { "id": 4181569 } }
+{ "sessionId": "win1", "action": "imageReady", "payload": { "id": 4181569 } }
 ```
 
 The orchestrator's readiness barrier waits for every visible session
@@ -102,29 +139,40 @@ timer using a wall-clock deadline; `true` resumes the *remaining* time
 (or advances immediately if the deadline already passed). Never bumps
 the deadline — see *Visibility never resets the timer* below.
 
-### `requestNext`
-Advance the current channel one step. Any session may call it.
+### `requestNext` (session-scoped)
+Advance the current channel one step. Any session on the channel may call it.
 
 ```json
-{ "action": "requestNext" }
+{ "sessionId": "win1", "action": "requestNext" }
 ```
 
 While `displaySync` is active the merge driver's channel advances and
 every connected display sees the same new image.
 
-### `reshuffle`
+### `reshuffle` (session-scoped)
 Wipe the queue and redraw a fresh page from the search backend.
 
 ```json
-{ "action": "reshuffle" }
+{ "sessionId": "win1", "action": "reshuffle" }
 ```
 
-### `setModTags`
+### `setModTags` (session-scoped)
 Update mod tags for this channel (last-write-wins among same-channel
 sessions). Triggers a clear+refill.
 
 ```json
-{ "action": "setModTags", "payload": { "tags": ["rating:s", "-blood"] } }
+{ "sessionId": "win1", "action": "setModTags",
+  "payload": { "tags": ["rating:s", "-blood"] } }
+```
+
+### `sessionEnd` (session-scoped, optional)
+Tear down one logical session without closing the underlying ws. Useful
+when a multiplexing client closes one of N viewer windows but keeps the
+others open. Closing the ws drops every session anyway, so single-session
+clients don't need this.
+
+```json
+{ "sessionId": "win1", "action": "sessionEnd" }
 ```
 
 ### `setTagList`
@@ -149,19 +197,22 @@ frame as a result; there is no separate `blocked` echo). Blocklists
 live in `imagemirror/data.json` and are server-only — clients never
 receive them on the wire. Hand-editing the file has the same effect.
 
-### `displaySync`
-Claim or release the merge driver role.
+### `displaySync` (session-scoped)
+Claim or release the merge driver role for the sender's channel.
 
 ```json
-{ "action": "displaySync", "payload": { "enabled": true } }
+{ "sessionId": "win1", "action": "displaySync", "payload": { "enabled": true } }
 ```
 
-`enabled: true` makes this session the merge driver: every channel is
-paused, and the driver's channel broadcasts to every connected
-display regardless of `deviceId`. The merged readiness barrier waits
-on every visible session across all channels. `enabled: false`
-releases the merge — each channel resumes its own cadence and
-re-broadcasts to its own audience. Driver disconnect auto-releases.
+`enabled: true` makes the sender's channel the merge driver: every
+other channel is paused, and the driver's channel broadcasts to every
+connected display regardless of `deviceId`. The merged readiness
+barrier waits on every visible session across all channels.
+`enabled: false` releases the merge — each channel resumes its own
+cadence and re-broadcasts to its own audience. All sessions on the
+driver channel are equals (any can release), and the original claimer
+disconnecting does *not* release the merge — it only releases when the
+driver channel is fully evicted (after the grace window).
 
 ### `reportDisplay`, `reportSensor`, `reportWebcam`
 Hardware-state reports from node-display (or any controller) into the
@@ -207,10 +258,15 @@ WebSocket query token and as a `token` field on the message itself.
 
 ### `playback`
 The channel's playback state. Pushed on every advance, displaySync claim,
-mod-tag change, tag-list change, or visibility-driven resume.
+mod-tag change, tag-list change, or visibility-driven resume. The only
+server-pushed frame that's session-scoped — `sessionIds` carries every
+session on the receiving ws that this frame is destined for. One frame
+can therefore satisfy N sessions when multiple windows on one device
+share a connection (e.g. all 10 windows in a room → one playback frame
+with `sessionIds: ["win1", ..., "win10"]`).
 
 ```json
-{ "action": "playback", "payload": {
+{ "action": "playback", "sessionIds": ["win1"], "payload": {
   "deviceId": "screen1",
   "mergeDriver": null,
   "interval": 15000,

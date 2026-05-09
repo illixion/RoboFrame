@@ -309,15 +309,18 @@ export function applyPlayback(payload) {
     }
 }
 
+// Single-session client: every session-scoped frame uses a constant id.
+const KIOSK_SESSION_ID = 'main';
+
 export function requestNext() {
     if (state.socket && state.socket.readyState === WebSocket.OPEN) {
-        state.socket.send(JSON.stringify({ action: 'requestNext' }));
+        state.socket.send(JSON.stringify({ sessionId: KIOSK_SESSION_ID, action: 'requestNext' }));
     }
 }
 
 export function requestReshuffle() {
     if (state.socket && state.socket.readyState === WebSocket.OPEN) {
-        state.socket.send(JSON.stringify({ action: 'reshuffle' }));
+        state.socket.send(JSON.stringify({ sessionId: KIOSK_SESSION_ID, action: 'reshuffle' }));
     }
 }
 
@@ -328,7 +331,11 @@ export function requestReshuffle() {
 function reportImageReady(postId) {
     if (!postId) return;
     if (state.socket && state.socket.readyState === WebSocket.OPEN) {
-        state.socket.send(JSON.stringify({ action: 'imageReady', payload: { id: postId } }));
+        state.socket.send(JSON.stringify({
+            sessionId: KIOSK_SESSION_ID,
+            action: 'imageReady',
+            payload: { id: postId },
+        }));
     }
 }
 
