@@ -243,9 +243,12 @@ function applyParamFlags() {
     if (Number(params.list)) tags.set(Number(params.list));
     if (Number(params.delay)) state.interval = Number(params.delay) * 1000;
 
-    if (Number(params.static) && !Number(params.noclock)) {
+    if (Number(params.static)) {
         const style = document.createElement('style');
-        style.innerHTML = `.fullscreen-media { animation: none !important; transform: translateX(-50%) !important; }`;
+        style.innerHTML = `
+            .fullscreen-media { animation: none !important; transform: translateX(-50%) !important; }
+            .fullscreen-media.alt-fit { animation: none !important; transform: none !important; }
+        `;
         document.head.appendChild(style);
     }
 }

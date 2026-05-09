@@ -262,7 +262,8 @@ export function crossfadeFullscreenMedia(container, newMediaUrl, postId, isVideo
                     const { focusX, focusY } = await findSobelFocus(img);
                     if (renderToken !== currentRenderToken) return;
                     img.style.transformOrigin = `${focusX * 100}% ${focusY * 100}%`;
-                    img.style.animation = `kenburns-zoom ${state.interval / 1000}s ease-in-out forwards`;
+                    const kenburnsName = Number(params.noclock) ? 'kenburns-zoom-alt' : 'kenburns-zoom';
+                    img.style.animation = `${kenburnsName} ${state.interval / 1000}s ease-in-out forwards`;
                 } catch (e) {
                     console.warn('Sobel focus failed; rendering without Ken Burns:', e);
                 }
