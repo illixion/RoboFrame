@@ -85,9 +85,19 @@ updates to track a server change, ship those too:
   kiosk's old `wakeAdvance` was deleted for this reason.
 - **`displaySync` is a merge.** The claimer's channel broadcasts to
   every WS regardless of `deviceId`; other channels' timers pause until
-  release. Driver disconnect auto-releases. Anyone can `requestNext` /
-  `block` / `setModTags` — no primary gate; the server is the only
-  emitter of `playback` so there's no echo loop.
+  release. All sessions on the driver channel are equal — the claimer
+  ws disconnecting does not release the merge; only full eviction of
+  the driver channel does (after the grace window). Anyone can
+  `requestNext` / `block` / `setModTags` — no primary gate; the server
+  is the only emitter of `playback` so there's no echo loop.
+- **Channel grace window.** When the last session on a channel
+  disconnects the channel is *not* deleted immediately — its queue,
+  cursor, mod tags, interval, currentId, and merge claim are kept for
+  2 minutes. A reconnecting client (typical sleep/wake on a visionOS
+  window) is rebound to the surviving channel and resumes without
+  having to replay `slideshowConfig`. Cadence is paused for the
+  duration; if no session rejoins by 2 min, the channel is evicted and
+  any held merge claim is released.
 - **Server-side blocklist.** The orchestrator filters blocked posts
   out of every channel's queue and advances any channel that was just
   showing one. Don't add client-side defensive filtering.

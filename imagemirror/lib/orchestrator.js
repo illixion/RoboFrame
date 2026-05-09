@@ -55,6 +55,14 @@ function createOrchestrator({
     const DEFAULT_INTERVAL_MS = 15000;
     const MIN_INTERVAL_MS = 2000;
     const MAX_INTERVAL_MS = 3600000;
+    // How long an empty channel lingers before it's torn down. A
+    // disconnecting visionOS window — sleep/wake or transient network —
+    // will reconnect well within this window, so its channel state
+    // (queue, mod tags, interval, displaySync claim, currentId) survives
+    // the round-trip and the client doesn't have to replay slideshowConfig
+    // to re-bind. Fully empties (server-driven cleanup) still happen, just
+    // delayed.
+    const CHANNEL_GRACE_MS = 2 * 60 * 1000;
     // How often the watchdog checks for channels that wedged in `idle` with an
     // empty queue (first refill returned nothing, transient DB error, etc.)
     // and re-attempts the refill so the slideshow recovers without needing
@@ -64,8 +72,12 @@ function createOrchestrator({
     const channels = new Map();           // deviceId → channel
     const wsToChannel = new Map();        // ws → channel
     const visibility = new Map();         // deviceId → boolean (true if no report)
-    let mergeDriverWs = null;             // ws claiming displaySync
-    let mergeDriverChannel = null;        // channel that ws belongs to
+    // displaySync merge is tracked as a property of the *driver channel*,
+    // not a specific ws. All sessions on the driver channel are considered
+    // equal — any of them can release. The original claimer leaving doesn't
+    // tear down the merge; only the driver channel itself going fully empty
+    // (after grace) does.
+    let mergeDriverChannel = null;
 
     function makeChannel(deviceId) {
         return {
@@ -95,6 +107,10 @@ function createOrchestrator({
             dwellDeadline: null,
             refilling: false,
             lastDisplayedId: null,
+            // Set when sessions hit zero; cleared if a session rejoins
+            // before it fires. On expiry the channel is fully evicted
+            // (and a held merge claim is released).
+            teardownTimer: null,
         };
     }
 
@@ -357,6 +373,15 @@ function createOrchestrator({
             removeFromChannel(ws, prevChannel);
         }
         const channel = getOrCreateChannel(deviceId);
+        // Reconnect within the grace window: cancel teardown so we keep
+        // queue / modTags / interval / currentId / merge claim. Existing
+        // dwellDeadline (if any) is invalidated below by commitCurrent's
+        // reset path, so the slideshow restarts the readiness barrier
+        // for the same image rather than firing immediately.
+        if (channel.teardownTimer) {
+            clearTimeout(channel.teardownTimer);
+            channel.teardownTimer = null;
+        }
         const sess = channel.sessions.get(ws) || { modTags: [] };
         sess.params = {
             interval: clampInterval(payload.interval),
@@ -407,14 +432,17 @@ function createOrchestrator({
         channel.sessions.delete(ws);
         channel.expectedReady.delete(ws);
         channel.ready.delete(ws);
-        // Drop the channel if it's empty and not pinned by a merge claim.
-        if (channel.sessions.size === 0 && channel !== mergeDriverChannel) {
+        if (channel.sessions.size === 0) {
+            // Last session left — pause cadence and start the grace
+            // window. State (queue, modTags, interval, currentId, merge
+            // claim) is preserved so a quick reconnect picks up where
+            // it left off without replaying slideshowConfig.
             stopDwellTimer(channel);
             if (channel.readinessTimer) {
                 clearTimeout(channel.readinessTimer);
                 channel.readinessTimer = null;
             }
-            channels.delete(channel.deviceId);
+            scheduleChannelTeardown(channel);
         } else if (channel.phase === 'loading') {
             // Disconnect during the readiness barrier — re-check now that
             // the expected set is smaller.
@@ -422,15 +450,47 @@ function createOrchestrator({
         }
     }
 
+    function scheduleChannelTeardown(channel) {
+        if (channel.teardownTimer) clearTimeout(channel.teardownTimer);
+        channel.teardownTimer = setTimeout(() => {
+            channel.teardownTimer = null;
+            // Re-check: a session may have joined just before the timer
+            // fired. (clearTimeout in `register` handles the common case,
+            // but JS timer semantics make the explicit guard worth it.)
+            if (channel.sessions.size > 0) return;
+            evictChannel(channel);
+        }, CHANNEL_GRACE_MS);
+        if (typeof channel.teardownTimer.unref === 'function') {
+            channel.teardownTimer.unref();
+        }
+    }
+
+    function evictChannel(channel) {
+        stopDwellTimer(channel);
+        if (channel.readinessTimer) {
+            clearTimeout(channel.readinessTimer);
+            channel.readinessTimer = null;
+        }
+        channels.delete(channel.deviceId);
+        if (channel === mergeDriverChannel) {
+            // Driver channel actually went away. Release the merge so
+            // remaining channels resume their own cadences instead of
+            // mirroring a ghost. (Until eviction, we deliberately keep
+            // the claim — see the displaySync comment in `unregister`.)
+            releaseMerge();
+        }
+    }
+
     function unregister(ws) {
         const channel = wsToChannel.get(ws);
         wsToChannel.delete(ws);
-        if (mergeDriverWs === ws) {
-            // Driver dropped — release the merge automatically so the
-            // remaining displays don't get stuck mirroring a ghost.
-            releaseMerge();
-        }
         if (channel) removeFromChannel(ws, channel);
+        // Note: the original claimer of displaySync leaving does NOT
+        // release the merge. All sessions on the driver channel are
+        // considered equal — any of them can release, and a transient
+        // disconnect of the claimer shouldn't disrupt the merge for
+        // everyone else. The merge only releases when the driver
+        // channel itself is evicted (after the grace window).
     }
 
     function setModTags(ws, tags) {
@@ -439,9 +499,11 @@ function createOrchestrator({
         const sess = channel.sessions.get(ws);
         if (!sess) return;
         sess.modTags = Array.isArray(tags) ? tags.map(String).filter(Boolean) : [];
-        // While merged, only the driver's ws can change modTags — other
-        // displays are borrowed and shouldn't override what the driver set.
-        if (isMergeActive() && ws !== mergeDriverWs) return;
+        // While merged, only sessions on the driver channel can change
+        // mod tags. Audience channels are borrowed and shouldn't override
+        // what the driver channel set. Within the driver channel any
+        // session can change them — all sessions are equal peers.
+        if (isMergeActive() && channel !== mergeDriverChannel) return;
         channel.modTags = sess.modTags.slice();
         clearAndRefill(channel).then(() => commitCurrent(channel));
     }
@@ -547,11 +609,10 @@ function createOrchestrator({
     }
 
     function claimDisplaySync(ws, enabled) {
+        const channel = wsToChannel.get(ws);
+        if (!channel) return;
         if (enabled) {
-            const channel = wsToChannel.get(ws);
-            if (!channel) return;
-            if (mergeDriverWs === ws && mergeDriverChannel === channel) return;
-            mergeDriverWs = ws;
+            if (mergeDriverChannel === channel) return;
             mergeDriverChannel = channel;
             for (const c of channels.values()) {
                 if (c === channel) continue;
@@ -571,14 +632,14 @@ function createOrchestrator({
             broadcastPlayback(channel);
             if (channel.expectedReady.size === 0) promoteToDisplaying(channel);
             else armReadinessTimeout(channel);
-        } else if (mergeDriverWs === ws) {
+        } else if (channel === mergeDriverChannel) {
+            // Any session on the driver channel can release the merge.
             releaseMerge();
         }
     }
 
     function releaseMerge() {
         const wasDriver = mergeDriverChannel;
-        mergeDriverWs = null;
         mergeDriverChannel = null;
         if (!wasDriver) return;
         // Each non-driver channel resumes its own playback. Driver shrinks
@@ -634,12 +695,15 @@ function createOrchestrator({
                 clearTimeout(channel.readinessTimer);
                 channel.readinessTimer = null;
             }
+            if (channel.teardownTimer) {
+                clearTimeout(channel.teardownTimer);
+                channel.teardownTimer = null;
+            }
             channel.sessions.clear();
             channel.queue.length = 0;
         }
         channels.clear();
         wsToChannel.clear();
-        mergeDriverWs = null;
         mergeDriverChannel = null;
     }
 

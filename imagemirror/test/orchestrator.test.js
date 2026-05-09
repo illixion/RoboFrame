@@ -334,7 +334,7 @@ test('displaySync release: each non-driver channel resumes its own playback', as
     assert.equal(bAfter.payload.mergeDriver, null);
 });
 
-test('displaySync: driver disconnect auto-releases the merge', async (t) => {
+test('displaySync: driver disconnect keeps merge across grace window', async (t) => {
     const { orch } = harness({
         pages: [
             { results: [{ _id: 1, file_ext: 'jpg' }, { _id: 2, file_ext: 'jpg' }, { _id: 3, file_ext: 'jpg' }, { _id: 4, file_ext: 'jpg' }, { _id: 5, file_ext: 'jpg' }], nextCursor: 0 },
@@ -353,9 +353,45 @@ test('displaySync: driver disconnect auto-releases the merge', async (t) => {
 
     orch.claimDisplaySync(a, true);
     assert.equal(orch._state().mergeDriverDeviceId, 'screen1');
+    // Driver disconnects. Merge stays — all sessions on the driver
+    // channel are equal, and a transient disconnect of the original
+    // claimer shouldn't disrupt the merge for everyone else. The
+    // channel itself lingers in the grace window with no sessions.
     orch.unregister(a);
-    assert.equal(orch._state().mergeDriverDeviceId, null,
-        'driver dropped → merge released, remaining channels resume');
+    assert.equal(orch._state().mergeDriverDeviceId, 'screen1',
+        'driver ws drop alone does not release the merge');
+});
+
+test('reconnect within grace window restores channel state without slideshowConfig replay', async (t) => {
+    const { orch } = harness({
+        pages: [
+            { results: [{ _id: 1, file_ext: 'jpg' }, { _id: 2, file_ext: 'jpg' }, { _id: 3, file_ext: 'jpg' }, { _id: 4, file_ext: 'jpg' }, { _id: 5, file_ext: 'jpg' }], nextCursor: 0 },
+        ],
+    });
+    t.after(() => orch.close());
+    const a = makeFakeWs();
+    orch.register(a, { deviceId: 'screen1', interval: 5000, modTags: ['rating:s'] });
+    await tick(); await tick(); await tick();
+    const before = orch._state().channels[0];
+    assert.equal(before.deviceId, 'screen1');
+
+    // Disconnect the only session. Channel must persist — its queue,
+    // mod tags, and current id are needed when the client reconnects.
+    orch.unregister(a);
+    const grace = orch._state().channels[0];
+    assert.ok(grace, 'channel persists during grace window');
+    assert.equal(grace.deviceId, 'screen1');
+    assert.equal(grace.sessionCount, 0);
+
+    // Reconnect with bare deviceId (no slideshowConfig replay needed
+    // for state — `register` takes care of session re-binding).
+    const a2 = makeFakeWs();
+    orch.register(a2, { deviceId: 'screen1', interval: 5000 });
+    await tick(); await tick();
+    const after = orch._state().channels[0];
+    assert.equal(after.sessionCount, 1, 'new session bound to surviving channel');
+    assert.deepEqual(orch._channels.get('screen1').modTags, ['rating:s'],
+        'mod tags survived the disconnect');
 });
 
 test('register with modTags bundles them into the first refill query', async (t) => {
