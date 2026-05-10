@@ -5,15 +5,18 @@
 // Power-down is two-staged. Stage 1 ("dim") drops the DDC backlight
 // (VCP 0x10) to the floor — instant, panel goes black, HDMI link and
 // DDC channel stay alive so a subsequent wake is a single setvcp with
-// no retry. Stage 2 ("off") escalates to `xset dpms force off` after
+// no retry. Stage 2 ("off") escalates to a DPMS-style power-off after
 // DIM_TO_OFF_DELAY_MS of continued inactivity to actually power the
-// panel down. DPMS is preferred over `xrandr --off` because xrandr
-// does a full modeset — when the only output goes away X collapses
-// the framebuffer to its minimum size and the browser resizes twice
-// per cycle, desyncing kiosk visibility from display state. State
-// transitions go through a serialised queue so a websocket burst
-// can't race a fresh `state:'on'` against a delayed `state:false`
-// echo.
+// panel down. Under X11 that's `xset dpms force off`; under Wayland
+// (labwc/wlroots) it's `wlopm --off '*'`, which talks
+// wlr-output-power-management-v1 directly and avoids depending on
+// Xwayland's DPMS forwarding. Either is preferred over a full modeset
+// (xrandr --off / wlr-randr --off) because dropping the only output
+// collapses the framebuffer to its minimum size and the browser
+// resizes twice per cycle, desyncing kiosk visibility from display
+// state. State transitions go through a serialised queue so a
+// websocket burst can't race a fresh `state:'on'` against a delayed
+// `state:false` echo.
 
 const { exec, execSync } = require('child_process');
 const { loadConfig, pickEnv } = require('@roboframe/shared');
@@ -34,8 +37,27 @@ function discoverDdcBus() {
     return '2';
 }
 
+// Detect session type once at startup. Wayland uses wlopm; X11 uses
+// xset. WAYLAND_DISPLAY is the most reliable signal — labwc on Pi OS
+// Bookworm sets it for the kiosk session.
+function detectSession() {
+    if (process.env.SESSION_TYPE === 'x11' || process.env.SESSION_TYPE === 'wayland') {
+        return process.env.SESSION_TYPE;
+    }
+    if (process.env.WAYLAND_DISPLAY) return 'wayland';
+    if (process.env.XDG_SESSION_TYPE === 'wayland') return 'wayland';
+    return 'x11';
+}
+
 function create() {
+    const SESSION = detectSession();
     const XRANDR_DISPLAY = ':0';
+    const DPMS_OFF_CMD = SESSION === 'wayland'
+        ? `wlopm --off '*'`
+        : `xset -display ${XRANDR_DISPLAY} dpms force off`;
+    const DPMS_ON_CMD = SESSION === 'wayland'
+        ? `wlopm --on '*'`
+        : `xset -display ${XRANDR_DISPLAY} dpms force on`;
     const DDC_BUS = discoverDdcBus();
     // VCP 0x10 minimum. The AOC panel rejects setvcp 10 0 (some firmwares
     // treat 0 as an invalid value rather than "off"), so the dim stage and
@@ -117,7 +139,7 @@ function create() {
         }
         // _powerStage === 'off' — DPMS wake, then retry brightness while
         // the DDC channel comes back up.
-        exec(`xset -display ${XRANDR_DISPLAY} dpms force on`, (err) => {
+        exec(DPMS_ON_CMD, (err) => {
             if (err) return cb(err);
             _powerStage = 'on';
             currentState = true;
@@ -126,7 +148,7 @@ function create() {
     }
 
     function _dpmsOff(cb) {
-        exec(`xset -display ${XRANDR_DISPLAY} dpms force off`, (err) => {
+        exec(DPMS_OFF_CMD, (err) => {
             _powerStage = 'off';
             currentState = false;
             cb(err || null);
@@ -158,7 +180,7 @@ function create() {
                     _dimToOffTimer = null;
                     _stateQueue = _stateQueue.then(() => new Promise((resolve) => {
                         if (_powerStage !== 'dim') return resolve();
-                        exec(`xset -display ${XRANDR_DISPLAY} dpms force off`, () => {
+                        exec(DPMS_OFF_CMD, () => {
                             _powerStage = 'off';
                             resolve();
                         });
@@ -190,9 +212,37 @@ function create() {
     function setGovernor(_gov, cb) { process.nextTick(cb); }
 
     function initializeState(callback) {
-        // Ensure DPMS is enabled (some X configs ship with it off, in
-        // which case `dpms force off` is a no-op), then determine the
-        // current monitor power state and cached brightness.
+        // Determine the current monitor power state and cached brightness.
+        // Under X11, ensure DPMS is enabled first (some X configs ship
+        // with it off, in which case `dpms force off` is a no-op); then
+        // parse `xset q`. Under Wayland the wlroots compositor always
+        // supports power management — no enable step — and `wlr-randr`
+        // reports per-output Enabled state.
+        const probeBrightness = (isOn) => {
+            currentState = isOn;
+            _powerStage = isOn ? 'on' : 'off';
+            if (!isOn) return callback(null, false);
+            exec(`ddcutil --bus=${DDC_BUS} getvcp 10`, (e2, out2) => {
+                if (!e2) {
+                    const m2 = out2.match(/current value\s*=\s*(\d+)/);
+                    if (m2) lastOnBrightness = clampPct(parseInt(m2[1], 10));
+                }
+                callback(null, true);
+            });
+        };
+        if (SESSION === 'wayland') {
+            exec('wlr-randr', (err, stdout) => {
+                // Default to on if wlr-randr is missing or fails — the
+                // first state command will reconcile reality.
+                let isOn = true;
+                if (!err) {
+                    const m = stdout.match(/Enabled:\s*(\w+)/i);
+                    if (m) isOn = /^yes$/i.test(m[1]);
+                }
+                probeBrightness(isOn);
+            });
+            return;
+        }
         exec(`xset -display ${XRANDR_DISPLAY} +dpms`, () => {
             exec(`xset -display ${XRANDR_DISPLAY} q`, (err, stdout) => {
                 let isOn = true;
@@ -200,16 +250,7 @@ function create() {
                     const m = stdout.match(/Monitor is\s+(\w+)/i);
                     if (m) isOn = /^On$/i.test(m[1]);
                 }
-                currentState = isOn;
-                _powerStage = isOn ? 'on' : 'off';
-                if (!isOn) return callback(null, false);
-                exec(`ddcutil --bus=${DDC_BUS} getvcp 10`, (e2, out2) => {
-                    if (!e2) {
-                        const m2 = out2.match(/current value\s*=\s*(\d+)/);
-                        if (m2) lastOnBrightness = clampPct(parseInt(m2[1], 10));
-                    }
-                    callback(null, true);
-                });
+                probeBrightness(isOn);
             });
         });
     }
