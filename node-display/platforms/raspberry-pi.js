@@ -6,20 +6,18 @@
 // (VCP 0x10) to the floor — instant, panel goes black, HDMI link and
 // DDC channel stay alive so a subsequent wake is a single setvcp with
 // no retry. Stage 2 ("off") escalates to a DPMS-style power-off after
-// DIM_TO_OFF_DELAY_MS of continued inactivity to actually power the
-// panel down. Under X11 that's `xset dpms force off`, which is
-// preferred over `xrandr --off` because xrandr does a full modeset —
-// when the only output goes away X collapses the framebuffer to its
-// minimum size and the browser resizes twice per cycle, desyncing
-// kiosk visibility from display state. Under Wayland we drive
-// `wlr-randr --off` instead: wlr-output-power-management-v1 (wlopm)
-// is the protocol-correct path but cage 0.2 doesn't implement it,
-// and `vcgencmd display_power` is a no-op on the Pi 4 KMS driver.
-// The framebuffer-collapse concern is X-specific — wlroots keeps the
-// client surface around across an output disable/enable, so cog
-// resumes cleanly. State transitions go through a serialised queue
-// so a websocket burst can't race a fresh `state:'on'` against a
-// delayed `state:false` echo.
+// DIM_TO_OFF_DELAY_MS of continued inactivity. Under X11 that's
+// `xset dpms force off`, preferred over `xrandr --off` because xrandr
+// does a full modeset — when the only output goes away X collapses
+// the framebuffer to its minimum size and the browser resizes twice
+// per cycle, desyncing kiosk visibility from display state. Under
+// Wayland the equivalent is `wlopm --off '*'` (wlr-output-power-management-v1),
+// which behaves like DPMS: the modeset is preserved so the kiosk
+// client keeps its surface and resumes instantly on wake. The
+// compositor must implement that protocol — labwc does, cage 0.2
+// does not. State transitions go through a serialised queue so a
+// websocket burst can't race a fresh `state:'on'` against a delayed
+// `state:false` echo.
 
 const { exec, execSync } = require('child_process');
 const { loadConfig, pickEnv } = require('@roboframe/shared');
@@ -52,29 +50,14 @@ function detectSession() {
     return 'x11';
 }
 
-// Synchronously discover the first wlr-randr output name (e.g.
-// HDMI-A-1) so we can address `--off`/`--on` at it. Falls back to
-// HDMI-A-1 — the Pi's primary HDMI port — if discovery fails.
-function discoverWlOutput() {
-    const override = process.env.WAYLAND_OUTPUT;
-    if (override) return override;
-    try {
-        const out = execSync('wlr-randr', { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString();
-        const m = out.match(/^(\S+)\s+"/m);
-        if (m) return m[1];
-    } catch (_) { /* fall through */ }
-    return 'HDMI-A-1';
-}
-
 function create() {
     const SESSION = detectSession();
     const XRANDR_DISPLAY = ':0';
-    const WL_OUTPUT = SESSION === 'wayland' ? discoverWlOutput() : null;
     const DPMS_OFF_CMD = SESSION === 'wayland'
-        ? `wlr-randr --output ${WL_OUTPUT} --off`
+        ? `wlopm --off '*'`
         : `xset -display ${XRANDR_DISPLAY} dpms force off`;
     const DPMS_ON_CMD = SESSION === 'wayland'
-        ? `wlr-randr --output ${WL_OUTPUT} --on`
+        ? `wlopm --on '*'`
         : `xset -display ${XRANDR_DISPLAY} dpms force on`;
     const DDC_BUS = discoverDdcBus();
     // VCP 0x10 minimum. The AOC panel rejects setvcp 10 0 (some firmwares
@@ -233,9 +216,9 @@ function create() {
         // Determine the current monitor power state and cached brightness.
         // Under X11, ensure DPMS is enabled first (some X configs ship
         // with it off, in which case `dpms force off` is a no-op); then
-        // parse `xset q`. Under Wayland the wlroots compositor always
-        // supports power management — no enable step — and `wlr-randr`
-        // reports per-output Enabled state.
+        // parse `xset q`. Under Wayland we don't probe — wlopm has no
+        // query mode, and assuming "on" at startup is safe: the next
+        // displayState command will reconcile.
         const probeBrightness = (isOn) => {
             currentState = isOn;
             _powerStage = isOn ? 'on' : 'off';
@@ -249,16 +232,7 @@ function create() {
             });
         };
         if (SESSION === 'wayland') {
-            exec(`wlr-randr --output ${WL_OUTPUT}`, (err, stdout) => {
-                // Default to on if wlr-randr is missing or fails — the
-                // first state command will reconcile reality.
-                let isOn = true;
-                if (!err) {
-                    const m = stdout.match(/Enabled:\s*(\w+)/i);
-                    if (m) isOn = /^yes$/i.test(m[1]);
-                }
-                probeBrightness(isOn);
-            });
+            probeBrightness(true);
             return;
         }
         exec(`xset -display ${XRANDR_DISPLAY} +dpms`, () => {
