@@ -13,6 +13,7 @@ const cors = require('cors');
 const { loadConfig, pickEnv } = require('@roboframe/shared');
 const { setupBroker } = require('./lib/broker');
 const { createSearch } = require('./lib/searchQuery');
+const { createHistory } = require('./lib/history');
 
 const config = loadConfig();
 const srv = config.server;
@@ -47,7 +48,7 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 
 app.use(cookieParser());
 
-app.use(['/get', '/save', '/history', '/addtohistory', '/rpc/tags.json'], requireToken);
+app.use(['/get', '/save', '/history', '/history.json', '/addtohistory', '/rpc/tags.json'], requireToken);
 
 // Setup view engine
 app.set('views', path.join(__dirname, 'views'));
@@ -78,9 +79,8 @@ let retryCount = 0;
 axios.defaults.headers.common['User-Agent'] = 'roboframe/1.0';
 
 
-// Rolling history of post IDs requested
-const requestHistory = [];
-const maxHistorySize = 50; // Maximum size of the history array
+// Rolling history of post IDs requested (state + dedup/cap logic in lib/history.js)
+const history = createHistory({ maxSize: 50 });
 
 /**
  * Convert an image to APNG format, preserving transparency and animation.
@@ -259,7 +259,7 @@ function processRequestV2(req, res) {
   let returnFile, returnMimeType;
 
   // If file already cached in request history, return it
-  const cachedRequest = requestHistory.find((entry) => entry.id === postId);
+  const cachedRequest = history.findCached(postId);
   if (cachedRequest) {
     // Validate cached data is present, if not then continue to fetch from disk
     if (!cachedRequest.file_contents || !cachedRequest.mime_type) {
@@ -349,22 +349,12 @@ function processRequestV2(req, res) {
         }
 
         // Log post ID, extension, MIME type, and file contents to request history
-        // Prevent duplicate entries by ID
-        const existingIndex = requestHistory.findIndex(entry => entry.id === postId);
-        if (existingIndex !== -1) {
-          // Remove existing entry to update it
-          requestHistory.splice(existingIndex, 1);
-        }
-        // Add new entry to the front of the history
-        requestHistory.unshift({
+        history.addEntry({
           id: postId,
           ext: path.extname(filePath).slice(1),
           mime_type: finalMimeType,
           file_contents: finalBuffer
         });
-        if (requestHistory.length > maxHistorySize) {
-          requestHistory.pop();
-        }
 
         if (cancelled || res.headersSent) return;
 
@@ -478,13 +468,21 @@ app.get('/get', (req, res) => {
 // Recent request history endpoint — returns an HTML page that loads thumbnails
 // concurrently from /get on the client side.
 app.get('/history', (req, res) => {
-  const previewList = requestHistory.map((post) => ({ id: post.id }));
+  const previewList = history.listPreview();
   const token = req.query.token || req.headers['x-roboframe-token'] || '';
   const lowmem = Number(req.query.lowmem) === 1 ? 1 : 0;
   res.render('history', { history: previewList, token, lowmem });
 });
 
-// This endpoint allows the user to send a post ID to insert it into requestHistory as the newest item
+// JSON variant of /history for non-browser clients (e.g. the Spatial Stash
+// visionOS app) that want to render their own history UI. Returns the same
+// rolling window as /history, with id + ext per entry so clients can tell
+// images from videos without a second round-trip.
+app.get('/history.json', (req, res) => {
+  res.json({ history: history.listJson() });
+});
+
+// This endpoint allows the user to send a post ID to insert it into history as the newest item
 // It looks up the file extension from DuckDB
 app.get('/addtohistory', (req, res) => {
   const postId = Number(req.query.id) || 0;
@@ -508,22 +506,12 @@ app.get('/addtohistory', (req, res) => {
 
       const postExt = rows[0].file_ext;
 
-      // Prevent duplicate entries by ID
-      const existingIndex = requestHistory.findIndex(entry => entry.id === postId);
-      if (existingIndex !== -1) {
-        requestHistory.splice(existingIndex, 1);
-      }
-
-      // Add new entry to the front of the history
-      requestHistory.unshift({
+      history.addEntry({
         id: postId,
         ext: postExt,
         mime_type: null,
         file_contents: null
       });
-      if (requestHistory.length > maxHistorySize) {
-        requestHistory.pop();
-      }
 
       return res.status(200).send('Post added to history');
     }
