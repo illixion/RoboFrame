@@ -251,6 +251,42 @@ test('Block lists are server-only — neither file edits nor `block` action emit
     ws.close();
 });
 
+test('cached displayState persists past disconnect and replays on reconnect', async (t) => {
+    await startServer();
+    t.after(stopServer);
+
+    // RPC-tier client publishes a displayState for kiosk1, then drops.
+    const sender = openClient('test-token');
+    await sender.opened;
+    sender.send(JSON.stringify({
+        action: 'rpcsend',
+        token: 'test-token',
+        payload: {
+            action: 'displayState',
+            payload: { target: 'kiosk1', state: 'off' },
+        },
+    }));
+    await new Promise((res) => setTimeout(res, 50));
+    sender.close();
+    await new Promise((res) => setTimeout(res, 100));
+
+    // A fresh client connecting with no live kiosk1 session must still
+    // receive the cached displayState during the connect-time replay.
+    const ws = openClient();
+    await ws.opened;
+    const deadline = Date.now() + 3000;
+    let ds;
+    while (Date.now() < deadline) {
+        ds = ws.frames.find((f) => f.action === 'displayState' && f.payload?.target === 'kiosk1');
+        if (ds) break;
+        await new Promise((res) => setTimeout(res, 50));
+    }
+    assert.ok(ds, 'expected cached displayState to be replayed on reconnect');
+    assert.equal(ds.payload.state, 'off');
+
+    ws.close();
+});
+
 test('visibility action augments getDisplayState reply with visible+visibilitySince', async (t) => {
     await startServer();
     t.after(stopServer);

@@ -329,9 +329,13 @@ id. Lets peer clients drop stale entries they accumulated from
 { "action": "displayDisconnect", "payload": { "target": "screen1_primary" } }
 ```
 
-The server also clears its own cached `displayState` / visibility for
-that `deviceId` when emitting this. A newer session that re-joins under
-the same id will repopulate via its next report.
+The server retains its cached `displayState` and visibility for that
+`deviceId` past the disconnect. When a client claiming the same id
+(re)connects, the cached `displayState` is replayed to it after the
+connect-time settle window — so panel state changes that arrive while
+no client is connected (e.g. via HA MQTT or `rpcsend`) are not lost.
+The cache is overwritten by the next report from the reconnected
+client.
 
 A non-suffixed peer (`screen1`) treats the presence of `screen1_primary`
 in its locally tracked peer set as "the primary owns the panel": the web

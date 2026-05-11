@@ -288,8 +288,11 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                     // "still present" is correct.
                     if (deviceWs.get(deviceId) !== ws) continue;
                     deviceWs.delete(deviceId);
-                    delete displayStates[deviceId];
-                    delete visibilityStates[deviceId];
+                    // Cached displayState / visibility is intentionally kept
+                    // so that when a client for this deviceId (re)connects,
+                    // the connect-time replay restores the last known panel
+                    // state — including states that arrived (e.g. via HA or
+                    // `rpcsend`) while no client was connected.
                     broadcast({
                         action: 'displayDisconnect',
                         payload: { target: deviceId },
