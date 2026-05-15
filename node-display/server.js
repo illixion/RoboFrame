@@ -29,7 +29,10 @@ const PIR_HTTP_PORT = pickEnv('PIR_HTTP_PORT', display.pirHttp.port, 8765, { typ
 // HA last pushed. Times are "HH:MM" 24h; window may wrap past midnight.
 const nightLight = display.nightLight || {};
 const NIGHT_LIGHT_ENABLED = !!nightLight.enabled;
-const NIGHT_LIGHT_BRIGHTNESS = clampUserBrightness(nightLight.brightness, 64);
+// brightness: null means "keep the display fully off during the window" —
+// PIR motion will not wake it, and a boundary entry forces it off.
+const NIGHT_LIGHT_OFF = nightLight.brightness === null;
+const NIGHT_LIGHT_BRIGHTNESS = NIGHT_LIGHT_OFF ? null : clampUserBrightness(nightLight.brightness, 64);
 const NIGHT_LIGHT_START_MIN = parseHHMM(nightLight.start, 0);
 const NIGHT_LIGHT_END_MIN = parseHHMM(nightLight.end, 6 * 60);
 
@@ -65,6 +68,54 @@ function isNightLightActive(now = new Date()) {
 // path explicitly does not touch it.
 let dayBrightness = 255;
 let nightLightApplied = false;
+
+// ----- Wake suppressor registry --------------------------------------------
+//
+// A central gate for "should a PIR motion event wake the panel?". Each entry
+// has a name (for logging), a reason, and a `forceOff` flag: when set, motion
+// during suppression actively drives the panel off instead of merely ignoring
+// the event.
+//
+// An explicit `displayState` from MQTT/HA always bypasses suppressors — the
+// user pressed a button, honour it. The same command lifts the
+// `night-light-off` suppressor for the remainder of the window so subsequent
+// PIR pulses don't fight HA's choice.
+const suppressors = new Map();
+
+function setSuppressor(name, info) {
+  const prev = suppressors.get(name);
+  suppressors.set(name, info);
+  if (!prev) console.log(`suppress[+${name}]: ${info.reason}`);
+}
+
+function clearSuppressor(name) {
+  if (suppressors.delete(name)) console.log(`suppress[-${name}]`);
+}
+
+function suppressionState() {
+  if (suppressors.size === 0) return null;
+  const entries = [...suppressors.values()];
+  return {
+    forceOff: entries.some(s => s.forceOff),
+    names: [...suppressors.keys()],
+    reasons: entries.map(s => s.reason),
+  };
+}
+
+// The `mqtt-switch` suppressor is the only one driven by the user. We mirror
+// its state to a HA switch entity via `reportSuppress`. Other suppressors
+// (primary-peer, night-light-off) are internal and don't surface.
+function setMqttSuppress(on) {
+  const was = suppressors.has('mqtt-switch');
+  if (on) setSuppressor('mqtt-switch', { reason: 'HA suppress switch is on', forceOff: true });
+  else clearSuppressor('mqtt-switch');
+  if (was !== !!on) reportSuppressToHA(!!on);
+}
+
+// Effect actions are home-control commands meant to grab the user's
+// attention. They always wake the panel, regardless of suppressors —
+// the suppress switch only gates ambient/PIR wake, not explicit commands.
+const EFFECT_WAKE_ACTIONS = new Set(['playVideo', 'showText', 'playAudio', 'refresh']);
 
 // Import server control functions
 const {
@@ -140,12 +191,20 @@ catch (err) {
 
 console.log(`Device ID: "${deviceId}"`);
 
-// Peers we've heard from via `displayState`. When a `<deviceId>_primary` peer
-// is connected, PIR motion is suppressed locally — the primary owns waking
-// the panel for that display.
+// Peers we've heard from via `displayState`. A `<deviceId>_primary` peer
+// owns waking the panel for this display; while one is connected we install
+// a suppressor so local PIR motion doesn't fight it.
 const knownPeers = new Set();
-function primaryActive() {
-  return !!deviceId && knownPeers.has(`${deviceId}_primary`);
+
+function primaryPeerId() { return deviceId ? `${deviceId}_primary` : null; }
+
+function syncPrimarySuppressor() {
+  const pid = primaryPeerId();
+  if (pid && knownPeers.has(pid)) {
+    setSuppressor('primary-peer', { reason: `${pid} is connected`, forceOff: false });
+  } else {
+    clearSuppressor('primary-peer');
+  }
 }
 
 function connectWebSocket() {
@@ -167,6 +226,11 @@ function connectWebSocket() {
     // disconnected while we were offline. The broker replays cached
     // `displayState` frames shortly after connect, repopulating this.
     knownPeers.clear();
+    syncPrimarySuppressor();
+    // Seed HA's suppress switch with our current local state so the entity
+    // appears (via auto-discovery on first publish) for every connected
+    // display, even when the user has never toggled it.
+    reportSuppressToHA(suppressors.has('mqtt-switch'));
     if (streamServer) reportWebcamToHA(webcamEnabled);
   });
 
@@ -190,6 +254,7 @@ function connectWebSocket() {
     const HANDLED = new Set([
       'displayState', 'setWebcam', 'setBrightness',
       'setBrightnessStateAware', 'displayDisconnect',
+      'setSuppress', ...EFFECT_WAKE_ACTIONS,
     ]);
     if (HANDLED.has(message.action)) {
       console.log('Received message of type:', message.action + ' with payload:', message.payload);
@@ -200,7 +265,10 @@ function connectWebSocket() {
         clearTimeout(pongTimeout);
         break;
       case 'displayState':
-        if (message.payload?.target) knownPeers.add(message.payload.target);
+        if (message.payload?.target) {
+          knownPeers.add(message.payload.target);
+          syncPrimarySuppressor();
+        }
         if (
           !tempDisable &&
           message.payload &&
@@ -212,6 +280,13 @@ function connectWebSocket() {
             state = message.payload.state;
           } else if (typeof message.payload.state === 'string') {
             state = message.payload.state.toLowerCase() === 'on';
+          }
+          // Explicit HA command wins. While the night-light-off window is
+          // active, an "on" lifts the suppressor (so subsequent PIR pulses
+          // don't undo it); an "off" reinstates it.
+          if (state) clearSuppressor('night-light-off');
+          else if (NIGHT_LIGHT_OFF && isNightLightActive()) {
+            setSuppressor('night-light-off', { reason: 'night light window (off mode)', forceOff: true });
           }
           (state ? turnDisplayOn : turnDisplayOff)((error) => {
             if (error) {
@@ -255,11 +330,39 @@ function connectWebSocket() {
         break;
 
       case 'displayDisconnect':
-        if (message.payload?.target) knownPeers.delete(message.payload.target);
+        if (message.payload?.target) {
+          knownPeers.delete(message.payload.target);
+          syncPrimarySuppressor();
+        }
+        break;
+
+      case 'setSuppress':
+        if (message.payload && message.payload.target === deviceId) {
+          const raw = message.payload.state;
+          const on = raw === true || raw === 'on' || raw === 'ON';
+          setMqttSuppress(on);
+          // Engaging the switch should make the current state match
+          // immediately — otherwise the user sees the toggle flip in HA
+          // but the panel only goes off on the next PIR clear.
+          if (on && !tempDisable) {
+            turnDisplayOff((err) => {
+              if (err) console.error(`Error force-off on setSuppress: ${err.message}`);
+            });
+          }
+        }
         break;
 
       default:
-        // Unknown action
+        if (EFFECT_WAKE_ACTIONS.has(message.action) && !tempDisable) {
+          // Home-control commands override suppressors. They don't *clear*
+          // the suppressor — once the effect ends, ambient PIR is still
+          // gated — they just punch through this one wake.
+          console.log(`effect[${message.action}]: bypassing suppressors, waking panel`);
+          turnDisplayOn((err) => {
+            if (err) return console.error(`Error waking on ${message.action}: ${err.message}`);
+            reportBacklightToHA(true);
+          });
+        }
         break;
     }
   });
@@ -421,6 +524,11 @@ function reportBacklightToHA(on) {
   });
 }
 
+function reportSuppressToHA(on) {
+  if (!deviceId) return;
+  sendReport('reportSuppress', { deviceId, state: on ? 'on' : 'off' });
+}
+
 // Local HTTP listener for an on-device PIR agent (e.g. a small script wired to a GPIO).
 // Posts to /pir/motion turn the display on; /pir/clear turns it off. Both paths
 // also push the new state up to HA via reportBacklightToHA.
@@ -432,11 +540,19 @@ function handlePirEvent(state) {
   if (deviceId && (state === 'motion' || state === 'clear')) {
     sendReport('visibility', { deviceId, visible: state === 'motion' });
   }
-  if (state === 'motion' && primaryActive()) {
-    console.log(`PIR webhook: motion suppressed (${deviceId}_primary peer is connected)`);
-    return;
-  }
   if (state === 'motion') {
+    const sup = suppressionState();
+    if (sup) {
+      console.log(`PIR webhook: motion suppressed by [${sup.names.join(', ')}] — ${sup.reasons.join('; ')}`);
+      if (sup.forceOff) {
+        // Force off silently — no HA report, so the kiosk's light entity
+        // keeps whatever state HA last set rather than flapping on every PIR.
+        turnDisplayOff((err) => {
+          if (err) console.error(`Error keeping display off (suppressed): ${err.message}`);
+        });
+      }
+      return;
+    }
     const night = isNightLightActive();
     const target = night ? NIGHT_LIGHT_BRIGHTNESS : (nightLightApplied ? dayBrightness : null);
     if (night) nightLightApplied = true;
@@ -515,6 +631,11 @@ if (os.platform() === 'linux') {
 // setBrightnessStateAware is a no-op when the panel is off, so an idle
 // boundary tick won't accidentally drive the screen.
 if (NIGHT_LIGHT_ENABLED) {
+  // Seed the suppressor if we boot up inside the window.
+  if (NIGHT_LIGHT_OFF && isNightLightActive()) {
+    setSuppressor('night-light-off', { reason: 'night light window (off mode)', forceOff: true });
+    nightLightApplied = true;
+  }
   let prevNight = isNightLightActive();
   setInterval(() => {
     const now = isNightLightActive();
@@ -522,10 +643,20 @@ if (NIGHT_LIGHT_ENABLED) {
     prevNight = now;
     if (now) {
       nightLightApplied = true;
-      setBrightnessStateAware(NIGHT_LIGHT_BRIGHTNESS, (err) => {
-        if (err) console.error(`night-light enter failed: ${err.message}`);
-      });
+      if (NIGHT_LIGHT_OFF) {
+        setSuppressor('night-light-off', { reason: 'night light window (off mode)', forceOff: true });
+        // Silent off — don't report to HA so the light entity's state is
+        // preserved and HA can still drive an explicit displayState=on.
+        turnDisplayOff((err) => {
+          if (err) console.error(`night-light enter (off) failed: ${err.message}`);
+        });
+      } else {
+        setBrightnessStateAware(NIGHT_LIGHT_BRIGHTNESS, (err) => {
+          if (err) console.error(`night-light enter failed: ${err.message}`);
+        });
+      }
     } else if (nightLightApplied) {
+      clearSuppressor('night-light-off');
       nightLightApplied = false;
       setBrightnessStateAware(dayBrightness, (err) => {
         if (err) console.error(`night-light exit failed: ${err.message}`);

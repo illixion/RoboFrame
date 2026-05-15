@@ -421,6 +421,15 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                     mqtt.publishSensor(deviceId, sensor, value);
                 }
 
+            } else if (action === 'reportSuppress') {
+                // Kiosk → broker: "my wake-suppressor is now on/off". Mirror
+                // to a HA switch entity via MQTT so the user can toggle it.
+                const deviceId = payload?.deviceId;
+                if (typeof deviceId === 'string') {
+                    attachDeviceId(ws, deviceId);
+                    mqtt.publishSuppress(deviceId, payload.state);
+                }
+
             } else if (action === 'reportWebcam') {
                 // Kiosk → broker: native webcam stream is on/off. Mirror to
                 // a HA switch entity via MQTT.

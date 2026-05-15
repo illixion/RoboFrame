@@ -214,7 +214,7 @@ driver channel are equals (any can release), and the original claimer
 disconnecting does *not* release the merge — it only releases when the
 driver channel is fully evicted (after the grace window).
 
-### `reportDisplay`, `reportSensor`, `reportWebcam`
+### `reportDisplay`, `reportSensor`, `reportWebcam`, `reportSuppress`
 Hardware-state reports from node-display (or any controller) into the
 broker → MQTT bridge. Not part of the slideshow loop.
 
@@ -239,6 +239,18 @@ wakes after an HA-driven `displayState: off`.
 ```json
 { "action": "reportWebcam", "payload": { "deviceId": "screen1", "state": "on" } }
 ```
+
+```json
+{ "action": "reportSuppress", "payload": { "deviceId": "screen1", "state": "on" } }
+```
+
+`reportSuppress` mirrors the local wake-suppressor switch into a HA
+`switch.roboframe_<deviceId>_suppress` entity. While engaged, PIR motion
+won't wake the panel and the panel is held off; explicit `displayState`
+commands and effect actions (`playVideo`, `showText`, `playAudio`,
+`refresh`) still bypass it. The complementary inbound action is
+`setSuppress { target, state }` — sent by the broker when HA writes the
+switch's command topic.
 
 ### `getDisplayState`, `ping`
 Diagnostics. `getDisplayState { target: "<deviceId>" }` echoes the
@@ -309,14 +321,20 @@ The data-store frames pushed on connect and on change. Shapes:
 There is no `blocked` frame. Block lists are server-only and clients
 never receive them.
 
-### `displayState` / `setBrightness`
+### `displayState` / `setBrightness` / `setSuppress`
 Driven by inbound HA MQTT writes (or `rpcsend`). `target` is the kiosk's
 `deviceId` — clients ignore frames not addressed to them.
 
 ```json
 { "action": "displayState", "payload": { "target": "screen1", "state": "off" } }
 { "action": "setBrightness", "payload": { "target": "screen1", "brightness": 64 } }
+{ "action": "setSuppress", "payload": { "target": "screen1", "state": "on" } }
 ```
+
+`setSuppress` engages the kiosk's local wake-suppressor. While on, PIR
+motion is ignored and the panel is held off. Explicit `displayState`
+commands and effect actions (`playVideo`, `showText`, `playAudio`,
+`refresh`) still wake the panel — the switch only gates ambient wake.
 
 ### `displayDisconnect`
 Broadcast when a WebSocket that previously claimed a `deviceId` (via

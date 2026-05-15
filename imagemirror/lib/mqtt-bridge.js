@@ -35,7 +35,7 @@ function createMqttBridge({ config, broadcast }) {
     const TOPIC_PREFIX = (cfg.topicPrefix || 'roboframe').replace(/\/+$/, '');
     const DISCOVERY_PREFIX = (cfg.discoveryPrefix || 'homeassistant').replace(/\/+$/, '');
 
-    /** @type {Map<string, { backlight: boolean, motion: boolean, als: boolean, webcam: boolean }>} */
+    /** @type {Map<string, { backlight: boolean, motion: boolean, als: boolean, webcam: boolean, suppress: boolean }>} */
     const registered = new Map();
 
     let client = null;
@@ -48,6 +48,7 @@ function createMqttBridge({ config, broadcast }) {
             publishMotion: noop,
             publishSensor: noop,
             publishWebcam: noop,
+            publishSuppress: noop,
             close: noop,
             get connected() { return false; },
             get enabled() { return false; },
@@ -81,6 +82,7 @@ function createMqttBridge({ config, broadcast }) {
             if (caps.motion) publishMotionDiscovery(deviceId);
             if (caps.als) publishAlsDiscovery(deviceId);
             if (caps.webcam) publishWebcamDiscovery(deviceId);
+            if (caps.suppress) publishSuppressDiscovery(deviceId);
         }
         publishDismissDiscovery();
         // Subscribe to every kiosk's command topic with a single wildcard,
@@ -88,6 +90,7 @@ function createMqttBridge({ config, broadcast }) {
         client.subscribe([
             `${TOPIC_PREFIX}/light/+/backlight/set`,
             `${TOPIC_PREFIX}/switch/+/webcam/set`,
+            `${TOPIC_PREFIX}/switch/+/suppress/set`,
             DISMISS_CMD_TOPIC,
             RPC_CMD_TOPIC,
         ], { qos: 0 }, (err) => {
@@ -142,6 +145,19 @@ function createMqttBridge({ config, broadcast }) {
             return;
         }
 
+        // Inbound HA suppress switch: when ON, the kiosk's wake-suppressor
+        // is engaged — PIR motion will not wake the panel, and the panel
+        // is held off. Home-control effect actions (playVideo/showText/...)
+        // continue to override this.
+        const sm = topic.match(new RegExp(`^${escapeRegExp(TOPIC_PREFIX)}/switch/([^/]+)/suppress/set$`));
+        if (sm) {
+            const deviceId = sm[1];
+            const text = message.toString().trim().toUpperCase();
+            const stateOn = text === 'ON' || text === 'TRUE' || text === '1';
+            broadcast({ action: 'setSuppress', payload: { target: deviceId, state: stateOn ? 'on' : 'off' } });
+            return;
+        }
+
         // Inbound HA brightness command: forward to the kiosk that owns
         // this deviceId.
         const m = topic.match(new RegExp(`^${escapeRegExp(TOPIC_PREFIX)}/light/([^/]+)/backlight/set$`));
@@ -173,7 +189,7 @@ function createMqttBridge({ config, broadcast }) {
         if (!deviceId) return false;
         let caps = registered.get(deviceId);
         if (!caps) {
-            caps = { backlight: false, motion: false, als: false, webcam: false };
+            caps = { backlight: false, motion: false, als: false, webcam: false, suppress: false };
             registered.set(deviceId, caps);
         }
         if (caps[kind]) return false;
@@ -230,6 +246,21 @@ function createMqttBridge({ config, broadcast }) {
             device: deviceBlock(deviceId),
         };
         publish(`${DISCOVERY_PREFIX}/sensor/${uid}/config`, cfg);
+    }
+
+    function publishSuppressDiscovery(deviceId) {
+        const uid = `roboframe_${deviceId}_suppress`;
+        const cfg = {
+            name: 'Suppress wake',
+            unique_id: uid,
+            command_topic: `${TOPIC_PREFIX}/switch/${deviceId}/suppress/set`,
+            state_topic: `${TOPIC_PREFIX}/switch/${deviceId}/suppress/state`,
+            payload_on: 'ON',
+            payload_off: 'OFF',
+            icon: 'mdi:sleep',
+            device: deviceBlock(deviceId),
+        };
+        publish(`${DISCOVERY_PREFIX}/switch/${uid}/config`, cfg);
     }
 
     function publishWebcamDiscovery(deviceId) {
@@ -310,6 +341,16 @@ function createMqttBridge({ config, broadcast }) {
         publish(`${TOPIC_PREFIX}/switch/${deviceId}/webcam/state`, on ? 'ON' : 'OFF');
     }
 
+    function publishSuppress(deviceId, state) {
+        if (!deviceId) return;
+        if (ensureRegistered(deviceId, 'suppress')) publishSuppressDiscovery(deviceId);
+        let on;
+        if (typeof state === 'boolean') on = state;
+        else if (typeof state === 'string') on = state.toUpperCase() === 'ON' || state === 'on';
+        else return;
+        publish(`${TOPIC_PREFIX}/switch/${deviceId}/suppress/state`, on ? 'ON' : 'OFF');
+    }
+
     function close() {
         if (client) {
             try { client.end(true); } catch (_) { /* ignore */ }
@@ -322,6 +363,7 @@ function createMqttBridge({ config, broadcast }) {
         publishMotion,
         publishSensor,
         publishWebcam,
+        publishSuppress,
         close,
         get connected() { return connected; },
         get enabled() { return true; },

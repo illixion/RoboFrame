@@ -148,6 +148,7 @@ test('subscribed to light, rpc/cmd, and dismiss topics on connect', () => {
     assert.deepEqual(client.subscribed[0], [
         'rf/light/+/backlight/set',
         'rf/switch/+/webcam/set',
+        'rf/switch/+/suppress/set',
         'rf/cmd/dismiss',
         'rf/rpc/cmd',
     ]);
