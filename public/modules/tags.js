@@ -3,9 +3,11 @@
 // The server is authoritative on the tag-list catalog and the active list
 // index. Local state is a cache of the last server push.
 //   - `setLists(arr)` is called by the WS dispatcher on `tagLists` frames.
-//   - `applyServer(n)` is called on `currentTagList` / `playback.currentList`.
+//   - `applyServer(n)` is called from each `playback` frame's `currentList`
+//     (the standalone `currentTagList` action no longer exists — list
+//     selection is per-channel and rides along with playback).
 //   - `set(n)` and `switch()` are user-action paths; they emit `setTagList`
-//     to the server and let the server's broadcast confirm the change.
+//     to the server and let the next playback frame confirm the change.
 //   - Mod tags are local user choices, forwarded to the server via
 //     `setModTags`. The orchestrator uses them in the DuckDB query for
 //     this client's channel (last-write-wins among same-channel sessions).
@@ -117,7 +119,7 @@ class Tags {
         this.currentTagsList = idx;
         localStorage.setItem('currentList', String(idx));
         if (state.socket && state.socket.readyState === WebSocket.OPEN) {
-            state.socket.send(JSON.stringify({ action: 'setTagList', payload: { listNumber: idx } }));
+            state.socket.send(JSON.stringify({ sessionId: 'main', action: 'setTagList', payload: { listNumber: idx } }));
         }
         showToast(`Switched to list ${idx}: ${this.tagsList[idx][0] || ''}`);
     }

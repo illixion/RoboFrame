@@ -21,9 +21,9 @@ the code disagree, the code wins — please open a PR to fix the doc.
   - `accessToken` — kiosk tier. Allowed: every action below except `rpcsend`.
   - `rpcToken` — privileged tier. Adds `rpcsend` (broadcast arbitrary frames).
 - Wrong / missing token → server closes with code **1008** (policy violation). Don't keep reconnecting; surface the error.
-- On open, the server pushes two frames in order, unsolicited:
-  1. `tagLists` — the catalog of preset tag lists.
-  2. `currentTagList` — `{ listNumber }` for the active list.
+- On open, the server pushes one unsolicited frame: `tagLists` — the
+  catalog of preset tag lists. The active list *index* is per-channel
+  and arrives in each `playback` frame's `currentList`.
 - Frames after that arrive as state changes happen.
 - The blocklist is server-only — clients never see it on the wire and
   shouldn't carry one. See [`block`](#block) below.
@@ -51,7 +51,7 @@ ignored by playback timing.
 ### Session ids
 
 Every session-scoped action (the ones that route through the orchestrator
-— `slideshowConfig`, `setModTags`, `requestNext`, `reshuffle`,
+— `slideshowConfig`, `setModTags`, `setTagList`, `requestNext`, `reshuffle`,
 `imageReady`, `displaySync`, plus the optional `sessionEnd`) carries a
 top-level `sessionId` string that names the session within the
 connection:
@@ -63,8 +63,8 @@ connection:
 Single-session clients (web kiosk, node-display) use a constant id like
 `"main"`. The id only needs to be unique *within* a connection; the
 server scopes it under the ws. Connection-wide actions (`block`,
-`setTagList`, `visibility`, `getDisplayState`, `ping`, `report*`,
-`rpcsend`) ignore `sessionId`.
+`visibility`, `getDisplayState`, `ping`, `report*`, `rpcsend`) ignore
+`sessionId`.
 
 A session is created the first time the server sees `slideshowConfig`
 for a `(ws, sessionId)` pair. Closing the underlying ws drops every
@@ -175,13 +175,17 @@ clients don't need this.
 { "sessionId": "win1", "action": "sessionEnd" }
 ```
 
-### `setTagList`
-Switch the active tag list catalog index. Server-authoritative —
-broadcasts `currentTagList` to every connected client; every channel's
-queue is reset to use the new list.
+### `setTagList` (session-scoped)
+Switch the active tag-list catalog index for the sender's channel. Each
+`deviceId` carries its own selection — setting list 1 on `kioskA` does
+not change `kioskB`. The server clears the channel's queue and refills
+against the new list; the new `currentList` is delivered via the next
+`playback` frame for that channel. While `displaySync` is active, only
+sessions on the driver channel can change the list; audience channels
+ignore the action.
 
 ```json
-{ "action": "setTagList", "payload": { "listNumber": 1 } }
+{ "sessionId": "win1", "action": "setTagList", "payload": { "listNumber": 1 } }
 ```
 
 ### `block`
@@ -307,16 +311,20 @@ with `sessionIds: ["win1", ..., "win10"]`).
 - A new `current.id` is your cue to start loading. Send `imageReady`
   when the transition completes.
 
-### `tagLists` / `currentTagList`
-The data-store frames pushed on connect and on change. Shapes:
+### `tagLists`
+The catalog of preset tag lists, pushed on connect and rebroadcast when
+the on-disk `data.json` changes. Shape:
 
 ```json
 { "action": "tagLists", "payload": [["robot","solo"], ["dragon","rating:s"]] }
-{ "action": "currentTagList", "payload": { "listNumber": 0 } }
 ```
 
-`tagLists` accepts both array-of-arrays (canonical) and array-of-strings
+Accepts both array-of-arrays (canonical) and array-of-strings
 (space-separated) on the wire — the broker normalizes.
+
+The active *index* into this catalog is per-channel and not broadcast
+as a separate frame; it arrives in every `playback` payload as
+`currentList`. See [`setTagList`](#settaglist-session-scoped).
 
 There is no `blocked` frame. Block lists are server-only and clients
 never receive them.
@@ -481,7 +489,7 @@ on different displays, use distinct `deviceId`s.
 - [ ] Connect with `?token=<ACCESS_TOKEN>` (or `RPC_TOKEN` if you need `rpcsend`).
 - [ ] On open, send `slideshowConfig { deviceId, interval, modTags?, ... }`. Re-send on every reconnect.
 - [ ] On open, send `visibility { deviceId, visible: true }` (and update on background/foreground).
-- [ ] Handle `tagLists`, `currentTagList` — they arrive in that order on connect.
+- [ ] Handle `tagLists` (arrives unsolicited on connect). Read the active list index from each `playback`'s `currentList`.
 - [ ] On every `playback` frame, render `current` and prefetch `upcoming`.
 - [ ] After each successful transition, send `imageReady { id }` with the same id you just rendered.
 - [ ] **Don't** wake-advance locally on visibility changes.

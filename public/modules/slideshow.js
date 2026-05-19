@@ -13,6 +13,7 @@
 import { params, api, buildGetUrl, isVideoExt } from './config.js';
 import { state } from './state.js';
 import { showToast } from './toast.js';
+import { tags } from './tags.js';
 import { findSobelFocus } from './sobel-focus.js';
 
 let lastSavedPost = null;
@@ -286,6 +287,9 @@ export function applyPlayback(payload) {
     state.currentPlayback = payload;
     if (typeof payload.interval === 'number' && payload.interval > 0) {
         state.interval = payload.interval;
+    }
+    if (typeof payload.currentList === 'number') {
+        tags.applyServer(payload.currentList);
     }
 
     const isHidden = state.tempDisable || state.forceDisable || document.hidden;

@@ -31,6 +31,7 @@
 //
 //   slideshowConfig { sessionId, deviceId, interval, ratio, width, height, bright, convert, modTags? }
 //   setModTags      { sessionId, tags }
+//   setTagList      { sessionId, listNumber }
 //   requestNext     { sessionId }
 //   reshuffle       { sessionId }
 //   imageReady      { sessionId, id }
@@ -47,7 +48,6 @@
 function createOrchestrator({
     search,
     getCurrentTagsList,
-    setCurrentTagsList,
     getTagLists,
     getBlockedIds = () => [],
     getBlockedTags = () => [],
@@ -113,6 +113,14 @@ function createOrchestrator({
             // shape (they read cursor.offset, which is absent here → 0).
             cursor: { dc: 0, rank: Math.random() },
             modTags: [],
+            // Index into getTagLists() that this channel uses for its base
+            // tags. Per-channel so two displays can run different lists
+            // independently; defaults to whatever getCurrentTagsList() seeds
+            // (0 in production, anything tests pass).
+            currentTagsList: (() => {
+                const n = Number(getCurrentTagsList ? getCurrentTagsList() : 0);
+                return Number.isFinite(n) && n >= 0 ? n : 0;
+            })(),
             interval: DEFAULT_INTERVAL_MS,
             currentId: null,
             // Readiness barrier for the current image. expectedReady is
@@ -172,7 +180,7 @@ function createOrchestrator({
             deviceId: channel.deviceId,
             mergeDriver: isMergeActive() ? mergeDriverChannel.deviceId : null,
             interval: channel.interval,
-            currentList: getCurrentTagsList(),
+            currentList: channel.currentTagsList,
             modTags: channel.modTags.slice(),
             current: channel.queue[0] || null,
             next: upcoming[0] || null,
@@ -247,7 +255,7 @@ function createOrchestrator({
 
     function buildQuery(channel) {
         const lists = getTagLists();
-        const idx = getCurrentTagsList();
+        const idx = channel.currentTagsList;
         const baseTags = Array.isArray(lists[idx]) ? lists[idx].slice() : [];
         const all = baseTags.concat(channel.modTags || []).filter(Boolean);
         return all.join(' ');
@@ -638,14 +646,20 @@ function createOrchestrator({
         }
     }
 
-    function notifyTagListChange() {
-        if (isMergeActive()) {
-            clearAndRefill(mergeDriverChannel).then(() => commitCurrent(mergeDriverChannel));
-            return;
-        }
-        for (const channel of channels.values()) {
-            clearAndRefill(channel).then(() => commitCurrent(channel));
-        }
+    function setTagList(ws, sessionId, listNumber) {
+        const key = sessionKeyOf(ws, sessionId);
+        const sess = sessionsByKey.get(key);
+        if (!sess) return;
+        const channel = sess.channel;
+        const n = Number(listNumber);
+        if (!Number.isFinite(n) || n < 0) return;
+        // While merged, only the driver channel's sessions can change the
+        // active list. Audience channels are paused; honoring their request
+        // would silently mutate state the driver doesn't know about.
+        if (isMergeActive() && channel !== mergeDriverChannel) return;
+        if (channel.currentTagsList === n) return;
+        channel.currentTagsList = n;
+        clearAndRefill(channel).then(() => commitCurrent(channel));
     }
 
     function notifyBlockedChange() {
@@ -760,12 +774,12 @@ function createOrchestrator({
         unregister,
         unregisterSession,
         setModTags,
+        setTagList,
         requestAdvance,
         requestReshuffle,
         notifyImageReady,
         notifyVisibility,
         notifyBlockedChange,
-        notifyTagListChange,
         claimDisplaySync,
         close,
         // exposed for tests

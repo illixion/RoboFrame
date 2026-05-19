@@ -2,7 +2,7 @@
 //
 // On open, sends `slideshowConfig` so the orchestrator can join us to the
 // channel for our deviceId. The dispatcher routes each server frame to the
-// appropriate module: tagLists/currentTagList → tags, playback → slideshow,
+// appropriate module: tagLists → tags, playback → slideshow,
 // displayState → visibility, update → sensors, playVideo/showText/etc. →
 // effects.
 
@@ -116,11 +116,6 @@ export function connectWebSocket() {
         switch (message.action) {
             case 'tagLists':
                 if (Array.isArray(message.payload)) tags.setLists(message.payload);
-                break;
-            case 'currentTagList':
-                if (typeof message.payload?.listNumber === 'number') {
-                    tags.applyServer(message.payload.listNumber);
-                }
                 break;
             case 'playback':
                 applyPlayback(message.payload);

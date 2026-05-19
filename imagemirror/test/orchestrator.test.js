@@ -50,7 +50,7 @@ function withDefaultSession(orch) {
         notifyImageReady: (ws, id) => orch.notifyImageReady(ws, sid(ws), id),
         claimDisplaySync: (ws, enabled) => orch.claimDisplaySync(ws, sid(ws), enabled),
         notifyVisibility: (...args) => orch.notifyVisibility(...args),
-        notifyTagListChange: (...args) => orch.notifyTagListChange(...args),
+        setTagList: (ws, listNumber) => orch.setTagList(ws, sid(ws), listNumber),
         notifyBlockedChange: (...args) => orch.notifyBlockedChange(...args),
         unregister: (...args) => orch.unregister(...args),
         unregisterSession: (...args) => orch.unregisterSession(...args),
@@ -77,7 +77,6 @@ function harness({ tagLists = [['cats']], pages, blockedIds = [], blockedTags = 
         search,
         broadcast,
         getCurrentTagsList: () => currentList,
-        setCurrentTagsList: (n) => { currentList = n; },
         getTagLists: () => tagLists,
         getBlockedIds: () => blockIds,
         getBlockedTags: () => blockTags,
@@ -504,7 +503,6 @@ test('register with modTags bundles them into the first refill query', async (t)
         search,
         broadcast: () => {},
         getCurrentTagsList: () => 0,
-        setCurrentTagsList: () => {},
         getTagLists: () => [["baseTag"]],
     }));
     t.after(() => orch.close());
@@ -569,7 +567,6 @@ test('setModTags clears queue and refills with the new query', async (t) => {
         search,
         broadcast: () => {},
         getCurrentTagsList: () => 0,
-        setCurrentTagsList: () => {},
         getTagLists: () => [["baseTag"]],
     }));
     t.after(() => orch.close());
@@ -583,9 +580,8 @@ test('setModTags clears queue and refills with the new query', async (t) => {
     assert.match(queries[0], /baseTag rating:s -blood/);
 });
 
-test('notifyTagListChange refills every active channel with the new list', async (t) => {
+test('setTagList changes only the sender channel; other channels keep their list', async (t) => {
     const queries = [];
-    let listIdx = 0;
     const lists = [['listA'], ['listB']];
     const search = {
         runSearch({ q }) {
@@ -597,18 +593,26 @@ test('notifyTagListChange refills every active channel with the new list', async
     const orch = withDefaultSession(createOrchestrator({
         search,
         broadcast: () => {},
-        getCurrentTagsList: () => listIdx,
-        setCurrentTagsList: (n) => { listIdx = n; },
+        getCurrentTagsList: () => 0,
         getTagLists: () => lists,
     }));
     t.after(() => orch.close());
-    const ws = makeFakeWs();
-    orch.register(ws, { deviceId: 'kiosk1', interval: 5000 });
+    const a = makeFakeWs();
+    const b = makeFakeWs();
+    orch.register(a, { deviceId: 'kioskA', interval: 5000 });
+    orch.register(b, { deviceId: 'kioskB', interval: 5000 });
     await tick(); await tick(); await tick();
 
     queries.length = 0;
-    listIdx = 1;
-    orch.notifyTagListChange();
+    orch.setTagList(a, 1);
     await tick(); await tick();
-    assert.match(queries[0], /listB/);
+
+    // kioskA refilled against listB; kioskB never re-queried.
+    assert.ok(queries.some((q) => /listB/.test(q)), 'expected kioskA to query listB');
+    assert.ok(!queries.some((q) => /listA/.test(q)), 'kioskB should not refill on a peer\'s setTagList');
+
+    const aLast = a.sent.filter((m) => m.action === 'playback').pop();
+    const bLast = b.sent.filter((m) => m.action === 'playback').pop();
+    assert.equal(aLast.payload.currentList, 1);
+    assert.equal(bLast.payload.currentList, 0);
 });

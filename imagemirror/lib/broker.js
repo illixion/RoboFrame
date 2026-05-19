@@ -75,8 +75,6 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         set.add(deviceId);
         deviceWs.set(deviceId, ws);
     }
-    let currentTagsList = 0;
-
     // Local data store — a single hand-editable JSON file holding three
     // arrays. Reads always go through readDataStore() (no in-memory cache),
     // so a hand-edit between the broker's read-modify-write of any one
@@ -223,8 +221,10 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     // list state through the closures below.
     const orchestrator = search ? createOrchestrator({
         search,
-        getCurrentTagsList: () => currentTagsList,
-        setCurrentTagsList: (n) => { currentTagsList = n; },
+        // Default seed for a new channel's currentTagsList. The active index
+        // lives on each channel — see orchestrator.setTagList — so this is
+        // only consulted when a channel is first created.
+        getCurrentTagsList: () => 0,
         getTagLists,
         getBlockedIds: getBlockedPosts,
         getBlockedTags,
@@ -266,7 +266,8 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         console.log(`WebSocket client connected: ${clientId} (tier=${tier})`);
 
         ws.send(JSON.stringify({ action: 'tagLists', payload: getTagLists() }));
-        ws.send(JSON.stringify({ action: 'currentTagList', payload: { listNumber: currentTagsList } }));
+        // currentTagList is per-channel now and arrives in each `playback`
+        // frame's `currentList` field. There's no global to send on connect.
 
         // Replay cached displayStates after a brief settle window.
         setTimeout(() => {
@@ -313,10 +314,10 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
             const { action, payload, token, sessionId } = parsed;
             // sessionId is the per-session multiplexing key. Required for
             // every action that the orchestrator routes through a session
-            // (slideshowConfig, setModTags, requestNext, reshuffle,
-            // imageReady, displaySync). Connection-wide actions (block,
-            // setTagList, visibility, getDisplayState, ping, the various
-            // report* frames, rpcsend) ignore it.
+            // (slideshowConfig, setModTags, setTagList, requestNext,
+            // reshuffle, imageReady, displaySync). Connection-wide actions
+            // (block, visibility, getDisplayState, ping, the various report*
+            // frames, rpcsend) ignore it.
             function requireSessionId(label) {
                 if (typeof sessionId !== 'string' || !sessionId) {
                     console.warn(`Missing sessionId on ${label} from ${clientId}; ignoring`);
@@ -470,11 +471,10 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 }
 
             } else if (action === 'setTagList') {
-                if (typeof payload?.listNumber === 'number') {
-                    currentTagsList = payload.listNumber;
-                    console.log(`Set current tag list to: ${currentTagsList}`);
-                    broadcast({ action: 'currentTagList', payload: { listNumber: currentTagsList } });
-                    if (orchestrator) orchestrator.notifyTagListChange();
+                // Per-channel: only the sender's channel switches list.
+                if (!requireSessionId('setTagList')) return;
+                if (typeof payload?.listNumber === 'number' && orchestrator) {
+                    orchestrator.setTagList(ws, sessionId, payload.listNumber);
                 }
 
             } else if (action === 'ping') {

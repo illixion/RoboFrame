@@ -100,12 +100,12 @@ test('WebSocket /rpc/ws upgrades and pushes initial state in order', async (t) =
 
     const ws = openClient();
     await ws.opened;
-    const frames = await ws.waitForFrames(2);
-    // Block lists are server-only; clients only see tagLists + currentTagList
-    // on connect.
-    assert.deepEqual(frames.map((f) => f.action), ['tagLists', 'currentTagList']);
+    const frames = await ws.waitForFrames(1);
+    // Block lists are server-only and currentTagList is per-channel (it
+    // arrives in each playback frame's `currentList`), so the only push at
+    // connect time is the tagLists catalog.
+    assert.deepEqual(frames.map((f) => f.action), ['tagLists']);
     assert.deepEqual(frames[0].payload, [['portrait'], ['landscape', 'sunset']]);
-    assert.equal(frames[1].payload.listNumber, 0);
 
     ws.close();
 });
@@ -167,7 +167,7 @@ test('Editing data.json rebroadcasts tagLists to live clients', async (t) => {
 
     const ws = openClient();
     await ws.opened;
-    await ws.waitForFrames(2); // initial tagLists, currentTagList
+    await ws.waitForFrames(1); // initial tagLists (currentTagList is per-channel now)
 
     fs.writeFileSync(dataPath, JSON.stringify({
         blockedIds: [],
@@ -176,7 +176,7 @@ test('Editing data.json rebroadcasts tagLists to live clients', async (t) => {
     }));
 
     // fs.watch is debounced 200ms in the broker; allow some headroom.
-    await ws.waitForFrames(3, 1500);
+    await ws.waitForFrames(2, 1500);
 
     const seen = ws.frames.filter((f) => f.action === 'tagLists').map((f) => f.payload);
     assert.deepEqual(seen, [[['initial']], [['changed', 'live']]]);
@@ -190,7 +190,7 @@ test('Hand-edit to tagLists survives a concurrent block action (read-modify-writ
 
     const ws = openClient();
     await ws.opened;
-    await ws.waitForFrames(2);
+    await ws.waitForFrames(1);
 
     // Simulate the scenario where the user hand-edits the data file while
     // the broker still has its own writes coming in. With an in-memory
@@ -223,7 +223,7 @@ test('Block lists are server-only — neither file edits nor `block` action emit
 
     const ws = openClient();
     await ws.opened;
-    await ws.waitForFrames(2);
+    await ws.waitForFrames(1);
 
     // 1. Hand-edit the data store: blocklist changes should NOT broadcast.
     fs.writeFileSync(dataPath, JSON.stringify({
@@ -293,7 +293,7 @@ test('visibility action augments getDisplayState reply with visible+visibilitySi
 
     const ws = openClient();
     await ws.opened;
-    await ws.waitForFrames(2); // drain initial frames
+    await ws.waitForFrames(1); // drain initial frames
 
     ws.send(JSON.stringify({ action: 'visibility', payload: { deviceId: 'kiosk1', visible: false } }));
     await new Promise((res) => setTimeout(res, 50));
