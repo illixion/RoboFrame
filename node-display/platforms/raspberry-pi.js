@@ -5,19 +5,28 @@
 // Power-down is two-staged. Stage 1 ("dim") drops the DDC backlight
 // (VCP 0x10) to the floor — instant, panel goes black, HDMI link and
 // DDC channel stay alive so a subsequent wake is a single setvcp with
-// no retry. Stage 2 ("off") escalates to a DPMS-style power-off after
-// DIM_TO_OFF_DELAY_MS of continued inactivity. Under X11 that's
-// `xset dpms force off`, preferred over `xrandr --off` because xrandr
-// does a full modeset — when the only output goes away X collapses
-// the framebuffer to its minimum size and the browser resizes twice
-// per cycle, desyncing kiosk visibility from display state. Under
-// Wayland the equivalent is `wlopm --off '*'` (wlr-output-power-management-v1),
-// which behaves like DPMS: the modeset is preserved so the kiosk
-// client keeps its surface and resumes instantly on wake. The
-// compositor must implement that protocol — labwc does, cage 0.2
-// does not. State transitions go through a serialised queue so a
-// websocket burst can't race a fresh `state:'on'` against a delayed
-// `state:false` echo.
+// no retry. Stage 2 ("off") escalates to a full HDMI cut after
+// DIM_TO_OFF_DELAY_MS of continued inactivity.
+//
+// Under X11 we use `xrandr --output <CONN> --off`, not `xset dpms`.
+// On Pi KMS the DPMS state register is software-only — the HDMI clock
+// keeps scanning out the framebuffer, so monitors that don't honour
+// DPMS (e.g. AOC consumer panels) see a live signal and stay backlit.
+// xrandr disables the CRTC so the HDMI link drops and the panel really
+// goes to standby. The historical objection to xrandr (framebuffer
+// collapse to minimum size on the only output, causing the Chromium
+// kiosk to resize twice per cycle) is sidestepped by pinning the
+// framebuffer with `xrandr --fb` at startup. Wake is `--output --auto`,
+// which reconnects to the pinned framebuffer with no resize event.
+//
+// Under Wayland the equivalent is `wlopm --off '*'` (wlr-output-
+// power-management-v1), which behaves like DPMS but is honoured at
+// the compositor level: the modeset is preserved so the kiosk client
+// keeps its surface and resumes instantly. The compositor must
+// implement that protocol — labwc does, cage 0.2 does not.
+//
+// State transitions go through a serialised queue so a websocket burst
+// can't race a fresh `state:'on'` against a delayed `state:false` echo.
 
 const { exec, execSync } = require('child_process');
 const { loadConfig, pickEnv } = require('@roboframe/shared');
@@ -55,6 +64,31 @@ function probeDdcBrightness(bus) {
     }
 }
 
+// Find the first connected output and its current mode, e.g.
+//   { name: 'HDMI-1', width: 1920, height: 1080 }
+// Returns null if xrandr isn't available or no output is connected.
+function discoverX11Output() {
+    try {
+        const out = execSync(`xrandr --display :0 --query`, { timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+        // Match "HDMI-1 connected ... 1920x1080+0+0" — primary token is optional.
+        const m = out.match(/^(\S+)\s+connected\b[^\n]*?\s(\d+)x(\d+)\+\d+\+\d+/m);
+        if (!m) return null;
+        return { name: m[1], width: parseInt(m[2], 10), height: parseInt(m[3], 10) };
+    } catch (_) {
+        return null;
+    }
+}
+
+// Lock the X root framebuffer to the connected output's mode. Without
+// this, `xrandr --output --off` on the only attached output collapses
+// the screen to the minimum (320x200), and Chromium / SDL clients
+// resize twice per cycle when the connector comes back.
+function pinX11Framebuffer({ width, height }) {
+    try {
+        execSync(`xrandr --display :0 --fb ${width}x${height}`, { timeout: 3000, stdio: ['ignore', 'ignore', 'ignore'] });
+    } catch (_) { /* not fatal — the resize cost is cosmetic on wake */ }
+}
+
 // Detect session type once at startup. WAYLAND_DISPLAY is the most
 // reliable signal — labwc/cage on Pi OS Bookworm set it for the
 // kiosk session.
@@ -70,12 +104,27 @@ function detectSession() {
 function create() {
     const SESSION = detectSession();
     const XRANDR_DISPLAY = ':0';
+    // X11 path: discover the connector name (e.g. HDMI-1) once and pin
+    // the framebuffer to its current resolution so `--output --off`
+    // doesn't shrink the X screen. If discovery fails we fall back to
+    // xset DPMS, which works on monitors that honour DPMS even though
+    // many Pi-attached panels don't.
+    const X11_OUTPUT = SESSION === 'wayland' ? null : discoverX11Output();
+    if (X11_OUTPUT) pinX11Framebuffer(X11_OUTPUT);
     const DPMS_OFF_CMD = SESSION === 'wayland'
         ? `wlopm --off '*'`
-        : `xset -display ${XRANDR_DISPLAY} dpms force off`;
+        : (X11_OUTPUT
+            ? `xrandr --display ${XRANDR_DISPLAY} --output ${X11_OUTPUT.name} --off`
+            : `xset -display ${XRANDR_DISPLAY} dpms force off`);
+    // On wake we must re-pin --fb in the same xrandr invocation: when the
+    // only output was --off'd, X auto-shrunk the root window to its 320x200
+    // minimum, and `--auto` alone can't grow it back to fit a 1920x1080
+    // mode. Doing both in one call combines into a single modeset.
     const DPMS_ON_CMD = SESSION === 'wayland'
         ? `wlopm --on '*'`
-        : `xset -display ${XRANDR_DISPLAY} dpms force on`;
+        : (X11_OUTPUT
+            ? `xrandr --display ${XRANDR_DISPLAY} --fb ${X11_OUTPUT.width}x${X11_OUTPUT.height} --output ${X11_OUTPUT.name} --auto`
+            : `xset -display ${XRANDR_DISPLAY} dpms force on`);
     const DDC_BUS = discoverDdcBus();
     // When the panel doesn't speak DDC/CI (or `ddcutil` is missing) we
     // drop brightness control entirely and use DPMS-only on/off. The
@@ -164,13 +213,21 @@ function create() {
             });
             return;
         }
-        // _powerStage === 'off' — DPMS wake, then retry brightness while
-        // the DDC channel comes back up.
+        // _powerStage === 'off' — wake, then retry brightness while the
+        // DDC channel comes back up. The brightness apply is cosmetic and
+        // best-effort: a DDCRC_RETRIES failure on the AOC panel doesn't
+        // mean the wake itself failed. Surface the wake's success/failure
+        // upstream and only log brightness errors, so a flaky DDC channel
+        // doesn't leave Display.js's `displayOn` flag stuck at false and
+        // turn every subsequent turnDisplayOff into a no-op.
         exec(DPMS_ON_CMD, (err) => {
             if (err) return cb(err);
             _powerStage = 'on';
             currentState = true;
-            _applyBrightnessWithRetry(lastOnBrightness, 4, cb);
+            _applyBrightnessWithRetry(lastOnBrightness, 4, (brightErr) => {
+                if (brightErr) console.error(`Brightness apply on wake failed (continuing): ${brightErr.message}`);
+                cb(null);
+            });
         });
     }
 
@@ -240,11 +297,10 @@ function create() {
 
     function initializeState(callback) {
         // Determine the current monitor power state and cached brightness.
-        // Under X11, ensure DPMS is enabled first (some X configs ship
-        // with it off, in which case `dpms force off` is a no-op); then
-        // parse `xset q`. Under Wayland we don't probe — wlopm has no
-        // query mode, and assuming "on" at startup is safe: the next
-        // displayState command will reconcile.
+        // Under X11 we parse `xrandr --query` for "HDMI-1 connected
+        // ... NxM" vs "disconnected"/no-mode (output --off). Under Wayland
+        // we don't probe — wlopm has no query mode, and assuming "on" at
+        // startup is safe: the next displayState command will reconcile.
         const probeBrightness = (isOn) => {
             currentState = isOn;
             _powerStage = isOn ? 'on' : 'off';
@@ -258,19 +314,19 @@ function create() {
                 callback(null, true);
             });
         };
-        if (SESSION === 'wayland') {
+        if (SESSION === 'wayland' || !X11_OUTPUT) {
             probeBrightness(true);
             return;
         }
-        exec(`xset -display ${XRANDR_DISPLAY} +dpms`, () => {
-            exec(`xset -display ${XRANDR_DISPLAY} q`, (err, stdout) => {
-                let isOn = true;
-                if (!err) {
-                    const m = stdout.match(/Monitor is\s+(\w+)/i);
-                    if (m) isOn = /^On$/i.test(m[1]);
-                }
-                probeBrightness(isOn);
-            });
+        exec(`xrandr --display ${XRANDR_DISPLAY} --query`, (err, stdout) => {
+            let isOn = true;
+            if (!err) {
+                // The active output has a `<W>x<H>+x+y` token. When `--off`'d
+                // the line still says "connected" but the mode is absent.
+                const re = new RegExp(`^${X11_OUTPUT.name}\\s+connected\\b[^\\n]*?\\s\\d+x\\d+\\+\\d+\\+\\d+`, 'm');
+                isOn = re.test(stdout);
+            }
+            probeBrightness(isOn);
         });
     }
 
