@@ -70,7 +70,7 @@ The shipped example matches the kiosk's shortcuts:
 "A": "B",        // keypad A → b (block post)
 "B": "S",        // keypad B → s (tag list select)
 "C": "D",        // keypad C → d (displaySync toggle)
-"D": "P",        // keypad D → p (panel off toggle)
+"D": "P",        // keypad D → p (hide image; clock/sensors stay visible)
 "*": { "tap": "SPACE", "hold": "T" },       // SPACE saves, hold for reshuffle
 "#": { "tap": "RIGHT", "hold": ["LEFTCTRL", "R"] }  // next image, hold to refresh
 ```

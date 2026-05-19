@@ -914,20 +914,22 @@ class Kiosk:
             pygame.display.flip()
             return False
 
-        # 1. base image (or black)
-        if self.base_surface is not None:
-            sw, sh = self.size
-            iw, ih = self.base_surface.get_size()
+        # Server-driven panel-off (HA / displayState=off): the panel is
+        # supposed to be dark, so overlays would leak light through any
+        # DDC dim — short-circuit to a black frame.
+        if self.server_off:
             self.screen.fill((0, 0, 0))
-            self.screen.blit(self.base_surface, ((sw - iw) // 2, (sh - ih) // 2))
-        else:
-            self.screen.fill((0, 0, 0))
-
-        # While the display is off, draw nothing on top (panel is supposed
-        # to be dark — overlays would leak light through DDC dim).
-        if self._is_off():
             pygame.display.flip()
             return False
+
+        # 1. base image (or black). The local 'p'-key toggle (force_off)
+        # only hides the photo; clock / date / sensors stay visible so the
+        # frame still reads as a status surface.
+        self.screen.fill((0, 0, 0))
+        if not self.force_off and self.base_surface is not None:
+            sw, sh = self.size
+            iw, ih = self.base_surface.get_size()
+            self.screen.blit(self.base_surface, ((sw - iw) // 2, (sh - ih) // 2))
 
         # 2. clock (bottom-left) + date (bottom-right)
         local = time.localtime()
@@ -989,9 +991,11 @@ class Kiosk:
             return
         if is_off:
             self.base_surface = None
-            self.screen.fill((0, 0, 0))
-            pygame.display.flip()
             self.current_id = None
+            # Repaint immediately so the transition is visually instant.
+            # The compositor decides whether to draw overlays based on
+            # which off-flavor (server vs force) is active.
+            self._composite_overlay()
         else:
             if self.last_playback:
                 self._apply_playback(self.last_playback)
@@ -1090,7 +1094,7 @@ class Kiosk:
             self.toast(f"Display Sync {'ON' if self.is_primary_sync else 'OFF'}")
         elif k == pygame.K_p:
             self._set_force_off(not self.force_off)
-            self.toast(f"Display {'off' if self.force_off else 'on'}")
+            self.toast(f"Image {'hidden' if self.force_off else 'shown'}")
         elif k == pygame.K_SPACE:
             pid = self.save_id
             if pid:
