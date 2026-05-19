@@ -45,13 +45,17 @@ function loadConfig({ reload = false } = {}) {
         }
     }
     const accessToken = raw.accessToken || '';
+    const deviceId = raw.deviceId || '';
     const server = raw.server || {};
     const display = raw.display || {};
     _cached = {
         // One section per process. `server` is the merged Node server (image
         // API + WebSocket broker + optional HA bridge); `display` is the
-        // on-device daemon that runs on each kiosk.
+        // on-device daemon that runs on each kiosk. `deviceId` is top-level
+        // so node-display and native-kiosk pull the same identifier without
+        // a second source of truth.
         accessToken,
+        deviceId,
         server: { ...server, ha: { ...(server.ha || {}) } },
         display: { ...display, pirHttp: { ...(display.pirHttp || {}) }, nightLight: { ...(display.nightLight || {}) }, webcam: { ...(display.webcam || {}) } },
         configPath,

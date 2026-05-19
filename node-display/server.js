@@ -1,7 +1,6 @@
 try { require('dotenv').config(); } catch (_) { /* dotenv is optional; env vars from the shell still work */ }
 const fs = require('fs');
 const http = require('http');
-const path = require('path');
 const axios = require('axios');
 const WebSocket = require('ws');
 const os = require('os');
@@ -179,16 +178,11 @@ let isReconnecting = false;
 let tempDisable = false;
 let wasOnBattery = null; // null = unknown, true/false = last known state
 
-// load device ID from file
-const deviceIdFilePath = path.join(__dirname, 'id');
-let deviceId;
-try {
-  deviceId = fs.readFileSync(deviceIdFilePath, 'utf8').trim();
+const deviceId = pickEnv('DEVICE_ID', cfg.deviceId, '');
+if (!deviceId) {
+  console.error('ERROR: deviceId is required (set top-level deviceId in roboframe.config.json or DEVICE_ID env var)');
+  process.exit(1);
 }
-catch (err) {
-  console.error(`Error reading device ID from file: ${err.message}`);
-}
-
 console.log(`Device ID: "${deviceId}"`);
 
 // Peers we've heard from via `displayState`. A `<deviceId>_primary` peer

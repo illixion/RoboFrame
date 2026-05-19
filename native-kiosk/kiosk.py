@@ -98,7 +98,7 @@ def load_config():
     ws_url = pick("WS_URL", kiosk.get("wsUrl"), display.get("wsUrl"),
                   "ws://localhost:3123/rpc/ws")
     access_token = pick("ACCESS_TOKEN", raw.get("accessToken"), "")
-    device_id = pick("DEVICE_ID", kiosk.get("deviceId"), "screen1")
+    device_id = pick("DEVICE_ID", raw.get("deviceId"), "screen1")
     interval = int(pick("INTERVAL", kiosk.get("interval"), 15000))
     bright = str(pick("BRIGHT", kiosk.get("bright"), "0")).lower() in ("1", "true", "yes", "on")
     lowmem = str(pick("LOWMEM", kiosk.get("lowmem"), "1")).lower() in ("1", "true", "yes", "on")

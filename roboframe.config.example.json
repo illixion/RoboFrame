@@ -4,6 +4,9 @@
   "accessToken": "REPLACE_ME_DIFFERENT_FROM_RPC_TOKEN",
   "_accessTokenComment": "Read-mostly token shared by every WebSocket consumer (kiosks, node-display, spatialstash). Required to connect to /rpc/ws but cannot call privileged `rpcsend`. Top-level so the same value can be copied to client and server configs.",
 
+  "deviceId": "screen1",
+  "_deviceIdComment": "Identifier this kiosk joins channels and HA entities under. Shared by node-display and native-kiosk on the same host (and by any browser kiosk URL that names this id via ?ws=). Override with the DEVICE_ID env var.",
+
   "server": {
     "_comment": "The merged Node server: image API + WebSocket broker + optional Home Assistant bridge, all in one process on one port.",
     "port": 3123,
@@ -60,9 +63,8 @@
   },
 
   "kiosk": {
-    "_comment": "Optional. Native SDL2 frontend (native-kiosk/kiosk.py) — a Chromium replacement for memory-constrained boards (Pi 3) running X11 + Openbox. Connects to the same WebSocket as the browser kiosk and renders pixels with pygame + Pillow. Env overrides: WS_URL, ACCESS_TOKEN, DEVICE_ID, INTERVAL, BRIGHT, LOWMEM, MOD_TAGS.",
+    "_comment": "Optional. Native SDL2 frontend (native-kiosk/kiosk.py) — a Chromium replacement for memory-constrained boards (Pi 3) running X11 + Openbox. Connects to the same WebSocket as the browser kiosk and renders pixels with pygame + Pillow. Env overrides: WS_URL, ACCESS_TOKEN, INTERVAL, BRIGHT, LOWMEM, MOD_TAGS.",
     "wsUrl": "ws://localhost:3123/rpc/ws",
-    "deviceId": "screen1",
     "interval": 15000,
     "bright": false,
     "lowmem": true,

@@ -27,9 +27,6 @@ Thumbs.db
 *.log
 npm-debug.log*
 
-# Device-specific files
-node-display/id
-
 # Local data store: blocked posts/tags + tag list catalog. Single
 # hand-editable JSON file, per-install, never committed.
 imagemirror/data.json
