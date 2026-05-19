@@ -43,8 +43,12 @@ function discoverDdcBus() {
 // successful getvcp proves brightness control is usable.
 function probeDdcBrightness(bus) {
     if (!bus) return false;
+    // --maxtries=1,1,1 and a tiny sleep-multiplier keep the probe quick on
+    // panels that ignore DDC/CI — without it, ddcutil's default retry loop
+    // can spend ~10 s and spew DDCRC_RETRIES warnings into the journal
+    // before giving up.
     try {
-        execSync(`ddcutil --bus=${bus} getvcp 10`, { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+        execSync(`ddcutil --bus=${bus} --maxtries=1,1,1 --sleep-multiplier=.1 getvcp 10`, { timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] });
         return true;
     } catch (_) {
         return false;
