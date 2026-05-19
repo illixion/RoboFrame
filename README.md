@@ -353,7 +353,7 @@ RestartSec=3
 WantedBy=multi-user.target
 ```
 
-The Pi build of `node-display` requires `ddcutil` for backlight brightness control via DDC/CI. The default DDC bus index is `2` (Pi 3B+ HDMI-A-1).
+The Pi build of `node-display` uses `ddcutil` for backlight brightness control via DDC/CI. The bus is auto-discovered via `ddcutil detect`; set `DDC_BUS` to override. If `ddcutil` is missing or the attached panel does not respond to DDC/CI, brightness control is disabled and the daemon falls back to DPMS-only on/off (a brightness of `0` powers the panel off, any non-zero value powers it on).
 
 ## License
 

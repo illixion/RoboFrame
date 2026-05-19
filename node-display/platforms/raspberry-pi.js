@@ -24,9 +24,9 @@ const { loadConfig, pickEnv } = require('@roboframe/shared');
 
 // HDMI-A-1's i2c bus index varies by Pi generation (Pi 3B+ = 2, Pi 4 = 20,
 // CM4/Pi 5 = different again). Discover it once at startup via
-// `ddcutil detect --terse`; fall back to 2 if detection fails so an
-// unplugged-at-boot panel still gets a sensible default. DDC_BUS env
-// overrides discovery.
+// `ddcutil detect --terse`. DDC_BUS env overrides discovery. Returns null
+// if no monitor advertises DDC/CI — callers fall back to DPMS-only control
+// with no brightness adjustment.
 function discoverDdcBus() {
     const override = process.env.DDC_BUS;
     if (override) return override;
@@ -35,7 +35,20 @@ function discoverDdcBus() {
         const m = out.match(/I2C bus:\s*\/dev\/i2c-(\d+)/);
         if (m) return m[1];
     } catch (_) { /* fall through */ }
-    return '2';
+    return null;
+}
+
+// Confirm the panel actually answers VCP 0x10. `ddcutil detect` can list a
+// bus even when the attached display ignores DDC/CI writes; only a
+// successful getvcp proves brightness control is usable.
+function probeDdcBrightness(bus) {
+    if (!bus) return false;
+    try {
+        execSync(`ddcutil --bus=${bus} getvcp 10`, { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+        return true;
+    } catch (_) {
+        return false;
+    }
 }
 
 // Detect session type once at startup. WAYLAND_DISPLAY is the most
@@ -60,6 +73,13 @@ function create() {
         ? `wlopm --on '*'`
         : `xset -display ${XRANDR_DISPLAY} dpms force on`;
     const DDC_BUS = discoverDdcBus();
+    // When the panel doesn't speak DDC/CI (or `ddcutil` is missing) we
+    // drop brightness control entirely and use DPMS-only on/off. The
+    // dim stage is also skipped because it relies on a DDC setvcp.
+    const DDC_AVAILABLE = probeDdcBrightness(DDC_BUS);
+    if (!DDC_AVAILABLE) {
+        console.log('node-display: DDC/CI brightness control unavailable, falling back to DPMS-only on/off');
+    }
     // VCP 0x10 minimum. The AOC panel rejects setvcp 10 0 (some firmwares
     // treat 0 as an invalid value rather than "off"), so the dim stage and
     // every brightness clamp floor at 1. Powering the panel down is the
@@ -69,10 +89,11 @@ function create() {
     //   positive: seconds before escalation
     //   0:        skip dim, go straight to DPMS off (legacy behaviour)
     //   null / non-finite: never escalate; stay in dim forever
+    // Forced to skip-dim when DDC/CI isn't available.
     const _cfgDisplay = (loadConfig().display) || {};
     const _dimToOffSecondsRaw = pickEnv('DIM_TO_OFF_SECONDS', _cfgDisplay.dimToOffSeconds, 120, { type: 'number' });
-    const _dimEscalates = Number.isFinite(_dimToOffSecondsRaw) && _dimToOffSecondsRaw > 0;
-    const _skipDimStage = _dimToOffSecondsRaw === 0;
+    const _dimEscalates = DDC_AVAILABLE && Number.isFinite(_dimToOffSecondsRaw) && _dimToOffSecondsRaw > 0;
+    const _skipDimStage = !DDC_AVAILABLE || _dimToOffSecondsRaw === 0;
     const DIM_TO_OFF_DELAY_MS = _dimEscalates ? Math.round(_dimToOffSecondsRaw * 1000) : 0;
     let currentState = true;
     let _powerStage = 'on'; // 'on' | 'dim' | 'off'
@@ -89,6 +110,7 @@ function create() {
     }
 
     function applyBrightness(pct, callback) {
+        if (!DDC_AVAILABLE) return process.nextTick(() => callback(null));
         const v = clampPct(pct);
         exec(`ddcutil --bus=${DDC_BUS} setvcp 10 ${v}`, (err) => {
             if (err) return callback(err);
@@ -223,6 +245,7 @@ function create() {
             currentState = isOn;
             _powerStage = isOn ? 'on' : 'off';
             if (!isOn) return callback(null, false);
+            if (!DDC_AVAILABLE) return callback(null, true);
             exec(`ddcutil --bus=${DDC_BUS} getvcp 10`, (e2, out2) => {
                 if (!e2) {
                     const m2 = out2.match(/current value\s*=\s*(\d+)/);
