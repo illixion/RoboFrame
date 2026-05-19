@@ -176,12 +176,22 @@ function createMqttBridge({ config, broadcast }) {
         // listen for these and filter by `target` — broadcast so both get
         // them. (Targeting just one ws via deviceWs picks the most recent
         // sender, which is usually the browser, leaving the screen on.)
+        // Confirm the command back to the light's state topic. Without this,
+        // HA only sees a state update when a kiosk independently reports
+        // (e.g. via PIR-driven reportDisplay) — HA-originated toggles would
+        // otherwise leave the entity stuck on its prior retained state.
+        const confirm = {};
         if (typeof body.brightness === 'number') {
             broadcast({ action: 'setBrightness', payload: { target: deviceId, brightness: body.brightness } });
+            confirm.brightness = body.brightness;
         }
         if (typeof body.state === 'string') {
             const stateOn = body.state.toUpperCase() === 'ON';
             broadcast({ action: 'displayState', payload: { target: deviceId, state: stateOn ? 'on' : 'off' } });
+            confirm.state = stateOn ? 'on' : 'off';
+        }
+        if (confirm.state || typeof confirm.brightness === 'number') {
+            publishLight(deviceId, confirm);
         }
     });
 

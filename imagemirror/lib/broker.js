@@ -383,6 +383,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                             action: 'displayState',
                             payload: { target: deviceId, state: 'off' },
                         }, ws);
+                        mqtt.publishLight(deviceId, { state: 'off' });
                     }
                 }
 
