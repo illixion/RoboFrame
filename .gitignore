@@ -37,3 +37,7 @@ imagemirror/data.json
 # Build artifacts
 dist/
 build/
+
+# Python bytecode (native-kiosk)
+__pycache__/
+*.pyc

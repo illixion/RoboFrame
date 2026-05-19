@@ -31,6 +31,12 @@ Spatialstash is a separate app that implements the same protocol in Swift, it is
 - `node-display/` — on-device daemon. WebSocket → backlight / brightness
   / PIR motion / webcam stream. Backends in `platforms/` (macOS,
   Raspberry Pi DDC/CI, generic Linux sysfs).
+- `native-kiosk/` — Python 3 + pygame + Pillow SDL2 frontend. Chromium
+  replacement for Pi 3 / 1 GB-class boards on X11 + Openbox. Same WS
+  protocol as the browser kiosk, single-session (`sessionId: "main"`),
+  server-side image resize via `/get?width=&height=&lowmem=1` so the Pi
+  never decodes a full-res JPEG. Pairs with node-display on the same host:
+  node-display owns backlight/PIR, native-kiosk owns pixels.
 - `packages/cli/` — `roboframe-cli bootstrap | doctor` to build /
   validate `posts.duckdb`.
 - `packages/shared/` — config loader (env > file > default).

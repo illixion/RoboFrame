@@ -57,5 +57,15 @@
       "framerate": 30,
       "port": 8082
     }
+  },
+
+  "kiosk": {
+    "_comment": "Optional. Native SDL2 frontend (native-kiosk/kiosk.py) — a Chromium replacement for memory-constrained boards (Pi 3) running X11 + Openbox. Connects to the same WebSocket as the browser kiosk and renders pixels with pygame + Pillow. Env overrides: WS_URL, ACCESS_TOKEN, DEVICE_ID, INTERVAL, BRIGHT, LOWMEM, MOD_TAGS.",
+    "wsUrl": "ws://localhost:3123/rpc/ws",
+    "deviceId": "screen1",
+    "interval": 15000,
+    "bright": false,
+    "lowmem": true,
+    "modTags": []
   }
 }

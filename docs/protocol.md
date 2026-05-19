@@ -10,9 +10,11 @@ existing clients already navigated.
 The shipped clients are the canonical implementations: web kiosk
 ([`public/modules/`](../public/modules/)), Spatialstash
 ([`SpatialStash/SpatialStash/Services/RemoteWebSocketClient.swift`](https://github.com/illixion/Spatialstash/blob/main/SpatialStash/SpatialStash/Services/RemoteWebSocketClient.swift)),
-and node-display
-([`node-display/server.js`](../node-display/server.js)). When this doc and
-the code disagree, the code wins — please open a PR to fix the doc.
+node-display
+([`node-display/server.js`](../node-display/server.js)), and the native
+SDL2 kiosk ([`native-kiosk/kiosk.py`](../native-kiosk/kiosk.py)) for
+memory-constrained boards (Pi 3 et al.). When this doc and the code
+disagree, the code wins — please open a PR to fix the doc.
 
 ## Connecting
 

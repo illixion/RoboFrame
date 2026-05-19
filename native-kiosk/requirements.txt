@@ -1,0 +1,4 @@
+pygame>=2.5
+Pillow>=10.0
+requests>=2.31
+websocket-client>=1.7
