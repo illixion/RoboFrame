@@ -269,10 +269,16 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         // currentTagList is per-channel now and arrives in each `playback`
         // frame's `currentList` field. There's no global to send on connect.
 
-        // Replay cached displayStates after a brief settle window.
+        // Replay cached displayStates and HA sensor updates after a brief
+        // settle window so a freshly connected (or reconnecting) client has
+        // current panel state and the most recent sensor readings without
+        // having to wait for the next HA state_changed event.
         setTimeout(() => {
             for (const target in displayStates) {
                 ws.send(JSON.stringify(displayStates[target]));
+            }
+            for (const entity in haStates) {
+                ws.send(JSON.stringify(haStates[entity]));
             }
         }, 2000);
 
@@ -556,21 +562,44 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     // calls services and never echoes anything back to HA.
     let haSocket = null;
     let haMessageId = 1;
+    let haGetStatesId = 0;
 
     function connectToHA() {
         haSocket = new WebSocket(HA_URL);
         haSocket.on('open', () => {
             console.log('Connected to Home Assistant WebSocket API (sensor forwarding)');
             haSocket.send(JSON.stringify({ type: 'auth', access_token: HA_TOKEN }));
-            setTimeout(() => {
-                haSocket.send(JSON.stringify({ id: haMessageId++, type: 'subscribe_events', event_type: 'state_changed' }));
-            }, 1000);
         });
         haSocket.on('message', (data) => {
             const message = JSON.parse(data);
             if (message.type === 'auth_invalid') {
                 console.error('HA authentication failed:', message.message, '— disabling HA sensor forwarding');
                 haSocket.close();
+                return;
+            }
+            if (message.type === 'auth_ok') {
+                // Subscribe to future changes, then prime the cache with a
+                // one-shot get_states so reconnecting clients see current
+                // readings even if no state_changed event fired since the
+                // broker started.
+                haSocket.send(JSON.stringify({ id: haMessageId++, type: 'subscribe_events', event_type: 'state_changed' }));
+                haGetStatesId = haMessageId++;
+                haSocket.send(JSON.stringify({ id: haGetStatesId, type: 'get_states' }));
+                return;
+            }
+            if (message.type === 'result' && message.id === haGetStatesId && Array.isArray(message.result)) {
+                for (const s of message.result) {
+                    if (!s?.entity_id) continue;
+                    if (HA_FILTER_ENTITIES.length === 0 || !HA_FILTER_ENTITIES.includes(s.entity_id)) continue;
+                    broadcast({
+                        action: 'update',
+                        payload: {
+                            entity: s.entity_id,
+                            state: s.state,
+                            attributes: s.attributes,
+                        },
+                    });
+                }
                 return;
             }
             if (message.type === 'event' && message.event?.data?.entity_id) {
