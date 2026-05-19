@@ -37,6 +37,17 @@ Spatialstash is a separate app that implements the same protocol in Swift, it is
   server-side image resize via `/get?width=&height=&lowmem=1` so the Pi
   never decodes a full-res JPEG. Pairs with node-display on the same host:
   node-display owns backlight/PIR, native-kiosk owns pixels.
+- `gpio-agent/` — Python 3 daemon that bridges Pi hardware to the rest
+  of the stack: PIR motion sensor → HTTP POST to node-display's
+  `/pir/motion` + `/pir/clear` (port 8765), 4x4 matrix keypad → uinput
+  keystrokes consumed by the kiosk's keyboard shortcuts (see
+  [`public/modules/ui.js`](public/modules/ui.js) and the matching block
+  in [`native-kiosk/kiosk.py`](native-kiosk/kiosk.py)), and an optional
+  SSD1306 128x64 I2C OLED clock gated on PIR. Runs as root for
+  `/dev/gpiomem` and uinput access; reads its own JSON config from
+  `/opt/gpio-agent/config.json` (not merged into `roboframe.config.json`
+  because the schema is hardware-specific and deployment is
+  independent).
 - `packages/cli/` — `roboframe-cli bootstrap | doctor` to build /
   validate `posts.duckdb`.
 - `packages/shared/` — config loader (env > file > default).
