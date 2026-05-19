@@ -288,12 +288,17 @@ function connectWebSocket() {
           else if (NIGHT_LIGHT_OFF && isNightLightActive()) {
             setSuppressor('night-light-off', { reason: 'night light window (off mode)', forceOff: true });
           }
+          // Do not reportBacklightToHA after applying an inbound displayState.
+          // The broker originated this message (from MQTT/HA, a peer's
+          // reportDisplay, or its visibility handler) and already knows the
+          // state. Echoing it back creates a feedback loop when two devices
+          // share a deviceId: each reapplies and re-reports the peer's state,
+          // republishing MQTT brightness with the local user value and making
+          // HA's light entity flap between the two devices' brightness levels.
           (state ? turnDisplayOn : turnDisplayOff)((error) => {
             if (error) {
               console.error(`Error turning display ${state ? 'on' : 'off'}: ${error.message}`);
-              return;
             }
-            reportBacklightToHA(state);
           });
         }
         break;
