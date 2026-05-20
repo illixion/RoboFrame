@@ -66,8 +66,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
 
     // Track every (ws, deviceId) association in one place so the close handler
     // can announce a `displayDisconnect` for each deviceId this ws was the
-    // most recent reporter for. Peer clients use that signal to clear stale
-    // local entries (e.g. an `_primary` peer going away).
+    // most recent reporter for.
     function attachDeviceId(ws, deviceId) {
         if (typeof deviceId !== 'string' || !deviceId) return;
         let set = wsDeviceIds.get(ws);

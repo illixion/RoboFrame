@@ -103,7 +103,7 @@ function suppressionState() {
 
 // The `mqtt-switch` suppressor is the only one driven by the user. We mirror
 // its state to a HA switch entity via `reportSuppress`. Other suppressors
-// (primary-peer, night-light-off) are internal and don't surface.
+// (night-light-off) are internal and don't surface.
 function setMqttSuppress(on) {
   const was = suppressors.has('mqtt-switch');
   if (on) setSuppressor('mqtt-switch', { reason: 'HA suppress switch is on', forceOff: true });
@@ -185,22 +185,6 @@ if (!deviceId) {
 }
 console.log(`Device ID: "${deviceId}"`);
 
-// Peers we've heard from via `displayState`. A `<deviceId>_primary` peer
-// owns waking the panel for this display; while one is connected we install
-// a suppressor so local PIR motion doesn't fight it.
-const knownPeers = new Set();
-
-function primaryPeerId() { return deviceId ? `${deviceId}_primary` : null; }
-
-function syncPrimarySuppressor() {
-  const pid = primaryPeerId();
-  if (pid && knownPeers.has(pid)) {
-    setSuppressor('primary-peer', { reason: `${pid} is connected`, forceOff: false });
-  } else {
-    clearSuppressor('primary-peer');
-  }
-}
-
 function connectWebSocket() {
   if (isReconnecting) return;
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -216,11 +200,6 @@ function connectWebSocket() {
     console.log('Connected to WebSocket server');
     isReconnecting = false;
     startHeartbeat();
-    // Drop stale peers learned in the previous session — they may have
-    // disconnected while we were offline. The broker replays cached
-    // `displayState` frames shortly after connect, repopulating this.
-    knownPeers.clear();
-    syncPrimarySuppressor();
     // Seed HA's suppress switch with our current local state so the entity
     // appears (via auto-discovery on first publish) for every connected
     // display, even when the user has never toggled it.
@@ -247,7 +226,7 @@ function connectWebSocket() {
     // displaySync, ...) that this daemon ignores; logging them is noise.
     const HANDLED = new Set([
       'displayState', 'setWebcam', 'setBrightness',
-      'setBrightnessStateAware', 'displayDisconnect',
+      'setBrightnessStateAware',
       'setSuppress', ...EFFECT_WAKE_ACTIONS,
     ]);
     if (HANDLED.has(message.action)) {
@@ -259,10 +238,6 @@ function connectWebSocket() {
         clearTimeout(pongTimeout);
         break;
       case 'displayState':
-        if (message.payload?.target) {
-          knownPeers.add(message.payload.target);
-          syncPrimarySuppressor();
-        }
         if (
           !tempDisable &&
           message.payload &&
@@ -325,13 +300,6 @@ function connectWebSocket() {
           setBrightnessStateAware(userValue, (error) => {
             if (error) console.error(`Error setting brightness state aware: ${error.message}`);
           });
-        }
-        break;
-
-      case 'displayDisconnect':
-        if (message.payload?.target) {
-          knownPeers.delete(message.payload.target);
-          syncPrimarySuppressor();
         }
         break;
 

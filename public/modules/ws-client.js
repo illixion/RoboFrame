@@ -21,14 +21,6 @@ let lowLightBrightness = 16;
 let deviceBrightness = 255;
 let halted = false;
 
-// Peers we've heard from via `displayState`, so we can detect whether a
-// `<our deviceId>_primary` peer is currently connected. When it is, we
-// keep the slideshow gated off — the primary owns the panel.
-const knownPeers = new Set();
-function primaryActive() {
-    return !!state.deviceID && knownPeers.has(`${state.deviceID}_primary`);
-}
-
 function showFatalBanner(text) {
     let banner = document.getElementById('ws-fatal-banner');
     if (!banner) {
@@ -91,11 +83,6 @@ export function connectWebSocket() {
     state.socket.addEventListener('open', () => {
         console.log('WebSocket connected');
         reconnectAttempts = 0;
-        // Drop stale peers learned in the previous session — peers may have
-        // disconnected while we were offline and we'd never have seen the
-        // `displayDisconnect`. The broker replays cached `displayState`
-        // frames after a brief settle window, which repopulates this.
-        knownPeers.clear();
         sendSlideshowConfig();
         if (state.deviceID) {
             state.socket.send(JSON.stringify({
@@ -121,17 +108,10 @@ export function connectWebSocket() {
                 applyPlayback(message.payload);
                 break;
             case 'displayState':
-                if (message.payload?.target) knownPeers.add(message.payload.target);
                 if (message.payload?.target === state.deviceID) {
                     const off = message.payload.state === 'off' || message.payload.state === false;
-                    // Suppress turn-on while a `<deviceId>_primary` peer is
-                    // connected — that peer owns waking the panel. Off events
-                    // still apply so HA/MQTT can force-blank us.
-                    if (off || !primaryActive()) disable(off);
+                    disable(off);
                 }
-                break;
-            case 'displayDisconnect':
-                if (message.payload?.target) knownPeers.delete(message.payload.target);
                 break;
             case 'setBrightness':
                 if (message.payload?.target === state.deviceID) {

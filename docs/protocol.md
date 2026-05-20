@@ -354,7 +354,7 @@ id. Lets peer clients drop stale entries they accumulated from
 `displayState` frames.
 
 ```json
-{ "action": "displayDisconnect", "payload": { "target": "screen1_primary" } }
+{ "action": "displayDisconnect", "payload": { "target": "screen1" } }
 ```
 
 The server retains its cached `displayState` and visibility for that
@@ -364,11 +364,6 @@ connect-time settle window — so panel state changes that arrive while
 no client is connected (e.g. via HA MQTT or `rpcsend`) are not lost.
 The cache is overwritten by the next report from the reconnected
 client.
-
-A non-suffixed peer (`screen1`) treats the presence of `screen1_primary`
-in its locally tracked peer set as "the primary owns the panel": the web
-kiosk gates slideshow turn-on, and node-display suppresses PIR motion
-turn-on. Off events still apply.
 
 ### `update`
 Forwarded HA sensor reading (filtered by `HA_FILTER_ENTITIES`).
