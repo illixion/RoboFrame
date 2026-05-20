@@ -59,7 +59,13 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
 
     // ----- In-memory state -------------------------------------------------
     const displayStates = {};              // deviceId → last `displayState` message
-    const visibilityStates = {};           // deviceId → { visible, lastChangedAt }
+    // deviceId → { sources: Map<ws, {visible, at}>, aggregate, lastChangedAt }
+    // Visibility is OR-ed across every ws reporting for the same deviceId so
+    // two reporters on one device (browser kiosk + visionOS viewer, or PIR
+    // agent + foreground app) can't fight: as long as ANY of them reports
+    // visible:true the device is treated as visible. Aggregate flips drive
+    // both the orchestrator pause/resume and the HA motion publish.
+    const visibilityStates = {};
     const haStates = {};                   // entity_id → last `update` message
     const deviceWs = new Map();            // deviceId → ws (most recent kiosk for that ID)
     const wsDeviceIds = new WeakMap();     // ws → Set<deviceId> claimed by this ws
@@ -67,6 +73,22 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     // Track every (ws, deviceId) association in one place so the close handler
     // can announce a `displayDisconnect` for each deviceId this ws was the
     // most recent reporter for.
+    // Recompute aggregate visibility for a deviceId from its per-ws sources.
+    // Returns the new aggregate if it changed (so the caller can fan out to
+    // orchestrator/MQTT/peers), or null when unchanged.
+    function recomputeVisibility(deviceId) {
+        const state = visibilityStates[deviceId];
+        if (!state) return null;
+        let agg = false;
+        for (const v of state.sources.values()) {
+            if (v.visible) { agg = true; break; }
+        }
+        if (agg === state.aggregate) return null;
+        state.aggregate = agg;
+        state.lastChangedAt = Date.now();
+        return agg;
+    }
+
     function attachDeviceId(ws, deviceId) {
         if (typeof deviceId !== 'string' || !deviceId) return;
         let set = wsDeviceIds.get(ws);
@@ -287,6 +309,20 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
             const claimed = wsDeviceIds.get(ws);
             if (claimed) {
                 wsDeviceIds.delete(ws);
+                // Drop this ws's visibility contributions before announcing
+                // departure so the aggregate reflects only still-connected
+                // reporters. If removing it flips the aggregate to false,
+                // fan out the same way as an inbound visibility report.
+                for (const deviceId of claimed) {
+                    const vstate = visibilityStates[deviceId];
+                    if (!vstate || !vstate.sources.has(ws)) continue;
+                    vstate.sources.delete(ws);
+                    const aggregate = recomputeVisibility(deviceId);
+                    if (aggregate !== null) {
+                        mqtt.publishMotion(deviceId, aggregate);
+                        if (orchestrator) orchestrator.notifyVisibility(deviceId, aggregate);
+                    }
+                }
                 for (const deviceId of claimed) {
                     // Only announce departure if this ws was still the most
                     // recent reporter for that deviceId — otherwise a newer
@@ -352,7 +388,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                         ...lastMessage,
                         payload: {
                             ...lastMessage.payload,
-                            visible: vis?.visible,
+                            visible: vis?.aggregate,
                             visibilitySince: vis?.lastChangedAt,
                         },
                     }));
@@ -361,7 +397,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                         action: 'displayState',
                         payload: {
                             target: payload.target,
-                            visible: vis.visible,
+                            visible: vis.aggregate,
                             visibilitySince: vis.lastChangedAt,
                         },
                     }));
@@ -377,18 +413,26 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                     console.warn('Invalid visibility payload:', payload);
                     return;
                 }
-                visibilityStates[deviceId] = { visible, lastChangedAt: Date.now() };
                 attachDeviceId(ws, deviceId);
-                mqtt.publishMotion(deviceId, visible);
-                if (orchestrator) orchestrator.notifyVisibility(deviceId, visible);
-                if (!visible) {
-                    const lastState = displayStates[deviceId]?.payload?.state;
-                    if (lastState === 'on' || lastState === true) {
-                        broadcast({
-                            action: 'displayState',
-                            payload: { target: deviceId, state: 'off' },
-                        }, ws);
-                        mqtt.publishLight(deviceId, { state: 'off' });
+                let state = visibilityStates[deviceId];
+                if (!state) {
+                    state = { sources: new Map(), aggregate: false, lastChangedAt: 0 };
+                    visibilityStates[deviceId] = state;
+                }
+                state.sources.set(ws, { visible, at: Date.now() });
+                const aggregate = recomputeVisibility(deviceId);
+                if (aggregate !== null) {
+                    mqtt.publishMotion(deviceId, aggregate);
+                    if (orchestrator) orchestrator.notifyVisibility(deviceId, aggregate);
+                    if (!aggregate) {
+                        const lastState = displayStates[deviceId]?.payload?.state;
+                        if (lastState === 'on' || lastState === true) {
+                            broadcast({
+                                action: 'displayState',
+                                payload: { target: deviceId, state: 'off' },
+                            }, ws);
+                            mqtt.publishLight(deviceId, { state: 'off' });
+                        }
                     }
                 }
 
