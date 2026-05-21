@@ -273,6 +273,9 @@ Records a post ID in the rolling history without fetching its bytes.
 `GET /post?id=` *(debug)*
 Returns the full DuckDB row for a post (joined with `posts_paths.path`) as JSON. Token-gated. Exposed on the web kiosk as `await getPost(id)` in devtools.
 
+`GET /count?q=` *(debug)*
+Returns `{ q, count }` — the total number of posts matching `q` using the same parser as `/search`. Token-gated. Exposed on the web kiosk as `await countPosts(q)` in devtools.
+
 `GET /search?q=&limit=` *(debug)*
 Runs `q` through the same parser the slideshow orchestrator uses (`tag`, `-tag`, `score:`, `limit:N`, `order:`, etc.) and returns `{ results, nextCursor }` as JSON. `limit` defaults to 40 unless overridden by `?limit=` or `limit:N` inside `q`. Token-gated. Exposed on the web kiosk as `await searchPosts(q, limit)` in devtools. The slideshow itself still consumes posts via the `playback` WebSocket channel — this endpoint is for inspection only.
 

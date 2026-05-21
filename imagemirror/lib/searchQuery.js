@@ -62,7 +62,20 @@ function createSearch({ db, cacheSize = 20 } = {}) {
         cache.length = 0;
     }
 
-    return { runSearch, clearCache };
+    function runCount({ q = '' } = {}) {
+        const { where } = parseQuery(q);
+        const baseWhere = where && where !== 'TRUE' ? where : 'TRUE';
+        const sql = `SELECT COUNT(*)::BIGINT AS n FROM file_db.posts p WHERE ${baseWhere};`;
+        return new Promise((resolve, reject) => {
+            db.all(sql, (err, rows) => {
+                if (err) return reject(err);
+                const n = rows && rows[0] ? rows[0].n : 0;
+                resolve(Number(n));
+            });
+        });
+    }
+
+    return { runSearch, runCount, clearCache };
 }
 
 function buildRandomSql({ where, cursor, limit }) {

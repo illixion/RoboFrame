@@ -49,7 +49,7 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 
 app.use(cookieParser());
 
-app.use(['/get', '/save', '/history', '/history.json', '/addtohistory', '/post', '/search', '/rpc/tags.json'], requireToken);
+app.use(['/get', '/save', '/history', '/history.json', '/addtohistory', '/post', '/search', '/count', '/rpc/tags.json'], requireToken);
 
 // Setup view engine
 app.set('views', path.join(__dirname, 'views'));
@@ -678,6 +678,20 @@ app.get('/addtohistory', (req, res) => {
       return res.status(200).send('Post added to history');
     }
   );
+});
+
+// Debugging helper: total number of posts matching a query string. Reuses
+// the same parseQuery as /search so syntax stays in sync.
+app.get('/count', async (req, res) => {
+  if (!searchRef) return res.status(503).send('Search not ready');
+  const q = String(req.query.q || '');
+  try {
+    const n = await searchRef.runCount({ q });
+    res.json({ q, count: n });
+  } catch (err) {
+    console.error(`count error: ${err.message}`);
+    res.status(500).send('Count failed');
+  }
 });
 
 // Debugging helper: run a query string through the same search layer the

@@ -22,6 +22,15 @@ window.searchPosts = async function searchPosts(q, limit) {
     if (!res.ok) throw new Error(`searchPosts ${res.status}: ${await res.text()}`);
     return res.json();
 };
+
+// Debug helper: `await countPosts('file_ext:gif')` returns the total number
+// of posts that would match the query.
+window.countPosts = async function countPosts(q) {
+    const res = await fetch(api(`/count?q=${encodeURIComponent(q || '')}`));
+    if (!res.ok) throw new Error(`countPosts ${res.status}: ${await res.text()}`);
+    const data = await res.json();
+    return data.count;
+};
 import './tags.js';
 import { connectWebSocket } from './ws-client.js';
 import { bootUi } from './ui.js';
