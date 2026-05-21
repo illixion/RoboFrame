@@ -135,7 +135,14 @@ function createOrchestrator({
             // Wall-clock deadline for the dwell timer. Set when entering
             // 'displaying'; survives visibility-driven pauses.
             dwellDeadline: null,
-            refilling: false,
+            // In-flight refill promise; coalesces concurrent refillQueue
+            // callers onto a single search round-trip.
+            refillPromise: null,
+            // Bumped whenever the query context changes (modTags / tagList /
+            // explicit clearAndRefill). Any in-flight refill that captured an
+            // older generation discards its results instead of polluting the
+            // freshly-cleared queue with stale-query rows.
+            refillGen: 0,
             lastDisplayedId: null,
             // Set when sessions hit zero; cleared if a session rejoins
             // before it fires. On expiry the channel is fully evicted
@@ -271,10 +278,16 @@ function createOrchestrator({
         return false;
     }
 
-    async function refillQueue(channel, { minSize = MIN_QUEUE_SIZE, fetchSize = REFILL_FETCH_SIZE } = {}) {
-        if (channel.refilling) return;
-        if (channel.queue.length >= minSize) return;
-        channel.refilling = true;
+    function refillQueue(channel, opts = {}) {
+        if (channel.refillPromise) return channel.refillPromise;
+        const minSize = opts.minSize ?? MIN_QUEUE_SIZE;
+        if (channel.queue.length >= minSize) return Promise.resolve();
+        const p = runRefill(channel, opts).finally(() => { channel.refillPromise = null; });
+        channel.refillPromise = p;
+        return p;
+    }
+
+    async function runRefill(channel, { minSize = MIN_QUEUE_SIZE, fetchSize = REFILL_FETCH_SIZE } = {}) {
         const startedEmpty = channel.queue.length === 0;
         let totalResults = 0;
         let lastQuery = '';
@@ -284,7 +297,12 @@ function createOrchestrator({
             while (channel.queue.length < minSize && attempts < 6) {
                 const q = buildQuery(channel);
                 lastQuery = q;
+                const gen = channel.refillGen;
                 const { results, nextCursor } = await search.runSearch({ q, cursor: channel.cursor, limit: fetchSize });
+                // If clearAndRefill ran while we were awaiting, the query
+                // context has changed under us — drop these results instead
+                // of pushing stale-query rows into the cleared queue.
+                if (channel.refillGen !== gen) return;
                 totalResults += results.length;
                 const beforeLen = channel.queue.length;
                 const present = new Set(channel.queue.map((e) => e.id));
@@ -310,8 +328,6 @@ function createOrchestrator({
             }
         } catch (err) {
             console.warn(`[orchestrator] refill failed (${channel.deviceId}): ${err.message}`);
-        } finally {
-            channel.refilling = false;
         }
         // Surface "no matches" for an active tag query so the user can tell a
         // stuck slideshow apart from a typo'd tag set. Only fire when we
@@ -332,10 +348,17 @@ function createOrchestrator({
         }
     }
 
-    function clearAndRefill(channel) {
+    async function clearAndRefill(channel) {
         channel.queue.length = 0;
         channel.cursor = null;
+        channel.refillGen += 1;
         if (search?.clearCache) search.clearCache();
+        // Wait for any in-flight refill to drain so its (aborted) results
+        // can't race ahead of ours. The gen bump above guarantees that
+        // refill's results have been discarded.
+        if (channel.refillPromise) {
+            try { await channel.refillPromise; } catch (_) { /* errors already logged */ }
+        }
         return refillQueue(channel);
     }
 
