@@ -146,6 +146,9 @@ export function connectWebSocket() {
             case 'refresh':
                 location.reload();
                 break;
+            case 'searchEmpty':
+                console.warn(`Server reports no matches for tag query: "${message.payload?.query ?? ''}"`);
+                break;
             default:
                 // Unknown actions are silently ignored — server-side may
                 // introduce new ones we don't yet handle.

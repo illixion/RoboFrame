@@ -376,6 +376,16 @@ Forwarded HA sensor reading (filtered by `HA_FILTER_ENTITIES`).
 }}
 ```
 
+### `searchEmpty`
+Channel-scoped notification fired when a refill returns zero rows for a
+non-empty tag query — typically a typo'd `setModTags` or an unsatisfiable
+combination. Clients can surface this to logs / UI; the slideshow remains
+paused on its current image.
+
+```json
+{ "action": "searchEmpty", "payload": { "query": "cats rare:tag" } }
+```
+
 ### Effect frames
 Broadcast to every client via `rpcsend` or MQTT RPC; render or ignore as
 fits. Payload field names are stable.

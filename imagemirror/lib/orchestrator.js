@@ -275,12 +275,17 @@ function createOrchestrator({
         if (channel.refilling) return;
         if (channel.queue.length >= minSize) return;
         channel.refilling = true;
+        const startedEmpty = channel.queue.length === 0;
+        let totalResults = 0;
+        let lastQuery = '';
         try {
             let attempts = 0;
             let wrapped = false;
             while (channel.queue.length < minSize && attempts < 6) {
                 const q = buildQuery(channel);
+                lastQuery = q;
                 const { results, nextCursor } = await search.runSearch({ q, cursor: channel.cursor, limit: fetchSize });
+                totalResults += results.length;
                 const beforeLen = channel.queue.length;
                 const present = new Set(channel.queue.map((e) => e.id));
                 const blockedIdSet = new Set((getBlockedIds() || []).map(Number));
@@ -307,6 +312,23 @@ function createOrchestrator({
             console.warn(`[orchestrator] refill failed (${channel.deviceId}): ${err.message}`);
         } finally {
             channel.refilling = false;
+        }
+        // Surface "no matches" for an active tag query so the user can tell a
+        // stuck slideshow apart from a typo'd tag set. Only fire when we
+        // started from an empty queue *and* the query returned zero rows.
+        if (startedEmpty && totalResults === 0 && lastQuery && channel.queue.length === 0) {
+            console.warn(`[orchestrator] search returned 0 results (${channel.deviceId}): q="${lastQuery}"`);
+            broadcastSearchEmpty(channel, lastQuery);
+        }
+    }
+
+    function broadcastSearchEmpty(channel, query) {
+        const targets = broadcastTargets(channel);
+        if (targets.length === 0) return;
+        const byWs = groupKeysByWs(targets);
+        for (const [ws, sessionIds] of byWs) {
+            const data = JSON.stringify({ action: 'searchEmpty', sessionIds, payload: { query } });
+            try { ws.send(data); } catch (_) { /* socket gone */ }
         }
     }
 

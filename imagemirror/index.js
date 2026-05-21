@@ -49,7 +49,7 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 
 app.use(cookieParser());
 
-app.use(['/get', '/save', '/history', '/history.json', '/addtohistory', '/rpc/tags.json'], requireToken);
+app.use(['/get', '/save', '/history', '/history.json', '/addtohistory', '/post', '/search', '/rpc/tags.json'], requireToken);
 
 // Setup view engine
 app.set('views', path.join(__dirname, 'views'));
@@ -527,6 +527,8 @@ function processRequestV2(req, res) {
   );
 }
 
+let searchRef = null;
+
 // Connect to DuckDB
 const DUCKDB_PATH = pickEnv('DUCKDB_PATH', srv.duckdbPath, 'posts.duckdb');
 const RANDOM_RANK_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -575,6 +577,7 @@ async function refreshRandomRanks() {
     // orchestrator, which broadcasts a `playback` channel over WebSocket
     // and is what every kiosk renders from.
     const search = createSearch({ db });
+    searchRef = search;
 
     const reshuffle = async () => {
         await refreshRandomRanks();
@@ -673,6 +676,45 @@ app.get('/addtohistory', (req, res) => {
       });
 
       return res.status(200).send('Post added to history');
+    }
+  );
+});
+
+// Debugging helper: run a query string through the same search layer the
+// orchestrator uses. `?q=` is the query, `?limit=` optional override.
+app.get('/search', async (req, res) => {
+  if (!searchRef) return res.status(503).send('Search not ready');
+  const q = String(req.query.q || '');
+  const limitRaw = Number(req.query.limit);
+  // parseQuery already defaults to 40 and honors `limit:N` inside `q`; only
+  // pass an override when the caller set `?limit=` explicitly.
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined;
+  try {
+    const value = await searchRef.runSearch({ q, limit });
+    res.type('application/json').send(JSON.stringify(value, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)));
+  } catch (err) {
+    console.error(`search error: ${err.message}`);
+    res.status(500).send('Search failed');
+  }
+});
+
+// Debugging helper: full DuckDB row for a post (joined with its file path).
+// Token-gated like the rest of the image API. Returns JSON.
+app.get('/post', (req, res) => {
+  const postId = Number(req.query.id) || 0;
+  if (!postId) return res.status(400).send('Missing post ID');
+
+  db.all(
+    "SELECT posts.*, p.path FROM file_db.posts LEFT JOIN file_db.posts_paths p ON p._id = posts._id WHERE posts._id = ? LIMIT 1;",
+    [postId],
+    (err, rows) => {
+      if (err) {
+        console.error(`DuckDB error: ${err.message}`);
+        return res.status(500).send('Database error');
+      }
+      if (!rows.length) return res.status(404).send('Post not found');
+      // DuckDB returns BIGINT columns as JS BigInt, which JSON.stringify rejects.
+      res.type('application/json').send(JSON.stringify(rows[0], (_k, v) => (typeof v === 'bigint' ? v.toString() : v)));
     }
   );
 });
