@@ -61,6 +61,7 @@ const mirrorFilesPath = pickEnv('IMAGE_MIRROR_PATH', srv.imageMirrorPath, '/Volu
 const CHUNK_SIZE = pickEnv('CHUNK_SIZE', srv.chunkSize, 0, { type: 'number' });
 const SAVE_PATH = pickEnv('SAVE_PATH', srv.savePath, '/tmp');
 const DJXL_PATH = pickEnv('DJXL_PATH', srv.djxlPath, 'djxl');
+const JXLINFO_PATH = pickEnv('JXLINFO_PATH', srv.jxlinfoPath, 'jxlinfo');
 
 /**
  * Build the file path for a given post ID and extension.
@@ -113,6 +114,27 @@ function convertToAPNG(imageData) {
     // Handle errors
     // djxl.stderr.on('data', (data) => console.error(`djxl error: ${data.toString()}`));
     djxl.on('error', (err) => reject(new Error(`Failed to start djxl: ${err.message}`)));
+  });
+}
+
+/**
+ * Probe a JXL buffer with jxlinfo and resolve true if it's animated.
+ * jxlinfo prints "JPEG XL animation" on the header line for animated files.
+ * Resolves false on any failure — caller falls through to the static path.
+ * @param {Buffer} imageData
+ * @returns {Promise<boolean>}
+ */
+function isAnimatedJxl(imageData) {
+  return new Promise((resolve) => {
+    let stdout = '';
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    const proc = spawn(JXLINFO_PATH, ['-']);
+    proc.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    proc.on('close', () => done(/JPEG XL animation/.test(stdout)));
+    proc.on('error', () => done(false));
+    proc.stdin.on('error', () => done(false));
+    proc.stdin.end(imageData);
   });
 }
 
@@ -294,8 +316,10 @@ function processRequestV2(req, res) {
 
       const filePath = row.path;
 
-      // Animated JXL isn't uniformly supported, this will convert it to APNG if needed
+      // Animated JXL isn't uniformly supported, this will convert it to APNG if needed.
+      // Explicit `animated_png` tag forces APNG; otherwise probe JXL files with jxlinfo.
       let apngMode = false;
+      const isJxl = path.extname(filePath).toLowerCase() === '.jxl';
       if (row.tags && row.tags.includes('animated_png')) {
         apngMode = true;
       }
@@ -326,6 +350,10 @@ function processRequestV2(req, res) {
         let finalMimeType = 'application/octet-stream';
 
         try {
+          if (cancelled) return;
+          if (!apngMode && isJxl) {
+            apngMode = await isAnimatedJxl(data);
+          }
           if (cancelled) return;
           // if bright is set, we will convert the image to WebP with opacity always
           if (apngMode) {
