@@ -10,6 +10,7 @@ const { spawn } = require('child_process');
 const duckdb = require('duckdb');
 const bodyParser = require("body-parser");
 const cors = require('cors');
+const zlib = require('zlib');
 const { loadConfig, pickEnv } = require('@roboframe/shared');
 const { setupBroker } = require('./lib/broker');
 const { createSearch } = require('./lib/searchQuery');
@@ -62,6 +63,7 @@ const CHUNK_SIZE = pickEnv('CHUNK_SIZE', srv.chunkSize, 0, { type: 'number' });
 const SAVE_PATH = pickEnv('SAVE_PATH', srv.savePath, '/tmp');
 const DJXL_PATH = pickEnv('DJXL_PATH', srv.djxlPath, 'djxl');
 const JXLINFO_PATH = pickEnv('JXLINFO_PATH', srv.jxlinfoPath, 'jxlinfo');
+const FFMPEG_PATH = pickEnv('FFMPEG_PATH', srv.ffmpegPath, 'ffmpeg');
 
 /**
  * Build the file path for a given post ID and extension.
@@ -83,37 +85,145 @@ axios.defaults.headers.common['User-Agent'] = 'roboframe/1.0';
 // Rolling history of post IDs requested (state + dedup/cap logic in lib/history.js)
 const history = createHistory({ maxSize: 50 });
 
+const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function pngChunk(type, data) {
+  const typeBuf = Buffer.from(type, 'ascii');
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const crcInput = Buffer.concat([typeBuf, data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(zlib.crc32(crcInput), 0);
+  return Buffer.concat([len, typeBuf, data, crc]);
+}
+
 /**
- * Convert an image to APNG format, preserving transparency and animation.
- * @param {Buffer} imageData - The raw image data.
- * @returns {Promise<Buffer>} A promise that resolves with the converted image buffer.
+ * Split an APNG buffer into an array of { png, delayNum, delayDen } per
+ * frame, where `png` is a standalone PNG of that frame. Assumes every
+ * frame covers the full canvas — partial-frame APNGs (x/y offsets or
+ * disposal compositing) are not supported and would need a real
+ * compositor. Sources here are video → APNG so this holds.
  */
-function convertToAPNG(imageData) {
-  return new Promise((resolve, reject) => {
-    let outputChunks = [];
+function splitApngFrames(buf) {
+  if (buf.length < 8 || !buf.slice(0, 8).equals(PNG_SIG)) {
+    throw new Error('not a PNG');
+  }
+  let ihdrChunk = null;
+  const ancillary = [];
+  const frames = [];
+  let cur = null;
+  let sawIdat = false;
+  let p = 8;
+  while (p + 8 <= buf.length) {
+    const len = buf.readUInt32BE(p);
+    const type = buf.slice(p + 4, p + 8).toString('ascii');
+    const dataStart = p + 8;
+    const dataEnd = dataStart + len;
+    const chunkEnd = dataEnd + 4;
+    if (chunkEnd > buf.length) break;
+    const whole = buf.slice(p, chunkEnd);
 
-    // Spawn djxl to decode JXL and output APNG
+    if (type === 'IHDR') {
+      ihdrChunk = whole;
+    } else if (type === 'fcTL') {
+      const width = buf.readUInt32BE(dataStart + 4);
+      const height = buf.readUInt32BE(dataStart + 8);
+      const delayNum = buf.readUInt16BE(dataStart + 20);
+      const delayDen = buf.readUInt16BE(dataStart + 22);
+      cur = { width, height, delayNum, delayDen, idats: [] };
+      frames.push(cur);
+    } else if (type === 'IDAT') {
+      sawIdat = true;
+      if (cur) cur.idats.push(whole);
+    } else if (type === 'fdAT') {
+      const frameData = buf.slice(dataStart + 4, dataEnd);
+      cur.idats.push(pngChunk('IDAT', frameData));
+    } else if (type === 'IEND') {
+      break;
+    } else if (type !== 'acTL') {
+      if (!sawIdat) ancillary.push(whole);
+    }
+    p = chunkEnd;
+  }
+
+  if (!ihdrChunk) throw new Error('APNG missing IHDR');
+  if (frames.length === 0) throw new Error('APNG has no frames');
+
+  const ihdrData = Buffer.from(ihdrChunk.slice(8, 8 + 13));
+  const iend = pngChunk('IEND', Buffer.alloc(0));
+
+  return frames.map((f) => {
+    const ihdr = Buffer.from(ihdrData);
+    ihdr.writeUInt32BE(f.width, 0);
+    ihdr.writeUInt32BE(f.height, 4);
+    const parts = [PNG_SIG, pngChunk('IHDR', ihdr), ...ancillary, ...f.idats, iend];
+    return { png: Buffer.concat(parts), delayNum: f.delayNum, delayDen: f.delayDen };
+  });
+}
+
+/**
+ * Convert an animated JXL to animated WebP. djxl emits APNG (its only
+ * animated output format); we split that into standalone PNG frames in
+ * memory and pipe them into ffmpeg via image2pipe (no temp file, no
+ * seekable-input requirement). Frame delays are assumed uniform — true
+ * for video-sourced APNGs/GIFs in this library.
+ * @param {Buffer} imageData - Raw JXL bytes.
+ * @returns {Promise<Buffer>}
+ */
+async function convertToAnimatedWebP(imageData) {
+  const apngBuf = await new Promise((resolve, reject) => {
+    const chunks = [];
+    let err = '';
     const djxl = spawn(DJXL_PATH, ['-', '-', '--output_format', 'apng']);
-
-    // Write input image data (JXL) to stdin of djxl
-    djxl.stdin.write(imageData);
-    djxl.stdin.end();
-
-    // Collect stdout (APNG output)
-    djxl.stdout.on('data', (chunk) => outputChunks.push(chunk));
-
-    // Handle process completion
+    djxl.stdout.on('data', (c) => chunks.push(c));
+    djxl.stderr.on('data', (c) => { err += c.toString(); });
+    djxl.on('error', (e) => reject(new Error(`djxl spawn failed: ${e.message}`)));
     djxl.on('close', (code) => {
-      if (code === 0) {
-        resolve(Buffer.concat(outputChunks));
-      } else {
-        reject(new Error(`djxl failed with exit code ${code}`));
-      }
+      if (code !== 0) return reject(new Error(`djxl exit ${code}: ${err.trim()}`));
+      resolve(Buffer.concat(chunks));
     });
+    djxl.stdin.on('error', () => {});
+    djxl.stdin.end(imageData);
+  });
 
-    // Handle errors
-    // djxl.stderr.on('data', (data) => console.error(`djxl error: ${data.toString()}`));
-    djxl.on('error', (err) => reject(new Error(`Failed to start djxl: ${err.message}`)));
+  const frames = splitApngFrames(apngBuf);
+  // APNG delay_den == 0 is spec shorthand for /100.
+  const first = frames[0];
+  const num = first.delayNum || 1;
+  const den = first.delayDen || 100;
+  // image2pipe wants -framerate as N/D where N=ticks/sec; ffmpeg accepts "den/num".
+  const framerate = `${den}/${num}`;
+
+  return await new Promise((resolve, reject) => {
+    const ffmpeg = spawn(FFMPEG_PATH, [
+      '-loglevel', 'error',
+      '-f', 'image2pipe',
+      '-framerate', framerate,
+      '-i', 'pipe:0',
+      '-loop', '0',
+      '-c:v', 'libwebp_anim',
+      '-quality', '90',
+      '-f', 'webp',
+      'pipe:1',
+    ]);
+    const out = [];
+    let err = '';
+    ffmpeg.stdout.on('data', (c) => out.push(c));
+    ffmpeg.stderr.on('data', (c) => { err += c.toString(); });
+    ffmpeg.on('error', (e) => reject(new Error(`ffmpeg spawn failed: ${e.message}`)));
+    ffmpeg.on('close', (code) => {
+      if (code !== 0) return reject(new Error(`ffmpeg exit ${code}: ${err.trim()}`));
+      resolve(Buffer.concat(out));
+    });
+    ffmpeg.stdin.on('error', () => {});
+    (async () => {
+      for (const f of frames) {
+        if (!ffmpeg.stdin.write(f.png)) {
+          await new Promise((r) => ffmpeg.stdin.once('drain', r));
+        }
+      }
+      ffmpeg.stdin.end();
+    })().catch(() => {});
   });
 }
 
@@ -127,13 +237,21 @@ function convertToAPNG(imageData) {
 function isAnimatedJxl(imageData) {
   return new Promise((resolve) => {
     let stdout = '';
+    let stderr = '';
     let settled = false;
     const done = (v) => { if (!settled) { settled = true; resolve(v); } };
-    const proc = spawn(JXLINFO_PATH, ['-']);
+    const proc = spawn(JXLINFO_PATH, ['/dev/stdin']);
     proc.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
-    proc.on('close', () => done(/JPEG XL animation/.test(stdout)));
-    proc.on('error', () => done(false));
-    proc.stdin.on('error', () => done(false));
+    proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    proc.on('close', (code) => {
+      if (code !== 0) console.error(`jxlinfo exit ${code}: ${stderr.trim()}`);
+      done(/JPEG XL animation/.test(stdout));
+    });
+    proc.on('error', (err) => {
+      console.error(`jxlinfo spawn failed: ${err.message}`);
+      done(false);
+    });
+    proc.stdin.on('error', () => {});
     proc.stdin.end(imageData);
   });
 }
@@ -297,7 +415,7 @@ function processRequestV2(req, res) {
 
   // Query DuckDB for the post with the given _id to get the path
   db.all(
-    "SELECT path FROM file_db.posts_paths WHERE _id = ? LIMIT 1;",
+    "SELECT p.path, posts.tags FROM file_db.posts_paths p JOIN file_db.posts ON posts._id = p._id WHERE p._id = ? LIMIT 1;",
     [postId],
     (err, rows) => {
       if (cancelled) return;
@@ -316,12 +434,16 @@ function processRequestV2(req, res) {
 
       const filePath = row.path;
 
-      // Animated JXL isn't uniformly supported, this will convert it to APNG if needed.
-      // Explicit `animated_png` tag forces APNG; otherwise probe JXL files with jxlinfo.
-      let apngMode = false;
+      // Animated JXL → animated WebP for every client. Safari doesn't
+      // decode raw JXL animation, so we can't pass it through, and APNG
+      // animation isn't supported in Safari either — WebP is the only
+      // format that works across the browser kiosk and Spatialstash.
+      // Explicit `animated_png` tag forces the animated path; otherwise
+      // probe JXL files with jxlinfo.
+      let animatedMode = false;
       const isJxl = path.extname(filePath).toLowerCase() === '.jxl';
       if (row.tags && row.tags.includes('animated_png')) {
-        apngMode = true;
+        animatedMode = true;
       }
 
       // Check if the file exists in either the original or cloud path, set the filePath accordingly
@@ -351,14 +473,13 @@ function processRequestV2(req, res) {
 
         try {
           if (cancelled) return;
-          if (!apngMode && isJxl) {
-            apngMode = await isAnimatedJxl(data);
+          if (!animatedMode && isJxl) {
+            animatedMode = await isAnimatedJxl(data);
           }
           if (cancelled) return;
-          // if bright is set, we will convert the image to WebP with opacity always
-          if (apngMode) {
-            finalBuffer = await convertToAPNG(data);
-            finalMimeType = 'image/apng';
+          if (animatedMode) {
+            finalBuffer = await convertToAnimatedWebP(data);
+            finalMimeType = 'image/webp';
           } else if (convert) {
             finalBuffer = await convertFromJxl(data, screenWidth, screenHeight, bright);
             finalMimeType = 'image/jpeg';
@@ -373,7 +494,8 @@ function processRequestV2(req, res) {
           }
         } catch (conversionError) {
           console.error('Error processing image:', conversionError);
-          // Keep original buffer and default MIME type
+          if (!res.headersSent) res.status(500).send('Image conversion failed');
+          return;
         }
 
         // Log post ID, extension, MIME type, and file contents to request history
@@ -387,8 +509,17 @@ function processRequestV2(req, res) {
         if (cancelled || res.headersSent) return;
 
         res.setHeader('Content-Type', finalMimeType);
-        // return original file name
-        res.setHeader('Content-Disposition', `inline; filename="${postId}.${path.extname(filePath).slice(1)}"`);
+        // Filename extension tracks the served MIME (Safari/Finder rely on
+        // it), not the on-disk source — animated JXL is re-encoded to WebP,
+        // convert/lowmem paths emit JPEG, etc.
+        const mimeExt = {
+          'image/webp': 'webp',
+          'image/jpeg': 'jpg',
+          'image/png': 'png',
+          'image/apng': 'apng',
+          'image/gif': 'gif',
+        }[finalMimeType] || path.extname(filePath).slice(1);
+        res.setHeader('Content-Disposition', `inline; filename="${postId}.${mimeExt}"`);
 
         res.send(finalBuffer);
       });
