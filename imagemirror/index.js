@@ -490,7 +490,31 @@ function processRequestV2(req, res) {
             finalBuffer = await convertBufferToJpeg(data, screenWidth, screenHeight, 85);
             finalMimeType = 'image/jpeg';
           } else {
-            finalMimeType = returnMimeType || finalMimeType;
+            // Raw passthrough — derive mime from the on-disk extension.
+            // The earlier `returnMimeType || finalMimeType` form was a
+            // dead branch: `returnMimeType` is only populated inside the
+            // cache-hit short-circuit above, which has already returned
+            // by the time we reach here. The fallback therefore always
+            // collapsed to `application/octet-stream`, and clients (e.g.
+            // WKWebView) silently failed to treat animated WebP as an
+            // animated image because the response wasn't tagged as one.
+            const srcExt = path.extname(filePath).slice(1).toLowerCase();
+            const extMime = {
+              jpg: 'image/jpeg',
+              jpeg: 'image/jpeg',
+              png: 'image/png',
+              apng: 'image/apng',
+              gif: 'image/gif',
+              webp: 'image/webp',
+              avif: 'image/avif',
+              heic: 'image/heic',
+              heif: 'image/heif',
+              jxl: 'image/jxl',
+              bmp: 'image/bmp',
+              tif: 'image/tiff',
+              tiff: 'image/tiff',
+            }[srcExt];
+            if (extMime) finalMimeType = extMime;
           }
         } catch (conversionError) {
           console.error('Error processing image:', conversionError);
