@@ -66,17 +66,31 @@ function createMqttBridge({ config, broadcast }) {
     //   needing a token or HTTP roundtrip.
     const DISMISS_CMD_TOPIC = `${TOPIC_PREFIX}/cmd/dismiss`;
     const RPC_CMD_TOPIC = `${TOPIC_PREFIX}/rpc/cmd`;
+    // Broker-wide availability. LWT publishes "offline" on ungraceful
+    // disconnect; on every (re)connect we publish "online". Every entity's
+    // discovery payload references this topic so HA marks the whole device
+    // tree unavailable while the broker is down — which is what lets the
+    // `connected` sensor's non-retained state work safely across restarts.
+    const AVAILABILITY_TOPIC = `${TOPIC_PREFIX}/status`;
 
     client = mqtt.connect(url, {
         username: cfg.username || undefined,
         password: cfg.password || undefined,
         reconnectPeriod: 5000,
         clientId: `roboframe-${process.pid}-${Math.random().toString(16).slice(2, 8)}`,
+        will: {
+            topic: AVAILABILITY_TOPIC,
+            payload: 'offline',
+            qos: 0,
+            retain: true,
+        },
     });
 
     client.on('connect', () => {
         connected = true;
         console.log(`[mqtt] Connected to ${url}`);
+        // Birth message — pairs with the LWT above.
+        client.publish(AVAILABILITY_TOPIC, 'online', { qos: 0, retain: true });
         // Re-publish discovery for everything we already know about so HA
         // re-creates entities after a broker restart.
         for (const [deviceId, caps] of registered.entries()) {
@@ -229,6 +243,7 @@ function createMqttBridge({ config, broadcast }) {
             state_topic: `${TOPIC_PREFIX}/light/${deviceId}/backlight/state`,
             brightness: true,
             brightness_scale: 255,
+            ...availabilityBlock(),
             device: deviceBlock(deviceId),
         };
         publish(`${DISCOVERY_PREFIX}/light/${uid}/config`, cfg);
@@ -243,6 +258,7 @@ function createMqttBridge({ config, broadcast }) {
             device_class: 'motion',
             payload_on: 'ON',
             payload_off: 'OFF',
+            ...availabilityBlock(),
             device: deviceBlock(deviceId),
         };
         publish(`${DISCOVERY_PREFIX}/binary_sensor/${uid}/config`, cfg);
@@ -256,6 +272,7 @@ function createMqttBridge({ config, broadcast }) {
             state_topic: `${TOPIC_PREFIX}/sensor/${deviceId}/als/state`,
             device_class: 'illuminance',
             unit_of_measurement: 'lx',
+            ...availabilityBlock(),
             device: deviceBlock(deviceId),
         };
         publish(`${DISCOVERY_PREFIX}/sensor/${uid}/config`, cfg);
@@ -271,6 +288,7 @@ function createMqttBridge({ config, broadcast }) {
             payload_on: 'ON',
             payload_off: 'OFF',
             icon: 'mdi:sleep',
+            ...availabilityBlock(),
             device: deviceBlock(deviceId),
         };
         publish(`${DISCOVERY_PREFIX}/switch/${uid}/config`, cfg);
@@ -285,6 +303,7 @@ function createMqttBridge({ config, broadcast }) {
             device_class: 'connectivity',
             payload_on: 'ON',
             payload_off: 'OFF',
+            ...availabilityBlock(),
             device: deviceBlock(deviceId),
         };
         publish(`${DISCOVERY_PREFIX}/binary_sensor/${uid}/config`, cfg);
@@ -300,6 +319,7 @@ function createMqttBridge({ config, broadcast }) {
             payload_on: 'ON',
             payload_off: 'OFF',
             icon: 'mdi:webcam',
+            ...availabilityBlock(),
             device: deviceBlock(deviceId),
         };
         publish(`${DISCOVERY_PREFIX}/switch/${uid}/config`, cfg);
@@ -319,6 +339,14 @@ function createMqttBridge({ config, broadcast }) {
             },
         };
         publish(`${DISCOVERY_PREFIX}/button/${uid}/config`, cfg);
+    }
+
+    function availabilityBlock() {
+        return {
+            availability_topic: AVAILABILITY_TOPIC,
+            payload_available: 'online',
+            payload_not_available: 'offline',
+        };
     }
 
     function deviceBlock(deviceId) {
@@ -381,12 +409,25 @@ function createMqttBridge({ config, broadcast }) {
     function publishConnected(deviceId, connectedState) {
         if (!deviceId) return;
         if (ensureRegistered(deviceId, 'connected')) publishConnectedDiscovery(deviceId);
-        publish(`${TOPIC_PREFIX}/binary_sensor/${deviceId}/connected/state`, connectedState ? 'ON' : 'OFF');
+        // Non-retained: on broker restart the entity reverts to `unknown`
+        // until a client actually (re)attaches, instead of resurfacing a
+        // stale ON from a previous runtime. The broker-wide availability
+        // topic still marks the entity `unavailable` while we're down.
+        publish(
+            `${TOPIC_PREFIX}/binary_sensor/${deviceId}/connected/state`,
+            connectedState ? 'ON' : 'OFF',
+            { retain: false, qos: 0 },
+        );
     }
 
     function close() {
         if (client) {
-            try { client.end(true); } catch (_) { /* ignore */ }
+            try {
+                if (connected) {
+                    client.publish(AVAILABILITY_TOPIC, 'offline', { qos: 0, retain: true });
+                }
+                client.end(true);
+            } catch (_) { /* ignore */ }
         }
         registered.clear();
     }

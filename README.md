@@ -297,7 +297,7 @@ When `server.mqtt.url` is set, the broker connects to the configured MQTT broker
 
 - `light.roboframe_<deviceId>_backlight` — on/off + brightness (0–255). HA writes flow back to the kiosk via the WebSocket `setBrightness` / `displayState` actions.
 - `binary_sensor.roboframe_<deviceId>_motion` — driven by the kiosk's `visibility` action (web frontend / spatialstash) and the on-device PIR HTTP endpoints.
-- `binary_sensor.roboframe_<deviceId>_connected` — `connectivity` class, ON whenever at least one WebSocket session has claimed this `deviceId` (browser kiosk, Spatialstash window, native kiosk, or node-display). Flips OFF on the last disconnect.
+- `binary_sensor.roboframe_<deviceId>_connected` — `connectivity` class, ON whenever at least one WebSocket session has claimed this `deviceId` (browser kiosk, Spatialstash window, native kiosk, or node-display). Flips OFF on the last disconnect. Not retained — after a broker restart the state is `unknown` until a client (re)connects, so automations must treat `unknown`/`unavailable` as off.
 - `sensor.roboframe_<deviceId>_als` — ambient light reading, published when the kiosk reports one.
 - `switch.roboframe_<deviceId>_suppress` — when ON, the kiosk's wake-suppressor is engaged: PIR motion will not wake the panel.
 
@@ -312,6 +312,10 @@ automation:
       - platform: state
         entity_id: binary_sensor.roboframe_kitchen_connected
         to: 'on'
+    # `to: 'on'` already filters out unknown/unavailable transitions, so
+    # the broker reconnecting won't fire this. The paired "disconnect"
+    # automation below uses a template trigger to treat unknown /
+    # unavailable as off.
     action:
       - service: switch.turn_on
         target:
@@ -322,9 +326,10 @@ automation:
 
   - alias: RoboFrame — hand off suppress when kitchen disconnects
     trigger:
-      - platform: state
-        entity_id: binary_sensor.roboframe_kitchen_connected
-        to: 'off'
+      - platform: template
+        value_template: >-
+          {{ states('binary_sensor.roboframe_kitchen_connected')
+             in ['off', 'unknown', 'unavailable'] }}
     action:
       - service: switch.turn_off
         target:
