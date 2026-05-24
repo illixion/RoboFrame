@@ -371,7 +371,7 @@ test('displaySync release: each non-driver channel resumes its own playback', as
     assert.equal(bAfter.payload.mergeDriver, null);
 });
 
-test('displaySync: driver disconnect keeps merge across grace window', async (t) => {
+test('displaySync: driver disconnect parks driver channel and keeps merge held', async (t) => {
     const { orch } = harness({
         pages: [
             { results: [{ _id: 1, file_ext: 'jpg' }, { _id: 2, file_ext: 'jpg' }, { _id: 3, file_ext: 'jpg' }, { _id: 4, file_ext: 'jpg' }, { _id: 5, file_ext: 'jpg' }], nextCursor: 0 },
@@ -393,13 +393,14 @@ test('displaySync: driver disconnect keeps merge across grace window', async (t)
     // Driver disconnects. Merge stays — all sessions on the driver
     // channel are equal, and a transient disconnect of the original
     // claimer shouldn't disrupt the merge for everyone else. The
-    // channel itself lingers in the grace window with no sessions.
+    // driver channel is parked (timers stopped) but persists with the
+    // merge claim until a session on it explicitly releases.
     orch.unregister(a);
     assert.equal(orch._state().mergeDriverDeviceId, 'screen1',
         'driver ws drop alone does not release the merge');
 });
 
-test('reconnect within grace window restores channel state without slideshowConfig replay', async (t) => {
+test('reconnect to parked channel restores state without slideshowConfig replay', async (t) => {
     const { orch } = harness({
         pages: [
             { results: [{ _id: 1, file_ext: 'jpg' }, { _id: 2, file_ext: 'jpg' }, { _id: 3, file_ext: 'jpg' }, { _id: 4, file_ext: 'jpg' }, { _id: 5, file_ext: 'jpg' }], nextCursor: 0 },
@@ -415,10 +416,10 @@ test('reconnect within grace window restores channel state without slideshowConf
     // Disconnect the only session. Channel must persist — its queue,
     // mod tags, and current id are needed when the client reconnects.
     orch.unregister(a);
-    const grace = orch._state().channels[0];
-    assert.ok(grace, 'channel persists during grace window');
-    assert.equal(grace.deviceId, 'screen1');
-    assert.equal(grace.sessionCount, 0);
+    const parked = orch._state().channels[0];
+    assert.ok(parked, 'channel persists after last session leaves');
+    assert.equal(parked.deviceId, 'screen1');
+    assert.equal(parked.sessionCount, 0);
 
     // Reconnect with bare deviceId (no slideshowConfig replay needed
     // for state — `register` takes care of session re-binding).

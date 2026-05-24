@@ -103,18 +103,22 @@ updates to track a server change, ship those too:
 - **`displaySync` is a merge.** The claimer's channel broadcasts to
   every WS regardless of `deviceId`; other channels' timers pause until
   release. All sessions on the driver channel are equal — the claimer
-  ws disconnecting does not release the merge; only full eviction of
-  the driver channel does (after the grace window). Anyone can
+  ws disconnecting does not release the merge; the driver channel
+  parks (timers stopped) and keeps the claim. Only an explicit
+  `displaySync {enabled:false}` or process shutdown releases it. Anyone can
   `requestNext` / `block` / `setModTags` — no primary gate; the server
   is the only emitter of `playback` so there's no echo loop.
-- **Channel grace window.** When the last session on a channel
-  disconnects the channel is *not* deleted immediately — its queue,
-  cursor, mod tags, interval, currentId, and merge claim are kept for
-  2 minutes. A reconnecting client (typical sleep/wake on a visionOS
-  window) is rebound to the surviving channel and resumes without
-  having to replay `slideshowConfig`. Cadence is paused for the
-  duration; if no session rejoins by 2 min, the channel is evicted and
-  any held merge claim is released.
+- **Channels are parked, not evicted.** When the last session on a
+  channel disconnects the channel is kept for the lifetime of the
+  server process — queue, cursor, mod tags, interval, currentId, and
+  merge claim are all preserved. All timers (dwell, readiness,
+  prefetch, idle-refill) stop while parked so no work runs for an
+  unattended channel. A reconnecting client (visionOS sleep/wake,
+  kiosk reboot, network blip, days-later return) rebinds to the
+  surviving channel and resumes from the same image without replaying
+  `slideshowConfig`. A held merge claim is only released by an
+  explicit `displaySync {enabled:false}` from some session on the
+  driver channel, or by `close()` at process shutdown.
 - **Server-side blocklist.** The orchestrator filters blocked posts
   out of every channel's queue and advances any channel that was just
   showing one. Don't add client-side defensive filtering.
@@ -173,6 +177,10 @@ the deadline) is the canary for the wake-advance class of bug.
   protocol, update that block as well as `docs/protocol.md`.
 - `'use strict'` on every server-side `.js` file.
 - Skip transitional language in code comments, write them as if it always worked that way. The Git history is the source of truth for how things evolved.
+- After tests pass for a change, create a commit without waiting to be
+  asked. Write commit subjects in the imperative mood ("Add X", "Fix Y",
+  "Drop Z"), matching the existing `git log` style — no trailing
+  period, no past tense, no "this commit…" preamble.
 
 ## Privacy
 

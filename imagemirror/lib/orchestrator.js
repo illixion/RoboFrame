@@ -4,9 +4,12 @@
 //
 // One channel per `deviceId`. Sessions joining a channel render the same
 // queue and advance in lockstep. A channel is created when the first session
-// for that deviceId calls `slideshowConfig`; it lingers in a 2-minute grace
-// window when its last session leaves and is fully evicted at end-of-grace
-// (unless a session reconnects in time).
+// for that deviceId calls `slideshowConfig` and persists for the lifetime of
+// the server process: when its last session leaves, the channel is *parked*
+// — all timers (dwell, readiness, prefetch) stop, but the queue, cursor,
+// mod tags, tag list, interval, currentId, and any held merge claim survive.
+// A returning client for the same deviceId rebinds to the parked channel
+// and resumes from the same image without replaying slideshowConfig.
 //
 // Cadence is gated on a readiness barrier: after a `playback` frame is sent,
 // the channel waits until every visible session reports `imageReady { id }`
@@ -65,14 +68,6 @@ function createOrchestrator({
     const DEFAULT_INTERVAL_MS = 15000;
     const MIN_INTERVAL_MS = 2000;
     const MAX_INTERVAL_MS = 3600000;
-    // How long an empty channel lingers before it's torn down. A
-    // disconnecting visionOS window — sleep/wake or transient network —
-    // will reconnect well within this window, so its channel state
-    // (queue, mod tags, interval, displaySync claim, currentId) survives
-    // the round-trip and the client doesn't have to replay slideshowConfig
-    // to re-bind. Fully empties (server-driven cleanup) still happen, just
-    // delayed.
-    const CHANNEL_GRACE_MS = 2 * 60 * 1000;
     // How often the watchdog checks for channels that wedged in `idle` with
     // an empty queue (first refill returned nothing, transient DB error,
     // etc.) and re-attempts the refill so the slideshow recovers without
@@ -148,10 +143,11 @@ function createOrchestrator({
             // freshly-cleared queue with stale-query rows.
             refillGen: 0,
             lastDisplayedId: null,
-            // Set when sessions hit zero; cleared if a session rejoins
-            // before it fires. On expiry the channel is fully evicted
-            // (and a held merge claim is released).
-            teardownTimer: null,
+            // True between the last session leaving and the next one
+            // arriving. While parked, timers stay stopped (no wasted DB
+            // / prefetch / readiness work) but every other piece of
+            // state is preserved verbatim for the eventual reconnect.
+            parked: false,
         };
     }
 
@@ -543,15 +539,12 @@ function createOrchestrator({
             removeSession(key);
         }
         const channel = getOrCreateChannel(deviceId);
-        // Reconnect within the grace window: cancel teardown so we keep
-        // queue / modTags / interval / currentId / merge claim. Existing
-        // dwellDeadline (if any) is invalidated below by commitCurrent's
+        // Reconnect to a parked channel: queue / modTags / interval /
+        // currentId / merge claim are all still here from last time.
+        // Any stale dwellDeadline is invalidated below by commitCurrent's
         // reset path, so the slideshow restarts the readiness barrier
         // for the same image rather than firing immediately.
-        if (channel.teardownTimer) {
-            clearTimeout(channel.teardownTimer);
-            channel.teardownTimer = null;
-        }
+        channel.parked = false;
         const sess = sessionsByKey.get(key) || { ws, sessionId, channel, modTags: [] };
         sess.ws = ws;
         sess.sessionId = sessionId;
@@ -624,46 +617,22 @@ function createOrchestrator({
             if (wsKeys.size === 0) wsSessions.delete(ws);
         }
         if (channel.sessions.size === 0) {
-            // Last session left — pause cadence and start the grace
-            // window. State (queue, modTags, interval, currentId, merge
-            // claim) is preserved so a quick reconnect picks up where it
-            // left off without replaying slideshowConfig.
+            // Last session left — park the channel. Every timer stops
+            // so no DB/prefetch/dwell work runs while no one's listening,
+            // but queue / modTags / interval / currentId / merge claim
+            // are preserved verbatim. The next register() for this
+            // deviceId rebinds to the same channel and resumes from the
+            // same image; no slideshowConfig replay needed for state.
             stopDwellTimer(channel);
             if (channel.readinessTimer) {
                 clearTimeout(channel.readinessTimer);
                 channel.readinessTimer = null;
             }
-            scheduleChannelTeardown(channel);
+            channel.parked = true;
         } else if (channel.phase === 'loading') {
             // Disconnect during the readiness barrier — re-check now that
             // the expected set is smaller.
             startTimerIfReady(channel);
-        }
-    }
-
-    function scheduleChannelTeardown(channel) {
-        if (channel.teardownTimer) clearTimeout(channel.teardownTimer);
-        channel.teardownTimer = setTimeout(() => {
-            channel.teardownTimer = null;
-            if (channel.sessions.size > 0) return;
-            evictChannel(channel);
-        }, CHANNEL_GRACE_MS);
-        if (typeof channel.teardownTimer.unref === 'function') {
-            channel.teardownTimer.unref();
-        }
-    }
-
-    function evictChannel(channel) {
-        stopDwellTimer(channel);
-        if (channel.readinessTimer) {
-            clearTimeout(channel.readinessTimer);
-            channel.readinessTimer = null;
-        }
-        channels.delete(channel.deviceId);
-        if (channel === mergeDriverChannel) {
-            // Driver channel actually went away. Release the merge so
-            // remaining channels resume their own cadences.
-            releaseMerge();
         }
     }
 
@@ -682,8 +651,12 @@ function createOrchestrator({
         // Iterate over a copy — removeSession mutates wsKeys via the
         // sessionsByKey deletion path.
         for (const key of Array.from(wsKeys)) removeSession(key);
-        // Note: a ws closing does NOT release a held merge claim. Only
-        // full eviction of the driver channel does that (after grace).
+        // Note: a ws closing does NOT release a held merge claim. The
+        // driver channel parks (timers stopped) and keeps the claim so
+        // a reconnect resumes the merged display layout. The only
+        // automatic release is close() at process shutdown; otherwise
+        // some session on the driver channel must explicitly disable
+        // displaySync.
     }
 
     function setModTags(ws, sessionId, tags) {
@@ -861,6 +834,7 @@ function createOrchestrator({
 
     const idleRefillTimer = setInterval(() => {
         for (const channel of channels.values()) {
+            if (channel.parked) continue;
             if (channel.phase !== 'idle') continue;
             if (channel.queue.length > 0) continue;
             if (channel.refilling) continue;
@@ -879,10 +853,6 @@ function createOrchestrator({
             if (channel.readinessTimer) {
                 clearTimeout(channel.readinessTimer);
                 channel.readinessTimer = null;
-            }
-            if (channel.teardownTimer) {
-                clearTimeout(channel.teardownTimer);
-                channel.teardownTimer = null;
             }
             channel.sessions.clear();
             channel.queue.length = 0;
