@@ -9,6 +9,7 @@
 //
 //   light.roboframe_<deviceId>_backlight    on/off + brightness 0–255
 //   binary_sensor.roboframe_<deviceId>_motion
+//   binary_sensor.roboframe_<deviceId>_connected   ≥1 ws claims this deviceId
 //   sensor.roboframe_<deviceId>_als         (only if the device reports it)
 //
 // Inbound flow (HA slider → kiosk):
@@ -35,7 +36,7 @@ function createMqttBridge({ config, broadcast }) {
     const TOPIC_PREFIX = (cfg.topicPrefix || 'roboframe').replace(/\/+$/, '');
     const DISCOVERY_PREFIX = (cfg.discoveryPrefix || 'homeassistant').replace(/\/+$/, '');
 
-    /** @type {Map<string, { backlight: boolean, motion: boolean, als: boolean, webcam: boolean, suppress: boolean }>} */
+    /** @type {Map<string, { backlight: boolean, motion: boolean, als: boolean, webcam: boolean, suppress: boolean, connected: boolean }>} */
     const registered = new Map();
 
     let client = null;
@@ -49,6 +50,7 @@ function createMqttBridge({ config, broadcast }) {
             publishSensor: noop,
             publishWebcam: noop,
             publishSuppress: noop,
+            publishConnected: noop,
             close: noop,
             get connected() { return false; },
             get enabled() { return false; },
@@ -83,6 +85,7 @@ function createMqttBridge({ config, broadcast }) {
             if (caps.als) publishAlsDiscovery(deviceId);
             if (caps.webcam) publishWebcamDiscovery(deviceId);
             if (caps.suppress) publishSuppressDiscovery(deviceId);
+            if (caps.connected) publishConnectedDiscovery(deviceId);
         }
         publishDismissDiscovery();
         // Subscribe to every kiosk's command topic with a single wildcard,
@@ -199,7 +202,7 @@ function createMqttBridge({ config, broadcast }) {
         if (!deviceId) return false;
         let caps = registered.get(deviceId);
         if (!caps) {
-            caps = { backlight: false, motion: false, als: false, webcam: false, suppress: false };
+            caps = { backlight: false, motion: false, als: false, webcam: false, suppress: false, connected: false };
             registered.set(deviceId, caps);
         }
         if (caps[kind]) return false;
@@ -271,6 +274,20 @@ function createMqttBridge({ config, broadcast }) {
             device: deviceBlock(deviceId),
         };
         publish(`${DISCOVERY_PREFIX}/switch/${uid}/config`, cfg);
+    }
+
+    function publishConnectedDiscovery(deviceId) {
+        const uid = `roboframe_${deviceId}_connected`;
+        const cfg = {
+            name: 'Connected',
+            unique_id: uid,
+            state_topic: `${TOPIC_PREFIX}/binary_sensor/${deviceId}/connected/state`,
+            device_class: 'connectivity',
+            payload_on: 'ON',
+            payload_off: 'OFF',
+            device: deviceBlock(deviceId),
+        };
+        publish(`${DISCOVERY_PREFIX}/binary_sensor/${uid}/config`, cfg);
     }
 
     function publishWebcamDiscovery(deviceId) {
@@ -361,6 +378,12 @@ function createMqttBridge({ config, broadcast }) {
         publish(`${TOPIC_PREFIX}/switch/${deviceId}/suppress/state`, on ? 'ON' : 'OFF');
     }
 
+    function publishConnected(deviceId, connectedState) {
+        if (!deviceId) return;
+        if (ensureRegistered(deviceId, 'connected')) publishConnectedDiscovery(deviceId);
+        publish(`${TOPIC_PREFIX}/binary_sensor/${deviceId}/connected/state`, connectedState ? 'ON' : 'OFF');
+    }
+
     function close() {
         if (client) {
             try { client.end(true); } catch (_) { /* ignore */ }
@@ -374,6 +397,7 @@ function createMqttBridge({ config, broadcast }) {
         publishSensor,
         publishWebcam,
         publishSuppress,
+        publishConnected,
         close,
         get connected() { return connected; },
         get enabled() { return true; },

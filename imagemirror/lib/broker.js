@@ -69,6 +69,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     const haStates = {};                   // entity_id → last `update` message
     const deviceWs = new Map();            // deviceId → ws (most recent kiosk for that ID)
     const wsDeviceIds = new WeakMap();     // ws → Set<deviceId> claimed by this ws
+    const deviceRefcount = new Map();      // deviceId → count of live ws that have claimed it
 
     // Track every (ws, deviceId) association in one place so the close handler
     // can announce a `displayDisconnect` for each deviceId this ws was the
@@ -93,7 +94,12 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         if (typeof deviceId !== 'string' || !deviceId) return;
         let set = wsDeviceIds.get(ws);
         if (!set) { set = new Set(); wsDeviceIds.set(ws, set); }
-        set.add(deviceId);
+        if (!set.has(deviceId)) {
+            set.add(deviceId);
+            const prev = deviceRefcount.get(deviceId) || 0;
+            deviceRefcount.set(deviceId, prev + 1);
+            if (prev === 0) mqtt.publishConnected(deviceId, true);
+        }
         deviceWs.set(deviceId, ws);
     }
     // Local data store — a single hand-editable JSON file holding three
@@ -337,6 +343,15 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                     if (aggregate !== null) {
                         mqtt.publishMotion(deviceId, aggregate);
                         if (orchestrator) orchestrator.notifyVisibility(deviceId, aggregate);
+                    }
+                }
+                for (const deviceId of claimed) {
+                    const prev = deviceRefcount.get(deviceId) || 0;
+                    if (prev <= 1) {
+                        deviceRefcount.delete(deviceId);
+                        mqtt.publishConnected(deviceId, false);
+                    } else {
+                        deviceRefcount.set(deviceId, prev - 1);
                     }
                 }
                 for (const deviceId of claimed) {
