@@ -102,6 +102,7 @@ Joins this session to the channel for `deviceId`. Send on every
   "height": 1080,
   "bright": false,
   "convert": false,
+  "lowmem": false,
   "modTags": ["rating:s", "-blood"]
 }}
 ```
@@ -110,6 +111,13 @@ Joins this session to the channel for `deviceId`. Send on every
 - `modTags` is optional; when present, the orchestrator's first refill
   query already includes them — without that the initial query is
   discarded a few ms later when a separate `setModTags` arrives.
+- `bright`, `convert`, `lowmem`, `width`, `height` are the variant
+  fingerprint the server uses for background pre-conversion of upcoming
+  images. They must match the corresponding `/get?…` query parameters
+  this session will use, otherwise the prefetched bytes will be the
+  wrong variant and every cycle pays the conversion cost on the hot
+  path. Omitting `lowmem` is treated as `false` (back-compat with
+  pre-prefetch clients).
 
 ### `imageReady` (required for slideshow sessions, session-scoped)
 Tell the server the channel's current image is fully on screen.

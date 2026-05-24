@@ -52,6 +52,7 @@ function sendSlideshowConfig() {
             height: r.screenHeight,
             bright: r.bright,
             convert: r.convert,
+            lowmem: !!r.lowmem,
             // Bundle mod tags so the orchestrator's first refill query
             // already includes them — avoids an immediately-discarded
             // refill round-trip a few ms after connect.

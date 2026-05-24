@@ -419,6 +419,7 @@ class Kiosk:
                 "height": h,
                 "bright": self.cfg["bright"],
                 "convert": True,
+                "lowmem": bool(self.cfg.get("lowmem", False)),
                 "modTags": self.cfg["mod_tags"],
             },
         })
