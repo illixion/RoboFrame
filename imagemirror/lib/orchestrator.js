@@ -53,6 +53,10 @@ function createOrchestrator({
     getBlockedTags = () => [],
     reshuffle,
     incrementDisplayCount,
+    prefetcher = null,
+    imageCache = null,
+    prefetchVariant = null,
+    getVisibility = null,
 }) {
     const UPCOMING_COUNT = 4;
     const MIN_QUEUE_SIZE = 1 + UPCOMING_COUNT;
@@ -427,6 +431,74 @@ function createOrchestrator({
         commitCurrent(channel);
     }
 
+    // Warm the per-channel cache with the exact variants the channel's
+    // sessions will request next. Bounded by interval-adaptive depth, so
+    // a 2s slideshow gets the next 4 images converted in the background
+    // while a 30s slideshow only bothers with the next one.
+    function schedulePrefetch(channel) {
+        if (!prefetcher || !prefetchVariant || !imageCache) return;
+        if (!channel || channel.sessions.size === 0) return;
+        if (channel.phase === 'idle' || channel.queue.length <= 1) return;
+        // Display off → kiosk isn't rendering, don't burn CPU warming bytes
+        // it won't ask for.
+        if (getVisibility) {
+            const driver = isMergeActive() ? mergeDriverChannel : channel;
+            if (driver && getVisibility(driver.deviceId) === false) return;
+        } else if (!channelActive(channel)) {
+            return;
+        }
+        // While merged, every audience channel's sessions are mirroring the
+        // driver's playback — they'll all be requesting the driver-channel's
+        // upcoming IDs. Walk every session, but only run from the driver's queue.
+        const driverChannel = isMergeActive() ? mergeDriverChannel : channel;
+        if (driverChannel !== channel && isMergeActive() && channel !== mergeDriverChannel) return;
+        const interval = Math.max(MIN_INTERVAL_MS, driverChannel.interval || DEFAULT_INTERVAL_MS);
+        const depth = Math.max(1, Math.min(UPCOMING_COUNT, Math.ceil(15000 / interval)));
+        const upcoming = driverChannel.queue.slice(1, 1 + depth);
+        if (upcoming.length === 0) return;
+
+        // Distinct variants across every visible session participating in
+        // this channel's playback. While merged, that's every session across
+        // every channel; otherwise just this channel's sessions.
+        const variantList = [];
+        const seen = new Set();
+        const sessionPools = isMergeActive()
+            ? Array.from(channels.values()).map((c) => c.sessions)
+            : [driverChannel.sessions];
+        for (const pool of sessionPools) {
+            for (const [key, sess] of pool) {
+                if (!sessionVisible(key)) continue;
+                const p = sess.params || {};
+                const v = {
+                    convert: !!p.convert,
+                    bright: !!p.bright,
+                    lowmem: !!p.lowmem,
+                    width: Number(p.width) || 3840,
+                    height: Number(p.height) || 2160,
+                };
+                const sig = `c${v.convert ? 1 : 0}b${v.bright ? 1 : 0}l${v.lowmem ? 1 : 0}w${v.width}h${v.height}`;
+                if (seen.has(sig)) continue;
+                seen.add(sig);
+                variantList.push(v);
+            }
+        }
+        if (variantList.length === 0) return;
+
+        for (const entry of upcoming) {
+            const id = Number(entry.id);
+            if (!Number.isFinite(id) || id <= 0) continue;
+            for (const v of variantList) {
+                const parts = { id, ...v };
+                const key = imageCache.keyOf(parts);
+                if (imageCache.peek(key)) continue;
+                prefetcher.schedule({
+                    key,
+                    run: () => prefetchVariant(parts),
+                });
+            }
+        }
+    }
+
     function commitCurrent(channel) {
         const current = channel.queue[0] || null;
         channel.currentId = current ? current.id : null;
@@ -441,6 +513,7 @@ function createOrchestrator({
         }
         channel.phase = 'loading';
         broadcastPlayback(channel);
+        schedulePrefetch(channel);
         if (channel.expectedReady.size === 0) {
             // No visible readers — short-circuit straight to displaying so
             // the channel's wall-clock keeps advancing even when every
@@ -490,6 +563,7 @@ function createOrchestrator({
             height: numberOrNull(payload.height),
             bright: !!payload.bright,
             convert: !!payload.convert,
+            lowmem: !!payload.lowmem,
         };
         if (Array.isArray(payload.modTags)) {
             sess.modTags = payload.modTags.map(String).filter(Boolean);
@@ -529,6 +603,10 @@ function createOrchestrator({
             if (target.phase === 'loading' && sessionVisible(key)) {
                 target.expectedReady.add(key);
             }
+            // New session's variant fingerprint may be unseen — warm the
+            // upcoming queue for it now rather than waiting for the next
+            // commitCurrent.
+            schedulePrefetch(target);
         }
     }
 
@@ -688,6 +766,7 @@ function createOrchestrator({
                     stopDwellTimer(channel);
                 }
             }
+            if (visible) schedulePrefetch(channel);
         }
     }
 

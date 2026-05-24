@@ -15,6 +15,8 @@ const { loadConfig, pickEnv } = require('@roboframe/shared');
 const { setupBroker } = require('./lib/broker');
 const { createSearch } = require('./lib/searchQuery');
 const { createHistory } = require('./lib/history');
+const { createImageCache } = require('./lib/imageCache');
+const { createPrefetcher } = require('./lib/prefetcher');
 
 const config = loadConfig();
 const srv = config.server;
@@ -76,14 +78,26 @@ function buildFilePath(basePath, postId, ext) {
   }
   return path.join(basePath, `${postId}.${ext}`);
 }
-let retryCount = 0;
-
 // Set the default user agent for all Axios requests
 axios.defaults.headers.common['User-Agent'] = 'roboframe/1.0';
 
 
 // Rolling history of post IDs requested (state + dedup/cap logic in lib/history.js)
 const history = createHistory({ maxSize: 50 });
+
+// Variant-aware response cache. `/get` resolves through this so the
+// prefetcher's pre-converted bytes are returned when a client arrives.
+const IMAGE_CACHE_MAX_BYTES = pickEnv('IMAGE_CACHE_MAX_BYTES', srv.cache?.maxBytes, 256 * 1024 * 1024, { type: 'number' });
+const PREFETCH_CONCURRENCY = pickEnv('IMAGE_PREFETCH_CONCURRENCY', srv.cache?.prefetchConcurrency, 2, { type: 'number' });
+const PREFETCH_DISABLED = pickEnv('IMAGE_PREFETCH_DISABLED', srv.cache?.prefetchDisabled, false, { type: 'boolean' });
+const imageCache = createImageCache({ maxBytes: IMAGE_CACHE_MAX_BYTES });
+const prefetcher = createPrefetcher({
+  concurrency: PREFETCH_CONCURRENCY,
+  enabled: !PREFETCH_DISABLED,
+  onError: (err, key) => {
+    console.warn(`[prefetch] ${key}: ${err.message}`);
+  },
+});
 
 const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
@@ -377,178 +391,131 @@ async function convertBufferToJpeg(imageBuffer, width, height, quality = 95) {
     .toBuffer();
 }
 
-function processRequestV2(req, res) {
+const EXT_MIME = {
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', apng: 'image/apng',
+  gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', heic: 'image/heic',
+  heif: 'image/heif', jxl: 'image/jxl', bmp: 'image/bmp', tif: 'image/tiff', tiff: 'image/tiff',
+};
+const MIME_EXT = {
+  'image/webp': 'webp', 'image/jpeg': 'jpg', 'image/png': 'png',
+  'image/apng': 'apng', 'image/gif': 'gif',
+};
+
+function lookupPostPath(postId) {
+  return new Promise((resolve, reject) => {
+    db.all(
+      "SELECT p.path, posts.tags FROM file_db.posts_paths p JOIN file_db.posts ON posts._id = p._id WHERE p._id = ? LIMIT 1;",
+      [postId],
+      (err, rows) => {
+        if (err) return reject(err);
+        if (!rows.length) return resolve(null);
+        resolve(rows[0]);
+      }
+    );
+  });
+}
+
+// Encode the variant requested by /get (or the prefetcher). Pure async —
+// no req/res. Returns { buffer, mime, ext } or throws.
+async function computeVariant({ id, convert, bright, width, height, lowmem }) {
+  const row = await lookupPostPath(id);
+  if (!row) {
+    const err = new Error('Post not found');
+    err.code = 'NOT_FOUND';
+    throw err;
+  }
+  const filePath = row.path;
+  const isJxl = path.extname(filePath).toLowerCase() === '.jxl';
+  let animatedMode = false;
+  if (row.tags && row.tags.includes('animated_png')) animatedMode = true;
+
+  let fullFilePath = filePath;
+  if (!fs.existsSync(fullFilePath)) {
+    fullFilePath = filePath.replace(filesOriginalPath, mirrorFilesPath);
+  }
+  if (!fs.existsSync(fullFilePath)) {
+    const err = new Error(`File not found: ${fullFilePath}`);
+    err.code = 'NO_FILE';
+    throw err;
+  }
+
+  const data = await fs.promises.readFile(fullFilePath);
+  if (!animatedMode && isJxl) {
+    animatedMode = await isAnimatedJxl(data);
+  }
+
+  let finalBuffer = data;
+  let finalMimeType = 'application/octet-stream';
+  const srcExt = path.extname(filePath).slice(1).toLowerCase();
+
+  if (animatedMode) {
+    finalBuffer = await convertToAnimatedWebP(data);
+    finalMimeType = 'image/webp';
+  } else if (convert) {
+    finalBuffer = await convertFromJxl(data, width, height, bright);
+    finalMimeType = 'image/jpeg';
+  } else if (lowmem) {
+    finalBuffer = await convertBufferToJpeg(data, width, height, 85);
+    finalMimeType = 'image/jpeg';
+  } else {
+    if (EXT_MIME[srcExt]) finalMimeType = EXT_MIME[srcExt];
+  }
+
+  const ext = MIME_EXT[finalMimeType] || srcExt;
+  return { buffer: finalBuffer, mime: finalMimeType, ext, animated: animatedMode };
+}
+
+function variantKeyParts(query) {
+  const id = Number(query.id) || 0;
+  return {
+    id,
+    convert: Boolean(Number(query.convert) || 0),
+    bright: Boolean(Number(query.bright) || 0),
+    width: Number(query.width) || 3840,
+    height: Number(query.height) || 2160,
+    lowmem: Boolean(Number(query.lowmem) || 0),
+  };
+}
+
+async function processRequestV2(req, res) {
   let cancelled = false;
   req.on('aborted', () => { cancelled = true; });
   res.on('close', () => {
     if (!res.writableEnded) cancelled = true;
   });
 
-  const postId = Number(req.query.id) || 0;
-  const convert = Boolean(Number(req.query.convert) || 0);
-  const screenWidth = Number(req.query.width) || 3840;
-  const screenHeight = Number(req.query.height) || 2160;
-  const bright = Boolean(Number(req.query.bright) || 0);
-  const lowmem = Boolean(Number(req.query.lowmem) || 0);
-
-  if (!postId) {
+  const parts = variantKeyParts(req.query);
+  if (!parts.id) {
     if (!res.headersSent) res.status(400).send('Missing post ID');
     return;
   }
 
-  let returnFile, returnMimeType;
-
-  // If file already cached in request history, return it
-  const cachedRequest = history.findCached(postId);
-  if (cachedRequest) {
-    // Validate cached data is present, if not then continue to fetch from disk
-    if (!cachedRequest.file_contents || !cachedRequest.mime_type) {
-      console.debug(`Cache entry for post ID ${postId} is missing data, refetching from disk.`);
+  try {
+    const entry = await imageCache.getOrCompute(parts, () => computeVariant(parts));
+    if (cancelled || res.headersSent) return;
+    // Record in /history's recent-request log (still id-based).
+    history.addEntry({
+      id: parts.id,
+      ext: entry.ext,
+      mime_type: entry.mime,
+      file_contents: entry.buffer,
+    });
+    res.setHeader('Content-Type', entry.mime);
+    res.setHeader('Content-Disposition', `inline; filename="${parts.id}.${entry.ext}"`);
+    res.send(entry.buffer);
+  } catch (err) {
+    if (cancelled || res.headersSent) return;
+    if (err.code === 'NOT_FOUND') {
+      console.error(`No DB entry for post ID: ${parts.id}`);
+      res.status(404).send('Post not found');
+    } else if (err.code === 'NO_FILE') {
+      console.error(err.message);
+      res.status(500).send('An error occurred while sending the file.');
     } else {
-      returnFile = cachedRequest.file_contents;
-      returnMimeType = cachedRequest.mime_type;
-      res.setHeader('Content-Type', returnMimeType || 'application/octet-stream');
-      res.send(returnFile);
-      return;
+      console.error('Error processing image:', err);
+      res.status(500).send('Image conversion failed');
     }
   }
-
-  // Query DuckDB for the post with the given _id to get the path
-  db.all(
-    "SELECT p.path, posts.tags FROM file_db.posts_paths p JOIN file_db.posts ON posts._id = p._id WHERE p._id = ? LIMIT 1;",
-    [postId],
-    (err, rows) => {
-      if (cancelled) return;
-      if (err) {
-        console.error(`DuckDB error: ${err.message}`);
-        if (!res.headersSent) res.status(500).send('Database error');
-        return;
-      }
-      if (!rows.length) {
-        console.error(`No DB entry for post ID: ${postId}`);
-        if (!res.headersSent) res.status(404).send('Post not found');
-        return;
-      }
-
-      const row = rows[0];
-
-      const filePath = row.path;
-
-      // Animated JXL → animated WebP for every client. Safari doesn't
-      // decode raw JXL animation, so we can't pass it through, and APNG
-      // animation isn't supported in Safari either — WebP is the only
-      // format that works across the browser kiosk and Spatialstash.
-      // Explicit `animated_png` tag forces the animated path; otherwise
-      // probe JXL files with jxlinfo.
-      let animatedMode = false;
-      const isJxl = path.extname(filePath).toLowerCase() === '.jxl';
-      if (row.tags && row.tags.includes('animated_png')) {
-        animatedMode = true;
-      }
-
-      // Check if the file exists in either the original or cloud path, set the filePath accordingly
-      let fullFilePath = filePath;
-      if (!fs.existsSync(fullFilePath)) {
-        fullFilePath = filePath.replace(filesOriginalPath, mirrorFilesPath);
-      }
-      if (!fs.existsSync(fullFilePath)) {
-        console.error(`File not found: ${fullFilePath}`);
-        if (!res.headersSent) {
-          res.status(500).send('An error occurred while sending the file.');
-        }
-        return;
-      }
-
-      // Handle file response
-      fs.readFile(filePath, async (err, data) => {
-        if (cancelled) return;
-        if (err) {
-          console.error(`Error reading file ${filePath}: ${err.message}`);
-          if (!res.headersSent) res.status(500).send('Error reading file');
-          return;
-        }
-
-        let finalBuffer = data;
-        let finalMimeType = 'application/octet-stream';
-
-        try {
-          if (cancelled) return;
-          if (!animatedMode && isJxl) {
-            animatedMode = await isAnimatedJxl(data);
-          }
-          if (cancelled) return;
-          if (animatedMode) {
-            finalBuffer = await convertToAnimatedWebP(data);
-            finalMimeType = 'image/webp';
-          } else if (convert) {
-            finalBuffer = await convertFromJxl(data, screenWidth, screenHeight, bright);
-            finalMimeType = 'image/jpeg';
-          } else if (lowmem) {
-            // Non-JXL source on a memory-tight kiosk: re-encode to JPEG
-            // so the browser hits VideoCore's hardware decoder instead
-            // of software-decoding WebP/PNG.
-            finalBuffer = await convertBufferToJpeg(data, screenWidth, screenHeight, 85);
-            finalMimeType = 'image/jpeg';
-          } else {
-            // Raw passthrough — derive mime from the on-disk extension.
-            // The earlier `returnMimeType || finalMimeType` form was a
-            // dead branch: `returnMimeType` is only populated inside the
-            // cache-hit short-circuit above, which has already returned
-            // by the time we reach here. The fallback therefore always
-            // collapsed to `application/octet-stream`, and clients (e.g.
-            // WKWebView) silently failed to treat animated WebP as an
-            // animated image because the response wasn't tagged as one.
-            const srcExt = path.extname(filePath).slice(1).toLowerCase();
-            const extMime = {
-              jpg: 'image/jpeg',
-              jpeg: 'image/jpeg',
-              png: 'image/png',
-              apng: 'image/apng',
-              gif: 'image/gif',
-              webp: 'image/webp',
-              avif: 'image/avif',
-              heic: 'image/heic',
-              heif: 'image/heif',
-              jxl: 'image/jxl',
-              bmp: 'image/bmp',
-              tif: 'image/tiff',
-              tiff: 'image/tiff',
-            }[srcExt];
-            if (extMime) finalMimeType = extMime;
-          }
-        } catch (conversionError) {
-          console.error('Error processing image:', conversionError);
-          if (!res.headersSent) res.status(500).send('Image conversion failed');
-          return;
-        }
-
-        // Log post ID, extension, MIME type, and file contents to request history
-        history.addEntry({
-          id: postId,
-          ext: path.extname(filePath).slice(1),
-          mime_type: finalMimeType,
-          file_contents: finalBuffer
-        });
-
-        if (cancelled || res.headersSent) return;
-
-        res.setHeader('Content-Type', finalMimeType);
-        // Filename extension tracks the served MIME (Safari/Finder rely on
-        // it), not the on-disk source — animated JXL is re-encoded to WebP,
-        // convert/lowmem paths emit JPEG, etc.
-        const mimeExt = {
-          'image/webp': 'webp',
-          'image/jpeg': 'jpg',
-          'image/png': 'png',
-          'image/apng': 'apng',
-          'image/gif': 'gif',
-        }[finalMimeType] || path.extname(filePath).slice(1);
-        res.setHeader('Content-Disposition', `inline; filename="${postId}.${mimeExt}"`);
-
-        res.send(finalBuffer);
-      });
-    }
-  );
 }
 
 let searchRef = null;
@@ -620,7 +587,14 @@ async function refreshRandomRanks() {
     // Wire the WebSocket broker (and HA bridge if configured) onto the same
     // http.Server that serves the image API. One process, one port, no proxy.
     const server = http.createServer(app);
-    setupBroker({ server, app, config, dataPath: DATA_PATH, search, reshuffle, incrementDisplayCount });
+    // Prefetcher needs to invoke computeVariant through the cache so that a
+    // /get arriving mid-compute shares the same promise.
+    const prefetchVariant = (parts) =>
+      imageCache.getOrCompute(parts, () => computeVariant(parts));
+    setupBroker({
+      server, app, config, dataPath: DATA_PATH, search, reshuffle, incrementDisplayCount,
+      imageCache, prefetcher, prefetchVariant,
+    });
     server.listen(PORT, HOST, () => {
       console.log(`Server running on http://${HOST}:${PORT}`);
     });
@@ -632,23 +606,10 @@ async function refreshRandomRanks() {
 
 // Express Routes
 app.get('/get', (req, res) => {
-  try {
-    processRequestV2(req, res);
-  } catch (error) {
-    retryCount++;
-
-    if (retryCount <= 3) {
-      try {
-        processRequestV2(req, res);
-      } catch (error) {
-        if (retryCount >= 3) {
-          res.end();
-        }
-      }
-    } else {
-      res.end();
-    }
-  }
+  processRequestV2(req, res).catch((err) => {
+    console.error('Unhandled /get error:', err);
+    if (!res.headersSent) res.status(500).end();
+  });
 });
 
 // Recent request history endpoint — returns an HTML page that loads thumbnails

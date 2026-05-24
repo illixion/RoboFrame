@@ -26,7 +26,7 @@ const { pickEnv } = require('@roboframe/shared');
 const { createOrchestrator } = require('./orchestrator');
 const { createMqttBridge } = require('./mqtt-bridge');
 
-function setupBroker({ server, app, config, dataPath, search, reshuffle, incrementDisplayCount }) {
+function setupBroker({ server, app, config, dataPath, search, reshuffle, incrementDisplayCount, imageCache, prefetcher, prefetchVariant }) {
     const srv = config.server || {};
     const ha = srv.ha || {};
     const mqttCfg = srv.mqtt || {};
@@ -205,6 +205,9 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                     console.log(`${dataPath} changed; applying blocklist update`);
                     lastBroadcastSnapshot.blockedIds = blockedKey;
                     lastBroadcastSnapshot.blockedTags = blockedTagsKey;
+                    if (imageCache) {
+                        for (const id of current.blockedIds) imageCache.evictPost(id);
+                    }
                     if (orchestrator) orchestrator.notifyBlockedChange();
                 }
             }, 50);
@@ -240,6 +243,15 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     // The orchestrator is the single source of truth for "what's playing now".
     // It uses the broker's `broadcast` to push `playback` frames and reads tag
     // list state through the closures below.
+    // Per-deviceId visibility lookup for the prefetcher: skip warming
+    // variants for displays whose panel is off — the kiosk's slideshow is
+    // paused there and we'd just heat the LRU with stale work.
+    function getVisibility(deviceId) {
+        const state = visibilityStates[deviceId];
+        if (!state) return true;
+        return state.aggregate;
+    }
+
     const orchestrator = search ? createOrchestrator({
         search,
         // Default seed for a new channel's currentTagsList. The active index
@@ -251,6 +263,10 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         getBlockedTags,
         reshuffle,
         incrementDisplayCount,
+        prefetcher,
+        imageCache,
+        prefetchVariant,
+        getVisibility,
     }) : null;
 
     // ----- MQTT bridge -----------------------------------------------------
@@ -377,6 +393,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                     blocked.push(payload.id);
                     saveBlockedIds(blocked);
                     console.log(`Blocked post ID: ${payload.id}`);
+                    if (imageCache) imageCache.evictPost(payload.id);
                     if (orchestrator) orchestrator.notifyBlockedChange();
                 }
 
