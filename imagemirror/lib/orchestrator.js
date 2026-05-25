@@ -260,12 +260,37 @@ function createOrchestrator({
         } catch (_) { /* socket gone */ }
     }
 
+    // Intersect every session's `ratio:"lo..hi"` advert into a single range
+    // for the channel. Sessions without a ratio claim are unconstrained and
+    // contribute nothing — the intersection narrows only when every session
+    // on the channel has one. Returns null if there's no constraint or the
+    // intersection collapses to empty (latter falls back to no filter so
+    // the channel doesn't deadlock on conflicting clients).
+    function channelRatioClause(channel) {
+        let lo = -Infinity, hi = Infinity, any = false;
+        for (const sess of channel.sessions.values()) {
+            const raw = sess.params && sess.params.ratio;
+            if (typeof raw !== 'string') continue;
+            const m = raw.match(/^(-?\d+(?:\.\d+)?)\.\.(-?\d+(?:\.\d+)?)$/);
+            if (!m) continue;
+            const sLo = Number(m[1]), sHi = Number(m[2]);
+            if (!Number.isFinite(sLo) || !Number.isFinite(sHi) || sLo > sHi) continue;
+            any = true;
+            if (sLo > lo) lo = sLo;
+            if (sHi < hi) hi = sHi;
+        }
+        if (!any || lo > hi) return null;
+        return `ratio:${lo.toFixed(2)}..${hi.toFixed(2)}`;
+    }
+
     function buildQuery(channel) {
         const lists = getTagLists();
         const idx = channel.currentTagsList;
         const baseTags = Array.isArray(lists[idx]) ? lists[idx].slice() : [];
-        const all = baseTags.concat(channel.modTags || []).filter(Boolean);
-        return all.join(' ');
+        const ratioClause = channelRatioClause(channel);
+        const all = baseTags.concat(channel.modTags || []);
+        if (ratioClause) all.push(ratioClause);
+        return all.filter(Boolean).join(' ');
     }
 
     function isPostBlocked(post, blockedIdSet, blockedTagSet) {
@@ -549,6 +574,8 @@ function createOrchestrator({
         sess.ws = ws;
         sess.sessionId = sessionId;
         sess.channel = channel;
+        const hadPrevParams = !!sess.params;
+        const prevRatio = sess.params ? sess.params.ratio : null;
         sess.params = {
             interval: clampInterval(payload.interval),
             ratio: payload.ratio || null,
@@ -558,6 +585,12 @@ function createOrchestrator({
             convert: !!payload.convert,
             lowmem: !!payload.lowmem,
         };
+        // Only treat ratio as "changed" if this is a re-register of an
+        // existing session whose ratio is actually different. On first
+        // register prevRatio is null by construction; treating that as a
+        // change triggers a clearAndRefill on every initial join, which
+        // races the first-session refillQueue → commitCurrent path.
+        const ratioChanged = hadPrevParams && prevRatio !== sess.params.ratio;
         if (Array.isArray(payload.modTags)) {
             sess.modTags = payload.modTags.map(String).filter(Boolean);
         }
@@ -600,6 +633,15 @@ function createOrchestrator({
             // upcoming queue for it now rather than waiting for the next
             // commitCurrent.
             schedulePrefetch(target);
+        }
+
+        // Ratio is folded into the channel query (see channelRatioClause);
+        // when a re-register changes a session's ratio (e.g. visionOS window
+        // resize), the existing queue is stale and must be redrawn against
+        // the new constraint. Skip while merged — non-driver channels are
+        // dormant and refilling would just discard their work.
+        if (ratioChanged && (!isMergeActive() || channel === mergeDriverChannel)) {
+            clearAndRefill(channel).then(() => commitCurrent(channel));
         }
     }
 

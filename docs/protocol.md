@@ -97,7 +97,7 @@ Joins this session to the channel for `deviceId`. Send on every
 { "sessionId": "win1", "action": "slideshowConfig", "payload": {
   "deviceId": "screen1",
   "interval": 15000,
-  "ratio": "16:9",
+  "ratio": "1.32..1.79",
   "width": 1920,
   "height": 1080,
   "bright": false,
@@ -111,6 +111,17 @@ Joins this session to the channel for `deviceId`. Send on every
 - `modTags` is optional; when present, the orchestrator's first refill
   query already includes them — without that the initial query is
   discarded a few ms later when a separate `setModTags` arrives.
+- `ratio` is optional; when present it's a numeric `"lo..hi"` range
+  (image aspect = width/height) that the orchestrator folds into the
+  channel query as a `ratio:lo..hi` clause. The web kiosk computes a
+  `±15%` window around its viewport aspect (see
+  `public/modules/config.js:calculateDisplayRatioRange`); other clients
+  should do the same so the server can pick posts that suit the panel.
+  Multiple sessions on the same channel are intersected — if the
+  intersection is empty the channel falls back to no ratio filter
+  rather than deadlocking on conflicting clients. Re-send
+  `slideshowConfig` with a new `ratio` to trigger a queue refill (e.g.
+  after a window resize).
 - `bright`, `convert`, `lowmem`, `width`, `height` are the variant
   fingerprint the server uses for background pre-conversion of upcoming
   images. They must match the corresponding `/get?…` query parameters
