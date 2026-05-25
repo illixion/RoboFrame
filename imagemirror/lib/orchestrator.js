@@ -48,6 +48,11 @@
 //   belongs to this channel. One frame can therefore satisfy N sessions
 //   when multiple windows on one device share a connection.
 
+const VIDEO_EXTS = new Set(['webm', 'mp4']);
+function isVideoExt(ext) {
+    return VIDEO_EXTS.has(String(ext || '').toLowerCase());
+}
+
 function createOrchestrator({
     search,
     getCurrentTagsList,
@@ -508,6 +513,9 @@ function createOrchestrator({
         for (const entry of upcoming) {
             const id = Number(entry.id);
             if (!Number.isFinite(id) || id <= 0) continue;
+            // Videos stream from disk on demand — prefetching them would just
+            // pull a ~100MB blob into a cache the streaming path doesn't use.
+            if (isVideoExt(entry.ext)) continue;
             for (const v of variantList) {
                 const parts = { id, ...v };
                 const key = imageCache.keyOf(parts);

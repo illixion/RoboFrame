@@ -125,6 +125,10 @@ function pruneQueueAndInflight(desiredById) {
 
 function enqueuePrefetch(post) {
     if (!post || !post.id || !post.url) return;
+    // Videos stream directly from /get via the <video> element on render —
+    // never pulled into the blob cache. A 100MB clip held in RAM only to be
+    // cut off mid-loop is pure waste.
+    if (isVideoExt(post.ext)) return;
     if (mediaCache.has(post.id) || pendingPrefetch.has(post.id)) return;
     if (prefetchQueue.some((queued) => queued.id === post.id)) return;
     prefetchQueue.push(post);
@@ -181,6 +185,13 @@ function maybeRenderDesiredCurrent() {
     if (!cur || !cur.id) return;
     if (state.currentPost === cur.id) return;
     if (state.tempDisable || state.forceDisable || document.hidden) return;
+
+    if (isVideoExt(cur.ext)) {
+        const url = buildGetUrl(cur);
+        if (!url) return;
+        crossfadeFullscreenMedia(state.mediaContainer, url, cur.id, true);
+        return;
+    }
 
     const entry = mediaCache.get(cur.id);
     if (!entry) return;

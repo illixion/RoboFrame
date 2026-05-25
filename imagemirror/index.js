@@ -395,7 +395,11 @@ const EXT_MIME = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', apng: 'image/apng',
   gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', heic: 'image/heic',
   heif: 'image/heif', jxl: 'image/jxl', bmp: 'image/bmp', tif: 'image/tiff', tiff: 'image/tiff',
+  webm: 'video/webm', mp4: 'video/mp4',
 };
+// Videos bypass the sharp pipeline and the imageCache — a single clip can be
+// up to ~100MB, and they get streamed straight from disk with Range support.
+const VIDEO_EXTS = new Set(['webm', 'mp4']);
 const MIME_EXT = {
   'image/webp': 'webp', 'image/jpeg': 'jpg', 'image/png': 'png',
   'image/apng': 'apng', 'image/gif': 'gif',
@@ -477,6 +481,66 @@ function variantKeyParts(query) {
   };
 }
 
+// Resolve the on-disk path for a post, falling back from the original to the
+// mirror location. Shared by the video streaming path and computeVariant.
+function resolveFilePath(rawPath) {
+  if (fs.existsSync(rawPath)) return rawPath;
+  const fallback = rawPath.replace(filesOriginalPath, mirrorFilesPath);
+  if (fs.existsSync(fallback)) return fallback;
+  return null;
+}
+
+// Stream a video file with single-range support. Multi-range and suffix-only
+// (`bytes=-N`) requests fall back to a 200 full-body response.
+function streamVideo(req, res, filePath, mime, postId, ext) {
+  let cancelled = false;
+  res.on('close', () => { if (!res.writableEnded) cancelled = true; });
+
+  fs.stat(filePath, (err, stat) => {
+    if (cancelled || res.headersSent) return;
+    if (err) {
+      console.error(`Video stat failed for ${filePath}:`, err.message);
+      res.status(500).send('Failed to read video');
+      return;
+    }
+    const size = stat.size;
+    const range = req.headers.range;
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Content-Disposition', `inline; filename="${postId}.${ext}"`);
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    let start = 0;
+    let end = size - 1;
+    let status = 200;
+    if (range) {
+      const m = /^bytes=(\d+)-(\d*)$/.exec(range);
+      if (m) {
+        const s = Number(m[1]);
+        const e = m[2] === '' ? size - 1 : Number(m[2]);
+        if (Number.isFinite(s) && Number.isFinite(e) && s <= e && e < size) {
+          start = s;
+          end = e;
+          status = 206;
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${size}`);
+        } else {
+          res.setHeader('Content-Range', `bytes */${size}`);
+          res.status(416).end();
+          return;
+        }
+      }
+    }
+    res.setHeader('Content-Length', String(end - start + 1));
+    res.status(status);
+    const stream = fs.createReadStream(filePath, { start, end });
+    stream.on('error', (streamErr) => {
+      console.error(`Video stream error for ${filePath}:`, streamErr.message);
+      if (!res.headersSent) res.status(500).end();
+      else res.destroy();
+    });
+    stream.pipe(res);
+  });
+}
+
 async function processRequestV2(req, res) {
   let cancelled = false;
   req.on('aborted', () => { cancelled = true; });
@@ -491,6 +555,25 @@ async function processRequestV2(req, res) {
   }
 
   try {
+    // Videos: stream from disk, bypassing the sharp pipeline and the variant
+    // cache. They can be up to ~100MB each so we never buffer them in RAM.
+    const row = await lookupPostPath(parts.id);
+    if (cancelled || res.headersSent) return;
+    if (!row) {
+      res.status(404).send('Post not found');
+      return;
+    }
+    const srcExt = path.extname(row.path).slice(1).toLowerCase();
+    if (VIDEO_EXTS.has(srcExt)) {
+      const filePath = resolveFilePath(row.path);
+      if (!filePath) {
+        res.status(500).send('An error occurred while sending the file.');
+        return;
+      }
+      streamVideo(req, res, filePath, EXT_MIME[srcExt], parts.id, srcExt);
+      return;
+    }
+
     const entry = await imageCache.getOrCompute(parts, () => computeVariant(parts));
     if (cancelled || res.headersSent) return;
     // Record in /history's recent-request log (still id-based).

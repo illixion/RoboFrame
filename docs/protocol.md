@@ -329,8 +329,23 @@ with `sessionIds: ["win1", ..., "win10"]`).
   returns JPEG (q95) on the `convert` path and APNG for animated PNG
   posts; `lowmem=1` re-encodes non-JXL sources to JPEG q85 for kiosks
   without WebP hardware decode.
+- `ext` can also be `mp4` or `webm` — those entries are videos. `/get`
+  streams them straight from disk (no resize, no transcode; `convert`,
+  `bright`, `lowmem`, `width`, `height` are ignored) with
+  `Accept-Ranges: bytes` and single-range support. Clients should
+  render with `<video autoplay loop muted playsInline>` pointed at the
+  `/get` URL directly — do **not** fetch-to-blob and reuse, the clip
+  may be ~100 MB and is likely to be cut off mid-loop by the next
+  playback tick. Fire `imageReady` on `loadeddata` (first frame
+  decoded), the same barrier as images.
 - A new `current.id` is your cue to start loading. Send `imageReady`
   when the transition completes.
+- Clients MUST pause video playback when the display is off
+  (`displayState: off`, the page is hidden, or the platform equivalent
+  — e.g. Spatialstash's `scenePhase` going to `.background`) and
+  SHOULD release the media session entirely (`<video>` removed from
+  the DOM, AVPlayer torn down) so single-source platforms like
+  visionOS aren't pinned by a paused-but-attached video.
 
 ### `tagLists`
 The catalog of preset tag lists, pushed on connect and rebroadcast when

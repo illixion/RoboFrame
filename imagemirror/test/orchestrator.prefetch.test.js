@@ -136,6 +136,47 @@ test('already-cached variant is not re-scheduled', async (t) => {
     assert.equal(ctx.rec.calls.length, 0);
 });
 
+test('video upcoming entries are skipped by prefetch', async (t) => {
+    // First image (id 1) is the current; ids 2..5 are upcoming. Mark id 3
+    // and id 5 as videos — they should never be scheduled.
+    const pages = [{
+        results: [
+            { _id: 1, file_ext: 'jxl' },
+            { _id: 2, file_ext: 'jxl' },
+            { _id: 3, file_ext: 'mp4' },
+            { _id: 4, file_ext: 'jxl' },
+            { _id: 5, file_ext: 'webm' },
+        ],
+        nextCursor: null,
+    }];
+    const rec = captureRecorder();
+    const cache = createImageCache({ maxBytes: 1024 * 1024 });
+    const orch = createOrchestrator({
+        search: makeFakeSearch(pages),
+        getCurrentTagsList: () => 0,
+        getTagLists: () => [['cats']],
+        prefetcher: rec.prefetcher,
+        imageCache: cache,
+        prefetchVariant: async () => ({ buffer: Buffer.alloc(8), mime: 'image/jpeg', ext: 'jpg' }),
+    });
+    t.after(() => orch.close());
+    orch.register(makeFakeWs(), 's1', {
+        deviceId: 'kVid', interval: 2000, width: 100, height: 100, convert: true,
+    });
+    await tick(); await tick();
+    // 2s interval → depth=4, queue[1..4] = ids 2,3,4,5. Two are videos.
+    // Only ids 2 and 4 should be scheduled.
+    const scheduledIds = new Set();
+    for (const c of rec.calls) {
+        const m = c.key.match(/(\d+)/);
+        if (m) scheduledIds.add(m[1]);
+    }
+    assert.ok(scheduledIds.has('2'), 'image id 2 should be prefetched');
+    assert.ok(scheduledIds.has('4'), 'image id 4 should be prefetched');
+    assert.ok(!scheduledIds.has('3'), 'video id 3 must not be prefetched');
+    assert.ok(!scheduledIds.has('5'), 'video id 5 must not be prefetched');
+});
+
 test('notifyVisibility(true) re-triggers prefetch', async (t) => {
     const visibility = { kV: false };
     const ctx = harness({ visibility });
