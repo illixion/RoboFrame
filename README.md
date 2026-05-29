@@ -276,6 +276,9 @@ Returns the full DuckDB row for a post (joined with `posts_paths.path`) as JSON.
 `GET /count?q=` *(debug)*
 Returns `{ q, count }` — the total number of posts matching `q` using the same parser as `/search`. Token-gated. Exposed on the web kiosk as `await countPosts(q)` in devtools.
 
+`GET /custom_page`
+Picks a random `.htm`/`.html` file from `CUSTOM_PAGES_PATH` (default `imagemirror/custom_pages/`, gitignored) and returns it inline with `Cache-Control: no-store`. The kiosk's **P** key toggles between photo slideshow and a fullscreen iframe pointing at this endpoint — each toggle-on cache-busts the URL so a new random page is served. 404 if the folder is missing or empty. Files are served straight from disk; any images/scripts/fonts they reference must be inlined or absolute. Token-gated.
+
 `GET /search?q=&limit=` *(debug)*
 Runs `q` through the same parser the slideshow orchestrator uses (`tag`, `-tag`, `score:`, `limit:N`, `order:`, etc.) and returns `{ results, nextCursor }` as JSON. `limit` defaults to 40 unless overridden by `?limit=` or `limit:N` inside `q`. Token-gated. Exposed on the web kiosk as `await searchPosts(q, limit)` in devtools. The slideshow itself still consumes posts via the `playback` WebSocket channel — this endpoint is for inspection only.
 

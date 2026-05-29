@@ -51,7 +51,11 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 
 app.use(cookieParser());
 
-app.use(['/get', '/save', '/history', '/history.json', '/addtohistory', '/post', '/search', '/count', '/rpc/tags.json'], requireToken);
+app.use(['/get', '/save', '/history', '/history.json', '/addtohistory', '/post', '/search', '/count', '/custom_page', '/rpc/tags.json'], requireToken);
+
+// Folder of user-supplied HTML files surfaced by /custom_page (P key
+// "custom page" mode on the kiosk). Per-install, gitignored — see README.
+const CUSTOM_PAGES_PATH = pickEnv('CUSTOM_PAGES_PATH', srv.customPagesPath, path.join(__dirname, 'custom_pages'));
 
 // Setup view engine
 app.set('views', path.join(__dirname, 'views'));
@@ -829,5 +833,31 @@ app.get('/save', async (req, res) => {
     }
     console.log(`File saved successfully to ${saveFilePath}`);
     return res.status(200).send('File saved successfully');
+  });
+});
+
+// Pick a random .htm/.html file from CUSTOM_PAGES_PATH and serve it inline.
+// The kiosk's P key loads this in a fullscreen iframe and cache-busts the
+// request so each toggle yields a fresh random choice. Pages are served
+// straight from disk (no template processing) — anything they need
+// (images, scripts, fonts) must be inlined or absolute URLs.
+app.get('/custom_page', (req, res) => {
+  fs.readdir(CUSTOM_PAGES_PATH, (err, entries) => {
+    if (err) {
+      if (err.code === 'ENOENT') return res.status(404).send('Custom pages folder not configured');
+      console.error(`custom_page readdir failed: ${err.message}`);
+      return res.status(500).send('Failed to list custom pages');
+    }
+    const candidates = entries.filter((n) => /\.(html?|HTML?)$/.test(n));
+    if (!candidates.length) return res.status(404).send('No custom pages available');
+    const pick = candidates[Math.floor(Math.random() * candidates.length)];
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.sendFile(path.join(CUSTOM_PAGES_PATH, pick), (sendErr) => {
+      if (sendErr && !res.headersSent) {
+        console.error(`custom_page sendFile failed: ${sendErr.message}`);
+        res.status(500).send('Failed to send custom page');
+      }
+    });
   });
 });

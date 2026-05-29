@@ -2,7 +2,7 @@
 // home-iframe toggle, button positioning. Anything that's neither slideshow
 // nor RPC effect lands here.
 
-import { params, homeEndpoint } from './config.js';
+import { params, homeEndpoint, api } from './config.js';
 import { state } from './state.js';
 import { tags } from './tags.js';
 import { showToast } from './toast.js';
@@ -49,6 +49,26 @@ export function toggleIframe() {
     iframe.style.display = isBackgrounded ? 'none' : 'block';
     disable(!isBackgrounded);
     iframe.contentWindow.postMessage({ type: 'visibility', hidden: isBackgrounded }, '*');
+}
+
+// ----- Custom page iframe (P key) -------------------------------------
+// P toggles between photo slideshow and a fullscreen iframe pointing at
+// /custom_page, which serves a random .htm/.html file from a per-install
+// folder. Each toggle-on cache-busts the URL so a new random page lands.
+// Slideshow is suspended via state.forceDisable while the iframe is up.
+function toggleCustomPage() {
+    const iframe = document.getElementById('custom-page-iframe');
+    if (!iframe) return;
+    const turningOn = !state.forceDisable;
+    if (turningOn) {
+        iframe.src = api(`/custom_page?_=${Date.now()}`);
+        iframe.style.display = 'block';
+    } else {
+        iframe.style.display = 'none';
+        iframe.src = 'about:blank';
+    }
+    state.forceDisable = turningOn;
+    disable(turningOn, true);
 }
 
 // ----- Button positioning when noclock is set -------------------------
@@ -164,8 +184,7 @@ function installKeyboard() {
                 showToast('Reshuffling random order');
                 break;
             case 'p':
-                state.forceDisable = !state.forceDisable;
-                disable(state.forceDisable, true);
+                toggleCustomPage();
                 break;
             case 'ArrowRight':
                 requestNext();

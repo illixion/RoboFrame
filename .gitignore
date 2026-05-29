@@ -31,6 +31,10 @@ npm-debug.log*
 # hand-editable JSON file, per-install, never committed.
 imagemirror/data.json
 
+# User-supplied HTML pages shown by /custom_page (P key "custom page" mode).
+# Per-install, never committed.
+imagemirror/custom_pages/
+
 # Build artifacts
 dist/
 build/
