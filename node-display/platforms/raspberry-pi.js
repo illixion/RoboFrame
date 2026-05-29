@@ -295,6 +295,34 @@ function create() {
 
     function setGovernor(_gov, cb) { process.nextTick(cb); }
 
+    // Ground-truth probe for the controller's periodic reconciler. Returns
+    // (null, null) when we genuinely can't tell — the controller treats
+    // null as "skip this tick" rather than assuming on. Prefer `xset -q`
+    // under X11 because it reads true DPMS power state regardless of
+    // whether we turned off via `xrandr --output --off` or `xset dpms
+    // force off` — the mode-presence heuristic in initializeState only
+    // works for the former.
+    function getActualPowerState(callback) {
+        if (SESSION === 'wayland') return callback(null, null);
+        exec(`xset -display ${XRANDR_DISPLAY} -q`, (err, stdout) => {
+            if (!err) {
+                const m = stdout.match(/Monitor is\s+(\S+)/i);
+                if (m) {
+                    const word = m[1].toLowerCase();
+                    return callback(null, word === 'on');
+                }
+            }
+            // xset unavailable or unparseable. Fall back to xrandr mode
+            // probe if we have a discovered output; otherwise give up.
+            if (!X11_OUTPUT) return callback(null, null);
+            exec(`xrandr --display ${XRANDR_DISPLAY} --query`, (e2, out2) => {
+                if (e2) return callback(null, null);
+                const re = new RegExp(`^${X11_OUTPUT.name}\\s+connected\\b[^\\n]*?\\s\\d+x\\d+\\+\\d+\\+\\d+`, 'm');
+                callback(null, re.test(out2));
+            });
+        });
+    }
+
     function initializeState(callback) {
         // Determine the current monitor power state and cached brightness.
         // Under X11 we parse `xrandr --query` for "HDMI-1 connected
@@ -380,6 +408,7 @@ function create() {
         setGovernor,
         autoAdjustBrightness,
         initializeState,
+        getActualPowerState,
         mapBrightnessToDisplay,
     };
 }

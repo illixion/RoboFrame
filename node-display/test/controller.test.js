@@ -231,6 +231,18 @@ test('reconcile re-drives when platform drifts out from under us', () => {
   assert.equal(h.ctl.snapshot().lastApplied, 'on');
 });
 
+test('reconcile skips when platform reports unknown (null)', () => {
+  const h = makeHarness();
+  // Force getActualState to return null forever (simulates Wayland / no xset).
+  h.ctl.getActualState = (cb) => cb(null, null);
+  h.ctl.start();
+  h.ctl.setPir(true);
+  // Pretend physical state diverged — controller should not log drift or re-drive.
+  h.log.length = 0;
+  h.advance(60_000);
+  assert.deepEqual(h.log, []);
+});
+
 test('reconcile is a no-op when actual matches expected', () => {
   const h = makeHarness();
   h.ctl.start();

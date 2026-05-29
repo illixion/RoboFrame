@@ -127,8 +127,14 @@ module.exports = {
     },
     // Ground-truth query of the panel power state. Used by the controller's
     // periodic reconciler to detect drift (failed platform calls, external
-    // dpms commands, DDC monitors that reset themselves). Re-uses the same
-    // probe initializeState ran at boot — no separate platform plumbing.
-    getActualState: (cb) => Display.initializeState(cb),
+    // dpms commands, DDC monitors that reset themselves). Platforms that
+    // can't reliably probe (Wayland with wlopm, missing tooling) return
+    // null — the controller treats null as "skip this tick", which is
+    // critical: assuming "on" here would make the reconciler log spurious
+    // drift every minute against a turned-off panel.
+    getActualState: (cb) => {
+        if (typeof Display.getActualPowerState === 'function') return Display.getActualPowerState(cb);
+        return Display.initializeState(cb);
+    },
     emitter: displayEmitter,
 };

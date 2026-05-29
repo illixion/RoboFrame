@@ -184,6 +184,9 @@ class DisplayController {
     if (!this.getActualState || this.lastApplied === null || this.inFlight) return;
     this.getActualState((err, isOn) => {
       if (err) { this.log(`reconcile: getActualState error: ${err.message}`); return; }
+      // null = platform can't probe reliably (Wayland with wlopm, no xset,
+      // etc). Trust our cached state rather than chasing a lie.
+      if (isOn === null || isOn === undefined) return;
       const expected = this.lastApplied === 'on';
       if (!!isOn === expected) return;
       this.log(`reconcile: drift detected (expected=${expected ? 'on' : 'off'}, actual=${isOn ? 'on' : 'off'}); re-driving`);
