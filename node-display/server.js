@@ -77,6 +77,7 @@ const {
   setBrightness,
   mapBrightnessToDisplay,
   setBrightnessStateAware,
+  getActualState,
   emitter,
 } = require('./Display');
 const displayEmitter = emitter;
@@ -90,6 +91,7 @@ const controller = new DisplayController({
   reportBacklight: (on /*, brightness */) => reportBacklightToHA(on),
   log: (msg) => console.log(`[display] ${msg}`),
   effectDefaultMs: EFFECT_HOLD_MS,
+  getActualState,
   nightLight: {
     off: NIGHT_LIGHT_OFF,
     brightness: NIGHT_LIGHT_BRIGHTNESS,
@@ -469,6 +471,7 @@ function startPirHttpServer() {
   });
 }
 
+controller.start();
 connectWebSocket();
 
 if (os.platform() === 'linux') {

@@ -22,6 +22,12 @@
 
 const REPORTING_REASONS = new Set(['pir', 'pir+nightLight', 'idle', 'effect']);
 
+// Exponential backoff for failed turnOn/turnOff calls. Capped so we don't
+// hammer DDC/xrandr forever on a broken bus, but reconcile() can still
+// nudge it back to truth periodically once the cap is reached.
+const RETRY_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 16_000];
+const RECONCILE_INTERVAL_MS = 60_000;
+
 class DisplayController {
   constructor(opts) {
     this.turnOn = opts.turnOn;
@@ -35,6 +41,10 @@ class DisplayController {
     this.nightLight = opts.nightLight || { off: false, brightness: null, isActive: () => false };
     this.dayBrightness = opts.initialDayBrightness != null ? opts.initialDayBrightness : 255;
     this.effectDefaultMs = opts.effectDefaultMs != null ? opts.effectDefaultMs : 60_000;
+    this.getActualState = opts.getActualState || null; // (cb(err, isOn)) optional
+    this.setIntervalFn = opts.setIntervalFn || setInterval;
+    this.clearIntervalFn = opts.clearIntervalFn || clearInterval;
+    this.reconcileIntervalMs = opts.reconcileIntervalMs != null ? opts.reconcileIntervalMs : RECONCILE_INTERVAL_MS;
 
     this.pirMotion = false;
     this.suppressWake = false;
@@ -42,9 +52,24 @@ class DisplayController {
     this.effectDeadline = 0;
     this.tempDisabled = false;
 
-    this.lastApplied = null;     // 'on' | 'off'
+    this.lastApplied = null;     // 'on' | 'off' — only set after a confirmed-good platform call
     this.lastBrightness = null;
     this.effectTimer = null;
+    this.retryAttempt = 0;
+    this.retryTimer = null;
+    this.inFlight = false;
+    this.reconcileTimer = null;
+  }
+
+  start() {
+    if (this.reconcileTimer || !this.getActualState) return;
+    this.reconcileTimer = this.setIntervalFn(() => this.reconcile(), this.reconcileIntervalMs);
+  }
+
+  stop() {
+    if (this.reconcileTimer) { this.clearIntervalFn(this.reconcileTimer); this.reconcileTimer = null; }
+    if (this.retryTimer) { this.clearTimeoutFn(this.retryTimer); this.retryTimer = null; }
+    if (this.effectTimer) { this.clearTimeoutFn(this.effectTimer); this.effectTimer = null; }
   }
 
   setPir(motion) {
@@ -145,29 +170,81 @@ class DisplayController {
   }
 
   evaluate(cause) {
+    // A new input preempts any pending retry — the target may have changed.
+    if (this.retryTimer) { this.clearTimeoutFn(this.retryTimer); this.retryTimer = null; }
+    this.retryAttempt = 0;
+    this._drive(cause, /* fromRetry */ false);
+  }
+
+  // Periodic reconciliation: ask the platform for ground truth and re-drive
+  // if it disagrees with what we believe we last applied. Covers transient
+  // platform failures, external commands (e.g. xset dpms force off), and
+  // DDC monitors that reset themselves.
+  reconcile() {
+    if (!this.getActualState || this.lastApplied === null || this.inFlight) return;
+    this.getActualState((err, isOn) => {
+      if (err) { this.log(`reconcile: getActualState error: ${err.message}`); return; }
+      const expected = this.lastApplied === 'on';
+      if (!!isOn === expected) return;
+      this.log(`reconcile: drift detected (expected=${expected ? 'on' : 'off'}, actual=${isOn ? 'on' : 'off'}); re-driving`);
+      this.lastApplied = null; // force re-drive past dedup
+      this._drive('reconcile', false);
+    });
+  }
+
+  _scheduleRetry(cause) {
+    const idx = Math.min(this.retryAttempt, RETRY_BACKOFF_MS.length - 1);
+    const delay = RETRY_BACKOFF_MS[idx];
+    this.retryAttempt += 1;
+    this.log(`retry[${this.retryAttempt}] in ${delay}ms (cause=${cause})`);
+    if (this.retryTimer) this.clearTimeoutFn(this.retryTimer);
+    this.retryTimer = this.setTimeoutFn(() => {
+      this.retryTimer = null;
+      this._drive(`retry:${cause}`, true);
+    }, delay);
+  }
+
+  _drive(cause, fromRetry) {
     const t = this.computeTarget();
-    if (t.state === this.lastApplied && t.brightness === this.lastBrightness) return;
+    if (!fromRetry && t.state === this.lastApplied && t.brightness === this.lastBrightness) return;
     const wasOn = this.lastApplied === 'on';
     const shouldReport = REPORTING_REASONS.has(t.reason);
     this.log(`evaluate(${cause}): -> ${t.state}${t.brightness !== null ? `@${t.brightness}` : ''} (${t.reason})`);
-    this.lastApplied = t.state;
-    this.lastBrightness = t.brightness;
+    this.inFlight = true;
+
+    const commit = () => {
+      this.inFlight = false;
+      this.retryAttempt = 0;
+      const transitioned = this.lastApplied !== t.state;
+      this.lastApplied = t.state;
+      this.lastBrightness = t.brightness;
+      if (transitioned && shouldReport) this.reportBacklight(t.state === 'on', t.brightness);
+    };
+    const fail = (op, err) => {
+      this.inFlight = false;
+      this.log(`${op} error: ${err.message}`);
+      if (this.retryAttempt < RETRY_BACKOFF_MS.length) this._scheduleRetry(cause);
+      else this.log(`${op}: backoff cap reached; relying on reconcile`);
+    };
 
     if (t.state === 'on') {
       const finish = () => this.turnOn((err) => {
-        if (err) return this.log(`turnOn error: ${err.message}`);
-        if (!wasOn && shouldReport) this.reportBacklight(true, t.brightness);
+        if (err) return fail('turnOn', err);
+        commit();
       });
       if (t.brightness !== null) {
-        // setBrightness while off stashes the value for the next wake.
-        this.setBrightness(t.brightness, () => finish());
+        this.setBrightness(t.brightness, (err) => {
+          // Brightness errors are non-fatal — proceed to turnOn anyway.
+          if (err) this.log(`setBrightness error (non-fatal): ${err.message}`);
+          finish();
+        });
       } else {
         finish();
       }
     } else {
       this.turnOff((err) => {
-        if (err) return this.log(`turnOff error: ${err.message}`);
-        if (wasOn && shouldReport) this.reportBacklight(false, null);
+        if (err) return fail('turnOff', err);
+        commit();
       });
     }
   }

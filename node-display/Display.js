@@ -125,5 +125,10 @@ module.exports = {
         const mapped = Display.mapBrightnessToDisplay(userValue);
         Display.setBrightnessStateAware(mapped, cb);
     },
+    // Ground-truth query of the panel power state. Used by the controller's
+    // periodic reconciler to detect drift (failed platform calls, external
+    // dpms commands, DDC monitors that reset themselves). Re-uses the same
+    // probe initializeState ran at boot — no separate platform plumbing.
+    getActualState: (cb) => Display.initializeState(cb),
     emitter: displayEmitter,
 };
