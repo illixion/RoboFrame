@@ -99,7 +99,10 @@ function createMqttBridge({ config, broadcast }) {
             if (caps.als) publishAlsDiscovery(deviceId);
             if (caps.webcam) publishWebcamDiscovery(deviceId);
             if (caps.suppress) publishSuppressDiscovery(deviceId);
-            if (caps.connected) publishConnectedDiscovery(deviceId);
+            if (caps.connected) {
+                publishConnectedDiscovery(deviceId);
+                publishConnectionTriggerDiscovery(deviceId);
+            }
         }
         publishDismissDiscovery();
         // Subscribe to every kiosk's command topic with a single wildcard,
@@ -309,6 +312,27 @@ function createMqttBridge({ config, broadcast }) {
         publish(`${DISCOVERY_PREFIX}/binary_sensor/${uid}/config`, cfg);
     }
 
+    // HA MQTT device triggers — fire HA events directly when we publish
+    // the configured payload, without going through any entity's state.
+    // Automations bind to them via "device → RoboFrame <id> → Connected /
+    // Disconnected" and are immune to unknown/unavailable transitions
+    // that bedevil state-based triggers across broker restarts.
+    function publishConnectionTriggerDiscovery(deviceId) {
+        const eventTopic = `${TOPIC_PREFIX}/event/${deviceId}/connection`;
+        for (const kind of ['connected', 'disconnected']) {
+            const uid = `roboframe_${deviceId}_${kind}`;
+            const cfg = {
+                automation_type: 'trigger',
+                topic: eventTopic,
+                payload: kind,
+                type: kind,
+                subtype: 'roboframe',
+                device: deviceBlock(deviceId),
+            };
+            publish(`${DISCOVERY_PREFIX}/device_automation/${uid}/config`, cfg);
+        }
+    }
+
     function publishWebcamDiscovery(deviceId) {
         const uid = `roboframe_${deviceId}_webcam`;
         const cfg = {
@@ -408,7 +432,10 @@ function createMqttBridge({ config, broadcast }) {
 
     function publishConnected(deviceId, connectedState) {
         if (!deviceId) return;
-        if (ensureRegistered(deviceId, 'connected')) publishConnectedDiscovery(deviceId);
+        if (ensureRegistered(deviceId, 'connected')) {
+            publishConnectedDiscovery(deviceId);
+            publishConnectionTriggerDiscovery(deviceId);
+        }
         // Non-retained: on broker restart the entity reverts to `unknown`
         // until a client actually (re)attaches, instead of resurfacing a
         // stale ON from a previous runtime. The broker-wide availability
@@ -416,6 +443,12 @@ function createMqttBridge({ config, broadcast }) {
         publish(
             `${TOPIC_PREFIX}/binary_sensor/${deviceId}/connected/state`,
             connectedState ? 'ON' : 'OFF',
+            { retain: false, qos: 0 },
+        );
+        // Fire the device-trigger event in lockstep with the state edge.
+        publish(
+            `${TOPIC_PREFIX}/event/${deviceId}/connection`,
+            connectedState ? 'connected' : 'disconnected',
             { retain: false, qos: 0 },
         );
     }
