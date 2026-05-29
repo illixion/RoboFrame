@@ -126,21 +126,37 @@ function create() {
     // xset DPMS, which works on monitors that honour DPMS even though
     // many Pi-attached panels don't.
     const X11_OUTPUT = SESSION === 'wayland' ? null : discoverX11Output();
-    if (X11_OUTPUT) pinX11Framebuffer(X11_OUTPUT);
+    if (X11_OUTPUT) {
+        pinX11Framebuffer(X11_OUTPUT);
+        // Recover if a previous run left the output mode disabled (e.g.
+        // killed mid-off). Idempotent when the mode is already active.
+        try {
+            execSync(`xrandr --display ${XRANDR_DISPLAY} --fb ${X11_OUTPUT.width}x${X11_OUTPUT.height} --output ${X11_OUTPUT.name} --auto`, { timeout: 3000, stdio: 'ignore' });
+        } catch (_) { /* best-effort */ }
+        // Disable X server's auto-blank / DPMS idle timeouts. We own the
+        // on/off state via xset dpms force; without this, X would re-blank
+        // the panel 10 minutes after the last input event (kiosk has no
+        // keyboard/mouse, so the idle counter ticks down even when we
+        // just woke it). DPMS itself stays enabled so force commands work.
+        try {
+            execSync(`xset -display ${XRANDR_DISPLAY} s off s noblank dpms 0 0 0`, { timeout: 3000, stdio: 'ignore' });
+        } catch (_) { /* best-effort */ }
+    }
+    // Use xset dpms for both on and off rather than xrandr --output --off:
+    //   * xrandr --auto does NOT wake DPMS on this Pi+panel combo — the
+    //     monitor stays in DPMS-off even after the mode is re-set, so a
+    //     wake that only ran xrandr left the panel dark.
+    //   * xrandr --output --off works but collapses the root framebuffer
+    //     to 320x200 if the process exits before the next --auto, which
+    //     leaves subsequent runs stuck without a mode.
+    // xset dpms force preserves mode + framebuffer and reliably drives
+    // power state on this hardware.
     const DPMS_OFF_CMD = SESSION === 'wayland'
         ? `wlopm --off '*'`
-        : (X11_OUTPUT
-            ? `xrandr --display ${XRANDR_DISPLAY} --output ${X11_OUTPUT.name} --off`
-            : `xset -display ${XRANDR_DISPLAY} dpms force off`);
-    // On wake we must re-pin --fb in the same xrandr invocation: when the
-    // only output was --off'd, X auto-shrunk the root window to its 320x200
-    // minimum, and `--auto` alone can't grow it back to fit a 1920x1080
-    // mode. Doing both in one call combines into a single modeset.
+        : `xset -display ${XRANDR_DISPLAY} dpms force off`;
     const DPMS_ON_CMD = SESSION === 'wayland'
         ? `wlopm --on '*'`
-        : (X11_OUTPUT
-            ? `xrandr --display ${XRANDR_DISPLAY} --fb ${X11_OUTPUT.width}x${X11_OUTPUT.height} --output ${X11_OUTPUT.name} --auto`
-            : `xset -display ${XRANDR_DISPLAY} dpms force on`);
+        : `xset -display ${XRANDR_DISPLAY} dpms force on`;
     const DDC_BUS = discoverDdcBus();
     // When the panel doesn't speak DDC/CI (or `ddcutil` is missing) we
     // drop brightness control entirely and use DPMS-only on/off. The
@@ -341,10 +357,11 @@ function create() {
 
     function initializeState(callback) {
         // Determine the current monitor power state and cached brightness.
-        // Under X11 we parse `xrandr --query` for "HDMI-1 connected
-        // ... NxM" vs "disconnected"/no-mode (output --off). Under Wayland
-        // we don't probe — wlopm has no query mode, and assuming "on" at
-        // startup is safe: the next displayState command will reconcile.
+        // Under X11 we read DPMS state via `xset -q`. The old xrandr
+        // mode-presence heuristic doesn't apply anymore since we use
+        // xset dpms force off for power-down (which preserves the mode).
+        // Under Wayland we don't probe — wlopm has no query mode, and
+        // assuming "on" at startup is safe.
         const probeBrightness = (isOn) => {
             currentState = isOn;
             _powerStage = isOn ? 'on' : 'off';
@@ -358,17 +375,15 @@ function create() {
                 callback(null, true);
             });
         };
-        if (SESSION === 'wayland' || !X11_OUTPUT) {
+        if (SESSION === 'wayland') {
             probeBrightness(true);
             return;
         }
-        exec(`xrandr --display ${XRANDR_DISPLAY} --query`, (err, stdout) => {
+        exec(`xset -display ${XRANDR_DISPLAY} -q`, (err, stdout) => {
             let isOn = true;
             if (!err) {
-                // The active output has a `<W>x<H>+x+y` token. When `--off`'d
-                // the line still says "connected" but the mode is absent.
-                const re = new RegExp(`^${X11_OUTPUT.name}\\s+connected\\b[^\\n]*?\\s\\d+x\\d+\\+\\d+\\+\\d+`, 'm');
-                isOn = re.test(stdout);
+                const m = stdout.match(/Monitor is\s+(\S+)/i);
+                if (m) isOn = m[1].toLowerCase() === 'on';
             }
             probeBrightness(isOn);
         });
