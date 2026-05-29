@@ -14,6 +14,12 @@
 
 const { parseQuery } = require('./parseQuery');
 
+// Hide posts whose file row was deleted (image removed on disk → CLI
+// dropped the posts_paths entry but kept the posts row for history /
+// blocklist resolution). Without this every random page would include
+// orphans that 404 on /get and warn from the prefetcher.
+const HAS_PATH = 'EXISTS (SELECT 1 FROM file_db.posts_paths pp WHERE pp._id = p._id)';
+
 function createSearch({ db, cacheSize = 20 } = {}) {
     const cache = []; // LRU: [{ key, value }]
 
@@ -65,7 +71,7 @@ function createSearch({ db, cacheSize = 20 } = {}) {
     function runCount({ q = '' } = {}) {
         const { where } = parseQuery(q);
         const baseWhere = where && where !== 'TRUE' ? where : 'TRUE';
-        const sql = `SELECT COUNT(*)::BIGINT AS n FROM file_db.posts p WHERE ${baseWhere};`;
+        const sql = `SELECT COUNT(*)::BIGINT AS n FROM file_db.posts p WHERE ${baseWhere} AND ${HAS_PATH};`;
         return new Promise((resolve, reject) => {
             db.all(sql, (err, rows) => {
                 if (err) return reject(err);
@@ -90,7 +96,7 @@ function buildRandomSql({ where, cursor, limit }) {
         SELECT p.*, r.random_rank, r.display_count
         FROM file_db.posts p
         JOIN memory.random_ranks r ON p._id = r._id
-        WHERE ${baseWhere}${pageFilter}
+        WHERE ${baseWhere}${pageFilter} AND ${HAS_PATH}
         ORDER BY r.display_count ASC, r.random_rank ASC
         LIMIT ${limit};
     `;
@@ -102,7 +108,7 @@ function buildDeterministicSql({ where, orderBy, cursor, limit }) {
     return `
         SELECT p.*
         FROM file_db.posts p
-        WHERE ${baseWhere}
+        WHERE ${baseWhere} AND ${HAS_PATH}
         ORDER BY ${orderBy}
         LIMIT ${limit} OFFSET ${offset};
     `;
