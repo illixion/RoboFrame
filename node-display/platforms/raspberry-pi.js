@@ -70,10 +70,26 @@ function probeDdcBrightness(bus) {
 function discoverX11Output() {
     try {
         const out = execSync(`xrandr --display :0 --query`, { timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).toString();
-        // Match "HDMI-1 connected ... 1920x1080+0+0" — primary token is optional.
-        const m = out.match(/^(\S+)\s+connected\b[^\n]*?\s(\d+)x(\d+)\+\d+\+\d+/m);
-        if (!m) return null;
-        return { name: m[1], width: parseInt(m[2], 10), height: parseInt(m[3], 10) };
+        // Prefer the active mode: "HDMI-1 connected ... 1920x1080+0+0".
+        const active = out.match(/^(\S+)\s+connected\b[^\n]*?\s(\d+)x(\d+)\+\d+\+\d+/m);
+        if (active) return { name: active[1], width: parseInt(active[2], 10), height: parseInt(active[3], 10) };
+        // Fallback: output is "connected" but has no active mode — happens
+        // when a previous run did `xrandr --output --off` and the process
+        // exited (or restarted) before re-enabling. The framebuffer is
+        // collapsed to 320x200 and DPMS toggles alone won't bring it back.
+        // Find the preferred mode (marked '+' in the mode list) so the
+        // first turnOn issues `--fb WxH --output --auto` and recovers.
+        const lines = out.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+            const cm = lines[i].match(/^(\S+)\s+connected\b/);
+            if (!cm) continue;
+            for (let j = i + 1; j < lines.length; j++) {
+                if (/^\S/.test(lines[j])) break; // next output block — give up
+                const mm = lines[j].match(/^\s+(\d+)x(\d+)\s+[\d.]+\s*[+*]/);
+                if (mm) return { name: cm[1], width: parseInt(mm[1], 10), height: parseInt(mm[2], 10) };
+            }
+        }
+        return null;
     } catch (_) {
         return null;
     }
