@@ -183,6 +183,13 @@
       display: none;
     }
 
+    /* Custom-page iframe sits below the clock/sensors overlay (z-index 10)
+       so the page chrome stays visible — unlike the HA iframe which
+       intentionally covers everything. */
+    #custom-page-iframe {
+      z-index: 5;
+    }
+
     .toggle-button {
       position: fixed;
       top: 15px;
