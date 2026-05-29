@@ -233,12 +233,16 @@ export function crossfadeFullscreenMedia(container, newMediaUrl, postId, isVideo
             nextLayer.removeChild(nextLayer.children[0]);
         }
         startCrossfade(currentLayer, nextLayer);
+        // The image is on screen now — tell the server immediately so its
+        // 15s dwell starts from render time, not render+crossfade time.
+        // Holding this until the crossfade settles added ~1s of slop to
+        // every cycle (15s interval → ~16s wall-clock cadence).
+        reportImageReady(postId);
         setTimeout(() => {
             if (renderToken !== currentRenderToken) return;
             state.currentPost = postId;
             if (inFlightPostId === postId) inFlightPostId = null;
             console.log('Current post:', postId);
-            reportImageReady(postId);
         }, 1000);
     };
 
