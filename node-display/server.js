@@ -128,6 +128,14 @@ let mic = null;
 let streamServer = null;
 let webcamEnabled = WEBCAM_INITIAL_ENABLED;
 
+// PIR presence republished to the webcam stream server (for an NVR's
+// motion sensor). Updated by handlePirEvent.
+const { EventEmitter } = require('events');
+let pirMotion = false;
+const pirEmitter = new EventEmitter();
+pirEmitter.setMaxListeners(0);
+const pir = { get: () => pirMotion, emitter: pirEmitter };
+
 if (WEBCAM_CONFIGURED && os.platform() === 'linux') {
   webcam = createWebcam({
     device: WEBCAM_DEVICE,
@@ -139,7 +147,7 @@ if (WEBCAM_CONFIGURED && os.platform() === 'linux') {
   if (AUDIO_ENABLED) {
     mic = createMicrophone({ device: AUDIO_DEVICE, rate: AUDIO_RATE, channels: AUDIO_CHANNELS });
   }
-  streamServer = createStreamServer({ webcam, mic, port: WEBCAM_PORT, tokens: WEBCAM_TOKENS });
+  streamServer = createStreamServer({ webcam, mic, pir, port: WEBCAM_PORT, tokens: WEBCAM_TOKENS });
   if (webcamEnabled) streamServer.start();
 }
 
@@ -447,6 +455,16 @@ function handlePirEvent(state) {
   }
   if (state === 'motion') controller.setPir(true);
   else if (state === 'clear') controller.setPir(false);
+
+  // Republish PIR presence on the webcam stream server so a co-located
+  // NVR (e.g. Scrypted) can consume it as the camera's motion sensor.
+  if (state === 'motion' || state === 'clear') {
+    const motion = state === 'motion';
+    if (motion !== pirMotion) {
+      pirMotion = motion;
+      pirEmitter.emit('change', motion);
+    }
+  }
 }
 
 function startPirHttpServer() {

@@ -8,6 +8,9 @@
 //   GET /audio.pcm     raw little-endian PCM from the mic, if configured.
 //                      Pair it with the video URL in a consumer that muxes
 //                      separate A/V inputs (e.g. Scrypted's FFmpeg camera).
+//   GET /pir/state     {"motion":bool} snapshot of PIR presence, if wired.
+//   GET /pir/events    text/event-stream of `motion`/`clear` on change, so
+//                      an NVR can mirror PIR onto the camera's motion sensor.
 //
 // The capture processes are reference-counted by Webcam/Microphone, so we
 // only burn CPU + USB bandwidth while a client is actually attached.
@@ -22,7 +25,7 @@ const http = require('http');
 
 const BOUNDARY = 'rfwebcam';
 
-function createStreamServer({ webcam, mic = null, port, host = '0.0.0.0', tokens = [] }) {
+function createStreamServer({ webcam, mic = null, pir = null, port, host = '0.0.0.0', tokens = [] }) {
     let server = null;
     const tokenSet = new Set((tokens || []).filter(Boolean));
 
@@ -57,7 +60,35 @@ function createStreamServer({ webcam, mic = null, port, host = '0.0.0.0', tokens
             if (!mic) { res.writeHead(404); return res.end(); }
             return serveAudio(req, res);
         }
+        if (path === '/pir/state') {
+            if (!pir) { res.writeHead(404); return res.end(); }
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
+            return res.end(JSON.stringify({ motion: pir.get() }));
+        }
+        if (path === '/pir/events') {
+            if (!pir) { res.writeHead(404); return res.end(); }
+            return servePirEvents(req, res);
+        }
         res.writeHead(404); res.end();
+    }
+
+    // Server-Sent Events feed of PIR presence: emits `motion`/`clear` on
+    // every change, plus the current state on connect, so an NVR can mirror
+    // it onto a motion sensor without polling.
+    function servePirEvents(req, res) {
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache, private',
+            'Connection': 'keep-alive',
+        });
+        const send = (motion) => { if (res.writable) res.write(`data: ${motion ? 'motion' : 'clear'}\n\n`); };
+        send(pir.get());
+        const onChange = (motion) => send(motion);
+        pir.emitter.on('change', onChange);
+        const keepalive = setInterval(() => { if (res.writable) res.write(': keepalive\n\n'); }, 20000);
+        const close = () => { clearInterval(keepalive); pir.emitter.off('change', onChange); };
+        req.on('close', close);
+        res.on('close', close);
     }
 
     function serveAudio(req, res) {
