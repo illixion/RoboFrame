@@ -63,10 +63,10 @@
       "controls": {},
       "_comment_tokens": "Optional. When non-empty, every media endpoint (/stream.mjpg, /snapshot.jpg, /audio.pcm) requires one of these tokens via `?token=<t>` or `Authorization: Bearer <t>`. /health stays open. Use a long random value, e.g. `openssl rand -hex 24`. Gates both the LAN port and any tailscale-serve path.",
       "tokens": [],
-      "_comment_audio": "Optional. When enabled, captures raw PCM from an ALSA device via `arecord` and serves it at /audio.pcm (little-endian, no container). Pair it with the video URL in a consumer that muxes separate A/V inputs (e.g. Scrypted FFmpeg camera: `-f s16le -ar <rate> -ac <channels> -i http://<host>:<port>/audio.pcm`). The mic process only runs while a client is attached.",
+      "_comment_audio": "Optional. When enabled, captures raw PCM from an ALSA device via `arecord` and serves it at /audio.pcm (little-endian, no container). Pair it with the video URL in a consumer that muxes separate A/V inputs (e.g. Scrypted FFmpeg camera: `-f s16le -ar <rate> -ac <channels> -i http://<host>:<port>/audio.pcm`). The mic process only runs while a client is attached. IMPORTANT: do NOT use a numeric `hw:N,0` device — ALSA card indices are not stable across reboots (USB vs HDMI probe order shifts them). Use the by-id form `hw:CARD=<id>,DEV=0` from `arecord -L` (e.g. a Logitech C270 is `hw:CARD=U0x46d0x825,DEV=0`).",
       "audio": {
         "enabled": false,
-        "device": "hw:1,0",
+        "device": "hw:CARD=U0x46d0x825,DEV=0",
         "rate": 16000,
         "channels": 1
       }
