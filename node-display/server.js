@@ -112,6 +112,7 @@ const WEBCAM_WIDTH = pickEnv('WEBCAM_WIDTH', webcamCfg.width, 1280, { type: 'num
 const WEBCAM_HEIGHT = pickEnv('WEBCAM_HEIGHT', webcamCfg.height, 720, { type: 'number' });
 const WEBCAM_FRAMERATE = pickEnv('WEBCAM_FRAMERATE', webcamCfg.framerate, 30, { type: 'number' });
 const WEBCAM_PORT = pickEnv('WEBCAM_PORT', webcamCfg.port, 8082, { type: 'number' });
+const WEBCAM_CONTROLS = (webcamCfg.controls && typeof webcamCfg.controls === 'object') ? webcamCfg.controls : {};
 const WEBCAM_INITIAL_ENABLED = !!webcamCfg.enabled;
 
 let webcam = null;
@@ -124,6 +125,7 @@ if (WEBCAM_CONFIGURED && os.platform() === 'linux') {
     width: WEBCAM_WIDTH,
     height: WEBCAM_HEIGHT,
     framerate: WEBCAM_FRAMERATE,
+    controls: WEBCAM_CONTROLS,
   });
   streamServer = createStreamServer({ webcam, port: WEBCAM_PORT });
   if (webcamEnabled) streamServer.start();

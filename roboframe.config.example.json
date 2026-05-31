@@ -58,7 +58,9 @@
       "width": 1280,
       "height": 720,
       "framerate": 30,
-      "port": 8082
+      "port": 8082,
+      "_comment_controls": "Optional. V4L2 controls applied via `v4l2-ctl --set-ctrl` each time capture (re)starts. Applied in listed order, so put dependent controls last (e.g. auto_exposure before exposure_time_absolute). Common UVC fixes: exposure_dynamic_framerate=0 stops the camera dropping fps to lengthen exposure in dim light; power_line_frequency=1 is 50 Hz (EU) / 2 is 60 Hz (US) anti-flicker. Run `v4l2-ctl -d <device> --list-ctrls` to see what your camera supports.",
+      "controls": {}
     }
   },
 

@@ -14,7 +14,7 @@ const { EventEmitter } = require('events');
 const SOI = Buffer.from([0xff, 0xd8]);
 const EOI = Buffer.from([0xff, 0xd9]);
 
-function createWebcam({ device = '/dev/video0', width = 1280, height = 720, framerate = 30 } = {}) {
+function createWebcam({ device = '/dev/video0', width = 1280, height = 720, framerate = 30, controls = {} } = {}) {
     const emitter = new EventEmitter();
     emitter.setMaxListeners(0);
 
@@ -22,6 +22,23 @@ function createWebcam({ device = '/dev/video0', width = 1280, height = 720, fram
     let subscribers = 0;
     let buf = Buffer.alloc(0);
     let lastFrame = null;
+
+    // V4L2 controls (e.g. exposure_dynamic_framerate, power_line_frequency)
+    // are device state that resets across capture restarts and USB
+    // re-enumeration, so reapply them every time the stream starts.
+    // Insertion order is preserved — list dependent controls accordingly
+    // (e.g. auto_exposure before exposure_time_absolute).
+    function applyControls() {
+        const pairs = Object.entries(controls).map(([k, v]) => `${k}=${v}`);
+        if (pairs.length === 0) return;
+        const args = ['-d', device, `--set-ctrl=${pairs.join(',')}`];
+        const ctl = spawn('v4l2-ctl', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+        ctl.stderr.on('data', (d) => {
+            const s = d.toString().trim();
+            if (s) console.warn(`[webcam] set-ctrl: ${s}`);
+        });
+        ctl.on('error', (err) => console.error(`[webcam] set-ctrl failed: ${err.message}`));
+    }
 
     function start() {
         if (proc) return;
@@ -34,6 +51,7 @@ function createWebcam({ device = '/dev/video0', width = 1280, height = 720, fram
             '--stream-to=-',
         ];
         console.log(`[webcam] starting v4l2-ctl ${args.join(' ')}`);
+        applyControls();
         proc = spawn('v4l2-ctl', args, { stdio: ['ignore', 'pipe', 'pipe'] });
         proc.stdout.on('data', onData);
         proc.stderr.on('data', (d) => {
