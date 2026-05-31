@@ -103,9 +103,11 @@ const controller = new DisplayController({
 // `display.webcam.enabled` gates whether the HTTP listener is bound;
 // when false the camera process is never spawned.
 const { createWebcam } = require('./Webcam');
+const { createMicrophone } = require('./Microphone');
 const { createStreamServer } = require('./StreamServer');
 
 const webcamCfg = display.webcam || {};
+const audioCfg = webcamCfg.audio || {};
 const WEBCAM_CONFIGURED = !!webcamCfg.device || !!webcamCfg.enabled;
 const WEBCAM_DEVICE = pickEnv('WEBCAM_DEVICE', webcamCfg.device, '/dev/video0');
 const WEBCAM_WIDTH = pickEnv('WEBCAM_WIDTH', webcamCfg.width, 1280, { type: 'number' });
@@ -113,9 +115,16 @@ const WEBCAM_HEIGHT = pickEnv('WEBCAM_HEIGHT', webcamCfg.height, 720, { type: 'n
 const WEBCAM_FRAMERATE = pickEnv('WEBCAM_FRAMERATE', webcamCfg.framerate, 30, { type: 'number' });
 const WEBCAM_PORT = pickEnv('WEBCAM_PORT', webcamCfg.port, 8082, { type: 'number' });
 const WEBCAM_CONTROLS = (webcamCfg.controls && typeof webcamCfg.controls === 'object') ? webcamCfg.controls : {};
+const WEBCAM_TOKENS = Array.isArray(webcamCfg.tokens) ? webcamCfg.tokens.filter(Boolean) : [];
 const WEBCAM_INITIAL_ENABLED = !!webcamCfg.enabled;
 
+const AUDIO_ENABLED = !!audioCfg.enabled;
+const AUDIO_DEVICE = pickEnv('WEBCAM_AUDIO_DEVICE', audioCfg.device, 'hw:1,0');
+const AUDIO_RATE = pickEnv('WEBCAM_AUDIO_RATE', audioCfg.rate, 16000, { type: 'number' });
+const AUDIO_CHANNELS = pickEnv('WEBCAM_AUDIO_CHANNELS', audioCfg.channels, 1, { type: 'number' });
+
 let webcam = null;
+let mic = null;
 let streamServer = null;
 let webcamEnabled = WEBCAM_INITIAL_ENABLED;
 
@@ -127,7 +136,10 @@ if (WEBCAM_CONFIGURED && os.platform() === 'linux') {
     framerate: WEBCAM_FRAMERATE,
     controls: WEBCAM_CONTROLS,
   });
-  streamServer = createStreamServer({ webcam, port: WEBCAM_PORT });
+  if (AUDIO_ENABLED) {
+    mic = createMicrophone({ device: AUDIO_DEVICE, rate: AUDIO_RATE, channels: AUDIO_CHANNELS });
+  }
+  streamServer = createStreamServer({ webcam, mic, port: WEBCAM_PORT, tokens: WEBCAM_TOKENS });
   if (webcamEnabled) streamServer.start();
 }
 

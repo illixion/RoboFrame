@@ -60,7 +60,16 @@
       "framerate": 30,
       "port": 8082,
       "_comment_controls": "Optional. V4L2 controls applied via `v4l2-ctl --set-ctrl` each time capture (re)starts. Applied in listed order, so put dependent controls last (e.g. auto_exposure before exposure_time_absolute). Common UVC fixes: exposure_dynamic_framerate=0 stops the camera dropping fps to lengthen exposure in dim light; power_line_frequency=1 is 50 Hz (EU) / 2 is 60 Hz (US) anti-flicker. Run `v4l2-ctl -d <device> --list-ctrls` to see what your camera supports.",
-      "controls": {}
+      "controls": {},
+      "_comment_tokens": "Optional. When non-empty, every media endpoint (/stream.mjpg, /snapshot.jpg, /audio.pcm) requires one of these tokens via `?token=<t>` or `Authorization: Bearer <t>`. /health stays open. Use a long random value, e.g. `openssl rand -hex 24`. Gates both the LAN port and any tailscale-serve path.",
+      "tokens": [],
+      "_comment_audio": "Optional. When enabled, captures raw PCM from an ALSA device via `arecord` and serves it at /audio.pcm (little-endian, no container). Pair it with the video URL in a consumer that muxes separate A/V inputs (e.g. Scrypted FFmpeg camera: `-f s16le -ar <rate> -ac <channels> -i http://<host>:<port>/audio.pcm`). The mic process only runs while a client is attached.",
+      "audio": {
+        "enabled": false,
+        "device": "hw:1,0",
+        "rate": 16000,
+        "channels": 1
+      }
     }
   },
 
