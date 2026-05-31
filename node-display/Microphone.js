@@ -18,9 +18,12 @@ function createMicrophone({ device = 'hw:1,0', rate = 16000, channels = 1, forma
 
     let proc = null;
     let subscribers = 0;
+    let stopping = false;
+    let respawnTimer = null;
 
     function start() {
         if (proc) return;
+        stopping = false;
         const args = ['-D', device, '-f', format, '-r', String(rate), '-c', String(channels), '-t', 'raw', '-'];
         console.log(`[mic] starting arecord ${args.join(' ')}`);
         proc = spawn('arecord', args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -38,10 +41,18 @@ function createMicrophone({ device = 'hw:1,0', rate = 16000, channels = 1, forma
         proc.on('exit', (code, signal) => {
             console.log(`[mic] arecord exited code=${code} signal=${signal}`);
             proc = null;
+            // A USB blip can make arecord exit with an I/O error mid-stream.
+            // Respawn while clients are still attached so the audio feed
+            // self-heals instead of going silent until the next reconnect.
+            if (!stopping && subscribers > 0 && !respawnTimer) {
+                respawnTimer = setTimeout(() => { respawnTimer = null; if (subscribers > 0) start(); }, 500);
+            }
         });
     }
 
     function stop() {
+        stopping = true;
+        if (respawnTimer) { clearTimeout(respawnTimer); respawnTimer = null; }
         if (!proc) return;
         try { proc.kill('SIGTERM'); } catch (_) { /* ignore */ }
         proc = null;
