@@ -64,24 +64,11 @@ app.set('view engine', 'ejs');
 // Resolved from roboframe.config.json[server] with env-var overrides.
 const filesOriginalPath = pickEnv('IMAGE_DB_PATH', srv.imageDbPath, '/Volumes/HDD/imagedb');
 const mirrorFilesPath = pickEnv('IMAGE_MIRROR_PATH', srv.imageMirrorPath, '/Volumes/HDD/imagedb_mirror');
-// CHUNK_SIZE: 0 = flat layout, >0 = files in subfolders like /0/1.jxl
-const CHUNK_SIZE = pickEnv('CHUNK_SIZE', srv.chunkSize, 0, { type: 'number' });
 const SAVE_PATH = pickEnv('SAVE_PATH', srv.savePath, '/tmp');
 const DJXL_PATH = pickEnv('DJXL_PATH', srv.djxlPath, 'djxl');
 const JXLINFO_PATH = pickEnv('JXLINFO_PATH', srv.jxlinfoPath, 'jxlinfo');
 const FFMPEG_PATH = pickEnv('FFMPEG_PATH', srv.ffmpegPath, 'ffmpeg');
 
-/**
- * Build the file path for a given post ID and extension.
- * If CHUNK_SIZE > 0, files are organized in subfolders (e.g., /0/123.jxl, /1/1234.jxl)
- * If CHUNK_SIZE is 0, files are in the root folder (e.g., /123.jxl)
- */
-function buildFilePath(basePath, postId, ext) {
-  if (CHUNK_SIZE > 0) {
-    return path.join(basePath, `${Math.floor(postId / CHUNK_SIZE)}`, `${postId}.${ext}`);
-  }
-  return path.join(basePath, `${postId}.${ext}`);
-}
 // Set the default user agent for all Axios requests
 axios.defaults.headers.common['User-Agent'] = 'roboframe/1.0';
 
@@ -807,24 +794,25 @@ app.get('/post', (req, res) => {
 
 app.get('/save', async (req, res) => {
   const postId = req.query.id;
-  const postExt = req.query.ext || 'jxl'; // Default to jxl if not provided
 
   if (!postId) {
     return res.status(400).send('Missing post ID');
   }
 
-  console.log(`Saving post ID: ${postId} with extension: ${postExt}`);
+  console.log(`Saving post ID: ${postId}`);
 
-  // Local-only: check the primary path, then fall back to the mirror path. No remote fetches, ever.
-  let sourcePath = buildFilePath(filesOriginalPath, postId, postExt);
-  if (!fs.existsSync(sourcePath)) {
-    sourcePath = buildFilePath(mirrorFilesPath, postId, postExt);
-  }
-  if (!fs.existsSync(sourcePath)) {
+  // Local-only: resolve the file via its recorded posts_paths entry. No remote
+  // fetches, ever, and no path reconstruction — the archive can span volumes,
+  // so the stored absolute path is the only authority for where a file lives.
+  const row = await lookupPostPath(postId);
+  const sourcePath = row && resolveFilePath(row.path);
+  if (!sourcePath) {
     return res.status(404).send('File not found');
   }
 
-  const saveFilePath = path.join(SAVE_PATH, `${postId}.${postExt}`);
+  // Mirror the file's real extension (e.g. .jxl), not a request hint.
+  const saveExt = path.extname(sourcePath).slice(1).toLowerCase() || 'bin';
+  const saveFilePath = path.join(SAVE_PATH, `${postId}.${saveExt}`);
   fs.copyFile(sourcePath, saveFilePath, (err) => {
     if (err) {
       console.error('Error saving file:', err);

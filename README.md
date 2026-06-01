@@ -183,7 +183,6 @@ The merged Node server: image API + WebSocket broker + optional Home Assistant b
 | `SAVE_PATH` | `server.savePath` | `/tmp` | Where `/save` copies files to |
 | `DUCKDB_PATH` | `server.duckdbPath` | `posts.duckdb` | Path to the DuckDB file |
 | `DJXL_PATH` | `server.djxlPath` | `djxl` | Path to the JPEG-XL decoder |
-| `CHUNK_SIZE` | `server.chunkSize` | `0` | If >0, files are organised in `<chunk>/<id>.<ext>` subfolders |
 | `HA_URL` | `server.ha.url` | *(none)* | Home Assistant WebSocket URL — sensor forwarding auto-enables when set with token |
 | `HA_TOKEN` | `server.ha.token` | *(none)* | Home Assistant long-lived access token |
 | `HA_FILTER_ENTITIES` | `server.ha.filterEntities` | *(none)* | Sensor entity_ids to forward to kiosks (CSV in env, array in JSON) |
@@ -261,8 +260,8 @@ On WebSocket connect, every client receives two initial frames: `tagLists`, `cur
 `GET /get?id=&convert=&bright=&width=&height=&lowmem=`
 Returns the binary image. `convert=1` decodes JXL via `djxl` and re-encodes to JPEG q95 with a black background flatten. `bright=1` ambient-dims the result for low-light viewing (RGB multiply by 0.32 / 0.20 depending on average image brightness). `lowmem=1` re-encodes non-JXL sources to JPEG q85 so kiosks without WebP/PNG hardware decode (Pi 3 etc.) don't saturate their ARM cores. Animated PNGs always come back as APNG.
 
-`GET /save?id=&ext=`
-Copies the file from `IMAGE_DB_PATH` (or `IMAGE_MIRROR_PATH` fallback) to `SAVE_PATH`. **Local-only**: 404 if not on disk. No third-party fetches, ever.
+`GET /save?id=`
+Copies the file to `SAVE_PATH`, resolving its location from the post's `posts_paths` entry (with the `IMAGE_MIRROR_PATH` fallback). The saved file keeps the source's real extension. **Local-only**: 404 if not on disk. No third-party fetches, ever.
 
 `GET /history?lowmem=`
 HTML page rendering the last 25 image requests. Thumbnails load via `/get` in parallel from the browser. `lowmem=1` propagates into the in-page `/get` URLs for Pi-class kiosks viewing their own history.

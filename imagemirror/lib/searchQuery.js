@@ -93,9 +93,10 @@ function buildRandomSql({ where, cursor, limit }) {
         pageFilter = ` AND (r.display_count > ${dc} OR (r.display_count = ${dc} AND r.random_rank > ${rank}))`;
     }
     return `
-        SELECT p.*, r.random_rank, r.display_count
+        SELECT p.*, pp.path, r.random_rank, r.display_count
         FROM file_db.posts p
         JOIN memory.random_ranks r ON p._id = r._id
+        LEFT JOIN file_db.posts_paths pp ON pp._id = p._id
         WHERE ${baseWhere}${pageFilter} AND ${HAS_PATH}
         ORDER BY r.display_count ASC, r.random_rank ASC
         LIMIT ${limit};
@@ -106,8 +107,9 @@ function buildDeterministicSql({ where, orderBy, cursor, limit }) {
     const baseWhere = where && where !== 'TRUE' ? where : 'TRUE';
     const offset = (cursor && Number(cursor.offset)) || 0;
     return `
-        SELECT p.*
+        SELECT p.*, pp.path
         FROM file_db.posts p
+        LEFT JOIN file_db.posts_paths pp ON pp._id = p._id
         WHERE ${baseWhere} AND ${HAS_PATH}
         ORDER BY ${orderBy}
         LIMIT ${limit} OFFSET ${offset};
