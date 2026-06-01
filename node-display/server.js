@@ -166,7 +166,7 @@ function reportWebcamToHA(enabled) {
 let ws;
 let pingInterval;
 let pongTimeout;
-let isReconnecting = false;
+let reconnectTimer = null;
 
 let wasOnBattery = null; // null = unknown, true/false = last known state
 
@@ -178,19 +178,15 @@ if (!deviceId) {
 console.log(`Device ID: "${deviceId}"`);
 
 function connectWebSocket() {
-  if (isReconnecting) return;
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
-  isReconnecting = true;
-
 
   console.log(`Attempting to connect to ${WS_URL}...`);
   ws = new WebSocket(WS_URL_WITH_TOKEN);
 
   ws.on('open', () => {
     console.log('Connected to WebSocket server');
-    isReconnecting = false;
     startHeartbeat();
     // Seed HA's suppress switch with our current local state so the entity
     // appears (via auto-discovery on first publish) for every connected
@@ -313,12 +309,15 @@ function connectWebSocket() {
 const RECONNECT_INTERVAL_MS = 5000;
 
 function scheduleReconnect() {
-  if (isReconnecting) return;
-  isReconnecting = true;
   stopHeartbeat();
+  // Dedupe on a pending-timer handle, not on connection state. A connect
+  // attempt that fails before 'open' (e.g. ECONNREFUSED while the backend
+  // is mid-restart) fires both 'error' and 'close'; both land here, and the
+  // handle ensures exactly one retry is armed rather than wedging forever.
+  if (reconnectTimer) return;
   console.error(`WebSocket disconnected. Reconnecting in ${RECONNECT_INTERVAL_MS}ms...`);
-  setTimeout(() => {
-    isReconnecting = false;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
     connectWebSocket();
   }, RECONNECT_INTERVAL_MS);
 }
