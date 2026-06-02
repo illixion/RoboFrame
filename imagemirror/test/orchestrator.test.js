@@ -180,7 +180,7 @@ test('two ws on different deviceIds get independent channels', async (t) => {
     assert.notEqual(c1.currentId, c2.currentId);
 });
 
-test('readiness barrier: dwell timer waits for all expected ws to report imageReady', async (t) => {
+test('readiness barrier: first imageReady from any expected ws starts the dwell timer', async (t) => {
     const { orch } = harness();
     t.after(() => orch.close());
     const a = makeFakeWs();
@@ -190,17 +190,38 @@ test('readiness barrier: dwell timer waits for all expected ws to report imageRe
     await tick(); await tick(); await tick();
 
     const ch = orch._channels.get('screen1');
-    assert.equal(ch.phase, 'loading', 'channel waits in loading until clients report ready');
+    assert.equal(ch.phase, 'loading', 'channel waits in loading until someone reports ready');
     assert.equal(ch.expectedReady.size, 2);
-    assert.equal(ch.timer, null, 'no dwell timer before barrier closes');
+    assert.equal(ch.timer, null, 'no dwell timer before the first report');
 
+    // First-ready wins: a single report is enough, even with another
+    // expected session still outstanding. The slow/absent peer must not
+    // gate the channel.
     orch.notifyImageReady(a, ch.currentId);
-    assert.equal(ch.phase, 'loading', 'one of two reports is not enough');
-    assert.equal(ch.timer, null);
-
-    orch.notifyImageReady(b, ch.currentId);
     assert.equal(ch.phase, 'displaying');
-    assert.ok(ch.timer, 'dwell timer arms once everyone reports');
+    assert.ok(ch.timer, 'dwell timer arms on the first imageReady');
+});
+
+test('readiness barrier: a client leaving before reporting does not wedge the channel', async (t) => {
+    const { orch } = harness();
+    t.after(() => orch.close());
+    const a = makeFakeWs();
+    const b = makeFakeWs();
+    orch.register(a, { deviceId: 'screen1', interval: 5000 });
+    orch.register(b, { deviceId: 'screen1', interval: 5000 });
+    await tick(); await tick(); await tick();
+
+    const ch = orch._channels.get('screen1');
+    assert.equal(ch.phase, 'loading');
+    assert.equal(ch.expectedReady.size, 2);
+
+    // `a` reports, `b` never does and then disconnects. The channel must
+    // already be running off `a`'s report — `b` leaving can't strand it.
+    orch.notifyImageReady(a, ch.currentId);
+    assert.equal(ch.phase, 'displaying', 'one report is enough to advance');
+    orch.unregister(b);
+    assert.equal(ch.phase, 'displaying');
+    assert.ok(ch.timer, 'channel keeps running after the non-reporting peer leaves');
 });
 
 test('no readiness fallback: a client that never reports imageReady holds the channel in loading forever', async (t) => {

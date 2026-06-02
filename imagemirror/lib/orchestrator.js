@@ -12,12 +12,15 @@
 // and resumes from the same image without replaying slideshowConfig.
 //
 // Cadence is gated on a readiness barrier: after a `playback` frame is sent,
-// the channel waits until every visible session reports `imageReady { id }`
-// for the new image before starting the dwell-time interval timer. There is
-// no timeout: a client that never reports parks the channel on the current
-// frame indefinitely rather than advancing blind, so the server never burns
-// work the client can't display. Sessions on hidden displays are auto-ready
-// — they wouldn't render the image anyway — so they don't stall the barrier.
+// the channel waits for the *first* visible session to report `imageReady
+// { id }` for the new image before starting the dwell-time interval timer.
+// First-ready wins rather than all-ready: when several clients share a
+// deviceId (a web kiosk and Spatialstash, say) the slowest must not gate the
+// channel, and a client leaving mid-barrier must not wedge it. There is no
+// timeout: if no visible session ever reports, the channel parks on the
+// current frame rather than advancing blind, so the server never burns work
+// no client can display. A channel with only hidden sessions has nothing to
+// wait for and promotes immediately.
 //
 // Visibility for a deviceId pauses/resumes the dwell timer using a wall-clock
 // deadline (`dwellDeadline`). It never resets the deadline.
@@ -493,15 +496,19 @@ function createOrchestrator({
 
     function startTimerIfReady(channel) {
         if (channel.phase !== 'loading') return;
-        const pending = [];
-        for (const key of channel.expectedReady) {
-            if (!channel.ready.has(key)) pending.push(key);
-        }
-        if (pending.length) {
-            dbg(`channel ${channel.deviceId} still waiting on imageReady from {${pending.join(',')}} for id=${channel.currentId}`);
+        // First-ready wins: a single visible session reporting `imageReady`
+        // starts the dwell timer. Requiring *every* session to report wedged
+        // the channel whenever clients mixed on one deviceId (e.g. a web kiosk
+        // and Spatialstash) reported at different speeds or one left
+        // mid-barrier. An empty expected set (all hidden) promotes too —
+        // there's no one to wait for. `ready` is always a subset of
+        // `expectedReady` (notifyImageReady gates on it), so a non-empty
+        // `ready` means at least one expected reader is in.
+        if (channel.expectedReady.size === 0 || channel.ready.size > 0) {
+            promoteToDisplaying(channel);
             return;
         }
-        promoteToDisplaying(channel);
+        dbg(`channel ${channel.deviceId} waiting for first imageReady from {${Array.from(channel.expectedReady).join(',')}} for id=${channel.currentId}`);
     }
 
     function promoteToDisplaying(channel) {

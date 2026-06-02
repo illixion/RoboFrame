@@ -93,9 +93,11 @@ updates to track a server change, ship those too:
   share a channel iff their `deviceId` matches. Different ids = independent
   queues / intervals / mod tags.
 - **Readiness barrier.** After each `playback` broadcast the channel
-  waits for every visible session's `imageReady { id }` before starting
-  the dwell timer. 10 s fallback if a client wedges. Hidden sessions
-  are auto-ready.
+  waits for the *first* visible session's `imageReady { id }` before
+  starting the dwell timer (first-ready wins, so a slow or leaving
+  co-tenant on the same deviceId can't wedge it). No timeout: if no
+  visible session ever reports, the channel parks on the frame. Hidden
+  sessions are auto-ready (all-hidden → promotes immediately).
 - **Visibility = pause/resume, not reset.** A `visibility {deviceId, false}`
   pauses the dwell countdown using a wall-clock deadline; `true`
   resumes the *remaining* time. A wake never bumps the deadline. Web

@@ -158,14 +158,17 @@ Tell the server the channel's current image is fully on screen.
 { "sessionId": "win1", "action": "imageReady", "payload": { "id": 4181569 } }
 ```
 
-The orchestrator's readiness barrier waits for every visible session
-on the channel to report before starting the dwell timer. There is no
-timeout. **If a visible session never sends this, the channel stays on
-the current frame indefinitely and never advances** — the server will
-not advance blind and waste work the client can't display. Send it
-exactly once per successful transition (matching the broadcast `current.id`).
-A hidden session (its display reported `visibility {false}`) is treated
-as auto-ready and does not hold the barrier.
+The orchestrator's readiness barrier starts the dwell timer as soon as
+the **first** visible session on the channel reports for the current
+image — first-ready wins, not all-ready. When several clients share a
+`deviceId` (e.g. a web kiosk and Spatialstash), the slowest doesn't gate
+the channel and a client leaving mid-barrier can't wedge it. There is no
+timeout: **if *no* visible session ever reports, the channel stays on the
+current frame and never advances** — the server won't advance blind and
+waste work no client can display. Send it once per successful transition
+(matching the broadcast `current.id`). A channel whose sessions are all
+hidden (each reported `visibility {false}`) has nothing to wait for and
+advances on its own.
 
 ### `visibility`
 Report whether this `deviceId` is visible (page in foreground, screen
