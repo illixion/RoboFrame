@@ -287,7 +287,7 @@ test('cached displayState persists past disconnect and replays on reconnect', as
     ws.close();
 });
 
-test('visibility action augments getDisplayState reply with visible+visibilitySince', async (t) => {
+test('getDisplayState echoes only the cached panel state, never visibility', async (t) => {
     await startServer();
     t.after(stopServer);
 
@@ -295,11 +295,26 @@ test('visibility action augments getDisplayState reply with visible+visibilitySi
     await ws.opened;
     await ws.waitForFrames(1); // drain initial frames
 
+    // Visibility is known but no panel displayState is cached yet. The reply
+    // must NOT synthesize a (state-less) displayState carrying visibility —
+    // clients read a missing `state` as off=false and would re-enable a
+    // panel PIR had turned off.
     ws.send(JSON.stringify({ action: 'visibility', payload: { deviceId: 'kiosk1', visible: false } }));
     await new Promise((res) => setTimeout(res, 50));
+    ws.frames.length = 0;
     ws.send(JSON.stringify({ action: 'getDisplayState', payload: { target: 'kiosk1' } }));
+    await new Promise((res) => setTimeout(res, 200));
+    assert.ok(
+        !ws.frames.some((f) => f.action === 'displayState' && f.payload?.target === 'kiosk1'),
+        'no displayState reply should be sent when only visibility is known',
+    );
 
-    // Wait until a displayState frame for kiosk1 appears.
+    // Once a panel state is cached, getDisplayState echoes it verbatim — with
+    // `state`, and without any visibility fields folded in.
+    ws.send(JSON.stringify({ action: 'reportDisplay', payload: { deviceId: 'kiosk1', state: 'off' } }));
+    await new Promise((res) => setTimeout(res, 50));
+    ws.frames.length = 0;
+    ws.send(JSON.stringify({ action: 'getDisplayState', payload: { target: 'kiosk1' } }));
     const deadline = Date.now() + 1000;
     let ds;
     while (Date.now() < deadline) {
@@ -307,9 +322,10 @@ test('visibility action augments getDisplayState reply with visible+visibilitySi
         if (ds) break;
         await new Promise((res) => setTimeout(res, 25));
     }
-    assert.ok(ds, 'expected a displayState reply for kiosk1');
-    assert.equal(ds.payload.visible, false);
-    assert.equal(typeof ds.payload.visibilitySince, 'number');
+    assert.ok(ds, 'getDisplayState should echo the cached panel displayState');
+    assert.equal(ds.payload.state, 'off');
+    assert.equal(ds.payload.visible, undefined, 'reply must not carry visibility');
+    assert.equal(ds.payload.visibilitySince, undefined);
 
     ws.close();
 });

@@ -300,7 +300,10 @@ switch's command topic.
 
 ### `getDisplayState`, `ping`
 Diagnostics. `getDisplayState { target: "<deviceId>" }` echoes the
-last `displayState` plus per-deviceId visibility; `ping` → `pong`.
+cached `displayState` frame for that device (its `state`, including a
+PIR/HA-driven `off`), or nothing if none is cached. It does not report
+page-visibility — that is a separate concept carried by the `visibility`
+action. `ping` → `pong`.
 
 ### `rpcsend` (rpc tier only)
 Privileged broadcast — server forwards `payload.action` / `payload.payload`

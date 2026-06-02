@@ -109,7 +109,12 @@ export function connectWebSocket() {
                 applyPlayback(message.payload);
                 break;
             case 'displayState':
-                if (message.payload?.target === state.deviceID) {
+                // Only act on frames that actually carry a panel `state`. A
+                // `state`-less displayState (e.g. a stray visibility echo)
+                // must not toggle the panel — treating a missing state as
+                // "on" would re-enable a display PIR had turned off.
+                if (message.payload?.target === state.deviceID
+                    && message.payload?.state !== undefined) {
                     const off = message.payload.state === 'off' || message.payload.state === false;
                     disable(off);
                 }

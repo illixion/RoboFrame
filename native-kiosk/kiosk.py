@@ -458,7 +458,11 @@ class Kiosk:
             self._apply_playback(msg.get("payload") or {})
         elif action == "displayState":
             p = msg.get("payload") or {}
-            if p.get("target") == self.cfg["device_id"]:
+            # Only act on frames that carry a panel `state`. A state-less
+            # displayState (e.g. a stray visibility echo) must not toggle the
+            # panel — treating a missing state as "on" would re-enable a
+            # display PIR had turned off.
+            if p.get("target") == self.cfg["device_id"] and "state" in p:
                 off = p.get("state") == "off" or p.get("state") is False
                 self._set_server_off(off)
         elif action == "refresh":

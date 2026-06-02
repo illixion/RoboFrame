@@ -450,26 +450,15 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 }
 
             } else if (action === 'getDisplayState' && payload?.target) {
+                // Echo only the cached panel `displayState` (it carries
+                // `state`, including a PIR/HA-driven `off`). Page-visibility is
+                // a separate concept tracked via the `visibility` action;
+                // folding `visible`/`visibilitySince` into a displayState frame
+                // produced a `state`-less message that clients read as
+                // `off=false` and used to re-enable a panel PIR had turned off.
                 const lastMessage = displayStates[payload.target];
-                const vis = visibilityStates[payload.target];
                 if (lastMessage) {
-                    ws.send(JSON.stringify({
-                        ...lastMessage,
-                        payload: {
-                            ...lastMessage.payload,
-                            visible: vis?.aggregate,
-                            visibilitySince: vis?.lastChangedAt,
-                        },
-                    }));
-                } else if (vis) {
-                    ws.send(JSON.stringify({
-                        action: 'displayState',
-                        payload: {
-                            target: payload.target,
-                            visible: vis.aggregate,
-                            visibilitySince: vis.lastChangedAt,
-                        },
-                    }));
+                    ws.send(JSON.stringify(lastMessage));
                 }
                 for (const entityId in haStates) {
                     ws.send(JSON.stringify(haStates[entityId]));
