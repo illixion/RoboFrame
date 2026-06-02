@@ -69,6 +69,13 @@ function createOrchestrator({
     getVisibility = null,
     getRatioWindow = null,
 }) {
+    // Set ORCHESTRATOR_DEBUG=1 to trace the readiness barrier: every dropped
+    // `imageReady` (with the reason) and the keys a loading channel is still
+    // waiting on. Quiet by default — drops are the only signal worth seeing
+    // and the happy path stays silent.
+    const DEBUG = !!process.env.ORCHESTRATOR_DEBUG;
+    const dbg = DEBUG ? (...a) => console.log('[orchestrator]', ...a) : () => {};
+
     const UPCOMING_COUNT = 4;
     const MIN_QUEUE_SIZE = 1 + UPCOMING_COUNT;
     const REFILL_FETCH_SIZE = Math.max(5, MIN_QUEUE_SIZE * 2);
@@ -458,8 +465,13 @@ function createOrchestrator({
 
     function startTimerIfReady(channel) {
         if (channel.phase !== 'loading') return;
+        const pending = [];
         for (const key of channel.expectedReady) {
-            if (!channel.ready.has(key)) return;
+            if (!channel.ready.has(key)) pending.push(key);
+        }
+        if (pending.length) {
+            dbg(`channel ${channel.deviceId} still waiting on imageReady from {${pending.join(',')}} for id=${channel.currentId}`);
+            return;
         }
         promoteToDisplaying(channel);
     }
@@ -764,12 +776,22 @@ function createOrchestrator({
     function notifyImageReady(ws, sessionId, id) {
         const key = sessionKeyOf(ws, sessionId);
         const sess = sessionsByKey.get(key);
-        if (!sess) return;
+        if (!sess) { dbg(`imageReady dropped: no session for key=${key} id=${id}`); return; }
         const target = isMergeActive() ? mergeDriverChannel : sess.channel;
-        if (target.phase !== 'loading') return;
-        if (Number(id) !== Number(target.currentId)) return;
-        if (!target.expectedReady.has(key)) return;
+        if (target.phase !== 'loading') {
+            dbg(`imageReady dropped: channel ${target.deviceId} phase=${target.phase} (not loading) key=${key} id=${id}`);
+            return;
+        }
+        if (Number(id) !== Number(target.currentId)) {
+            dbg(`imageReady dropped: id mismatch key=${key} reported=${id} currentId=${target.currentId} on ${target.deviceId}`);
+            return;
+        }
+        if (!target.expectedReady.has(key)) {
+            dbg(`imageReady dropped: key=${key} not in expectedReady={${Array.from(target.expectedReady).join(',')}} on ${target.deviceId}`);
+            return;
+        }
         target.ready.add(key);
+        dbg(`imageReady accepted: key=${key} id=${id} on ${target.deviceId} ready=${target.ready.size}/${target.expectedReady.size}`);
         startTimerIfReady(target);
     }
 
