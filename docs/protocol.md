@@ -131,7 +131,9 @@ Joins this session to the channel for `deviceId`. Send on every
   a number, e.g. `1.778` for 16:9. The server owns the tolerance: it
   expands the value into a `ratio:lo..hi` query clause with a ±15%
   window (so `1.778` becomes `ratio:1.51..2.04`) and picks posts that
-  suit the panel. A legacy `"lo..hi"` range *string* (and a numeric
+  suit the panel. The window is configurable via
+  `server.slideshow.ratioWindow` in `roboframe.config.json` (hot-reloaded
+  — no restart needed; env override `SLIDESHOW_RATIO_WINDOW`). A legacy `"lo..hi"` range *string* (and a numeric
   string like `"1.778"`) is still accepted for back-compat — the range
   form is used verbatim without re-expansion. When multiple sessions
   share a channel the server keeps the single advert whose aspect is

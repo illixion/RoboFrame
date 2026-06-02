@@ -67,6 +67,7 @@ function createOrchestrator({
     imageCache = null,
     prefetchVariant = null,
     getVisibility = null,
+    getRatioWindow = null,
 }) {
     const UPCOMING_COUNT = 4;
     const MIN_QUEUE_SIZE = 1 + UPCOMING_COUNT;
@@ -268,16 +269,24 @@ function createOrchestrator({
 
     // The ±window the server expands a bare aspect-ratio advert into. Clients
     // send their raw `width/height`; the server owns the tolerance so it can
-    // be tuned in one place without reshipping every client.
-    const RATIO_WINDOW = 0.15;
+    // be tuned in one place without reshipping every client. The value comes
+    // from config via `getRatioWindow` and is read live on every query, so a
+    // config edit takes effect without a restart. Invalid / out-of-range
+    // values fall back to the default.
+    const DEFAULT_RATIO_WINDOW = 0.15;
+    function ratioWindow() {
+        const v = Number(getRatioWindow ? getRatioWindow() : DEFAULT_RATIO_WINDOW);
+        return Number.isFinite(v) && v > 0 && v < 1 ? v : DEFAULT_RATIO_WINDOW;
+    }
 
     // Resolve a session's ratio advert into { center, lo, hi }. The preferred
     // form is a bare aspect-ratio number (e.g. 1.78) which the server expands
-    // by ±RATIO_WINDOW. A legacy `"lo..hi"` range string is honored as-is —
+    // by ±ratioWindow(). A legacy `"lo..hi"` range string is honored as-is —
     // its window was already baked in by an older client. Returns null for a
     // missing or malformed advert.
     function parseRatioAdvert(raw) {
-        const expand = (r) => ({ center: r, lo: r * (1 - RATIO_WINDOW), hi: r * (1 + RATIO_WINDOW) });
+        const w = ratioWindow();
+        const expand = (r) => ({ center: r, lo: r * (1 - w), hi: r * (1 + w) });
         if (typeof raw === 'number') {
             return Number.isFinite(raw) && raw > 0 ? expand(raw) : null;
         }
@@ -833,6 +842,21 @@ function createOrchestrator({
         }
     }
 
+    // Re-run every active channel's query against the current selection
+    // inputs (e.g. after the ratio window changed in config). Mirrors the
+    // setModTags/reshuffle path: clear, refill, re-commit so the new
+    // constraint takes effect immediately. Parked channels are skipped —
+    // they rebuild from the live getter on reconnect. While merged only the
+    // driver channel runs, so only it is requeried.
+    function requeryAll() {
+        if (search?.clearCache) search.clearCache();
+        for (const channel of channels.values()) {
+            if (channel.parked) continue;
+            if (isMergeActive() && channel !== mergeDriverChannel) continue;
+            clearAndRefill(channel).then(() => commitCurrent(channel));
+        }
+    }
+
     function claimDisplaySync(ws, sessionId, enabled) {
         const key = sessionKeyOf(ws, sessionId);
         const sess = sessionsByKey.get(key);
@@ -921,6 +945,7 @@ function createOrchestrator({
         notifyImageReady,
         notifyVisibility,
         notifyBlockedChange,
+        requeryAll,
         claimDisplaySync,
         close,
         // exposed for tests

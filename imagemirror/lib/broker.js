@@ -22,7 +22,7 @@
 const fs = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
-const { pickEnv } = require('@roboframe/shared');
+const { pickEnv, loadConfig } = require('@roboframe/shared');
 const { createOrchestrator } = require('./orchestrator');
 const { createMqttBridge } = require('./mqtt-bridge');
 
@@ -30,6 +30,15 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     const srv = config.server || {};
     const ha = srv.ha || {};
     const mqttCfg = srv.mqtt || {};
+
+    // ±window the orchestrator expands a client's raw aspect ratio into.
+    // Live-reloadable: the config watcher below updates `ratioWindow` and
+    // requeries active channels, so a roboframe.config.json edit takes effect
+    // without a restart. env > config > default, re-evaluated on each reload.
+    function readRatioWindow(cfg) {
+        return pickEnv('SLIDESHOW_RATIO_WINDOW', cfg?.server?.slideshow?.ratioWindow, 0.15, { type: 'number' });
+    }
+    let ratioWindow = readRatioWindow(config);
 
     const rpcToken = pickEnv('RPC_TOKEN', srv.rpcToken, '');
     const accessToken = pickEnv('ACCESS_TOKEN', config.accessToken, '');
@@ -273,7 +282,35 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         imageCache,
         prefetchVariant,
         getVisibility,
+        getRatioWindow: () => ratioWindow,
     }) : null;
+
+    // ----- Config watcher: hot-reload tunables -----------------------------
+    // Re-read roboframe.config.json on change and apply the slideshow
+    // tunables that are safe to swap live. Only ratioWindow is wired today;
+    // structural settings (tokens, ports, paths) still require a restart.
+    let configReloadTimer = null;
+    const configPath = config.configPath;
+    if (configPath) {
+        try {
+            fs.watch(configPath, () => {
+                if (configReloadTimer) clearTimeout(configReloadTimer);
+                configReloadTimer = setTimeout(() => {
+                    let fresh;
+                    try { fresh = loadConfig({ reload: true }); }
+                    catch (err) { console.warn(`Reload of ${configPath} failed: ${err.message}`); return; }
+                    const next = readRatioWindow(fresh);
+                    if (next !== ratioWindow) {
+                        console.log(`${configPath} changed; ratioWindow ${ratioWindow} -> ${next}`);
+                        ratioWindow = next;
+                        if (orchestrator) orchestrator.requeryAll();
+                    }
+                }, 50);
+            });
+        } catch (err) {
+            console.warn(`Could not watch ${configPath}: ${err.message}`);
+        }
+    }
 
     // ----- MQTT bridge -----------------------------------------------------
     // Auto-discovery for HA. When mqtt.url is empty in config the bridge is

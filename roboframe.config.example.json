@@ -19,6 +19,11 @@
     "duckdbPath": "./posts.duckdb",
     "djxlPath": "djxl",
     "chunkSize": 0,
+    "slideshow": {
+      "_comment": "Slideshow orchestrator tunables. Hot-reloaded: editing these in roboframe.config.json takes effect without a server restart.",
+      "ratioWindow": 0.15,
+      "_ratioWindowComment": "Aspect-ratio match tolerance. Clients advertise their raw width/height; the server expands it by ±this fraction into the ratio:lo..hi query window (0.15 = ±15%, so a 1.78 display matches 1.51..2.04). Larger = looser cropping match / more candidate images; smaller = stricter. Range (0,1); invalid values fall back to 0.15. Env override: SLIDESHOW_RATIO_WINDOW."
+    },
     "ha": {
       "_comment": "Read-only sensor forwarder. With url+token set, the broker subscribes to the listed HA entities and pushes their state to kiosks via the `update` action so the frontend can render outdoor temperature, humidity, etc. Set enabled:false to force-disable.",
       "url": "",

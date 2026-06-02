@@ -56,7 +56,7 @@ function loadConfig({ reload = false } = {}) {
         // a second source of truth.
         accessToken,
         deviceId,
-        server: { ...server, ha: { ...(server.ha || {}) } },
+        server: { ...server, ha: { ...(server.ha || {}) }, slideshow: { ...(server.slideshow || {}) } },
         display: { ...display, pirHttp: { ...(display.pirHttp || {}) }, nightLight: { ...(display.nightLight || {}) }, webcam: { ...(display.webcam || {}) } },
         configPath,
     };

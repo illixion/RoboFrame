@@ -56,6 +56,7 @@ function withDefaultSession(orch) {
         notifyVisibility: (...args) => orch.notifyVisibility(...args),
         setTagList: (ws, listNumber) => orch.setTagList(ws, sid(ws), listNumber),
         notifyBlockedChange: (...args) => orch.notifyBlockedChange(...args),
+        requeryAll: (...args) => orch.requeryAll(...args),
         unregister: (...args) => orch.unregister(...args),
         unregisterSession: (...args) => orch.unregisterSession(...args),
         close: () => orch.close(),
@@ -628,7 +629,7 @@ test('setTagList changes only the sender channel; other channels keep their list
     assert.equal(bLast.payload.currentList, 0);
 });
 
-function ratioHarness(t) {
+function ratioHarness(t, { getRatioWindow } = {}) {
     const queries = [];
     const search = {
         runSearch({ q }) {
@@ -642,6 +643,7 @@ function ratioHarness(t) {
         broadcast: () => {},
         getCurrentTagsList: () => 0,
         getTagLists: () => [[]],
+        getRatioWindow,
     }));
     t.after(() => orch.close());
     return { orch, queries };
@@ -703,4 +705,43 @@ test('numeric-string and float ratio adverts are treated identically', async (t)
     // 1.50 expanded ±15% → 1.275..1.725, formatted to 2dp as 1.27..1.72.
     assert.ok(queries.every((q) => /ratio:1\.27\.\.1\.72/.test(q)),
         'a numeric string advert should expand like a bare float');
+});
+
+test('ratio window comes from getRatioWindow and is read live on every query', async (t) => {
+    let window = 0.10;
+    const { orch, queries } = ratioHarness(t, { getRatioWindow: () => window });
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 5000, ratio: 2.0 });
+    await tick(); await tick(); await tick();
+
+    queries.length = 0;
+    orch.requestReshuffle(ws);
+    await tick(); await tick();
+    // ±10% of 2.0 → 1.80..2.20.
+    assert.ok(queries.every((q) => /ratio:1\.80\.\.2\.20/.test(q)),
+        'first query should use the initial window');
+
+    // Change the config-backed value; no re-register needed.
+    window = 0.25;
+    queries.length = 0;
+    orch.requeryAll();
+    await tick(); await tick();
+    // ±25% of 2.0 → 1.50..2.50.
+    assert.ok(queries.length >= 1, 'requeryAll should rebuild active channels');
+    assert.ok(queries.every((q) => /ratio:1\.50\.\.2\.50/.test(q)),
+        'the new window must take effect without a restart or re-register');
+});
+
+test('invalid getRatioWindow values fall back to the 0.15 default', async (t) => {
+    const { orch, queries } = ratioHarness(t, { getRatioWindow: () => 'nonsense' });
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 5000, ratio: 2.0 });
+    await tick(); await tick(); await tick();
+
+    queries.length = 0;
+    orch.requestReshuffle(ws);
+    await tick(); await tick();
+    // Falls back to ±15% → 1.70..2.30.
+    assert.ok(queries.every((q) => /ratio:1\.70\.\.2\.30/.test(q)),
+        'a non-numeric window should fall back to the default');
 });
