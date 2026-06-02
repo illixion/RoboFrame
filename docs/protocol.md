@@ -138,12 +138,13 @@ Tell the server the channel's current image is fully on screen.
 ```
 
 The orchestrator's readiness barrier waits for every visible session
-on the channel to report before starting the dwell timer. **If your
-client doesn't send this, the channel rides the 10 s bad-network
-fallback every cycle**, making the effective server cycle ~10 s longer
-than the configured interval. Symptom: every-other server frame
-triggers a cache miss / placeholder on the client side. Send it
+on the channel to report before starting the dwell timer. There is no
+timeout. **If a visible session never sends this, the channel stays on
+the current frame indefinitely and never advances** — the server will
+not advance blind and waste work the client can't display. Send it
 exactly once per successful transition (matching the broadcast `current.id`).
+A hidden session (its display reported `visibility {false}`) is treated
+as auto-ready and does not hold the barrier.
 
 ### `visibility`
 Report whether this `deviceId` is visible (page in foreground, screen

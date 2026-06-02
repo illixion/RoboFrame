@@ -13,8 +13,10 @@
 //
 // Cadence is gated on a readiness barrier: after a `playback` frame is sent,
 // the channel waits until every visible session reports `imageReady { id }`
-// for the new image (or 10 s elapses, whichever comes first) before starting
-// the dwell-time interval timer. Sessions on hidden displays are auto-ready
+// for the new image before starting the dwell-time interval timer. There is
+// no timeout: a client that never reports parks the channel on the current
+// frame indefinitely rather than advancing blind, so the server never burns
+// work the client can't display. Sessions on hidden displays are auto-ready
 // — they wouldn't render the image anyway — so they don't stall the barrier.
 //
 // Visibility for a deviceId pauses/resumes the dwell timer using a wall-clock
@@ -69,7 +71,6 @@ function createOrchestrator({
     const UPCOMING_COUNT = 4;
     const MIN_QUEUE_SIZE = 1 + UPCOMING_COUNT;
     const REFILL_FETCH_SIZE = Math.max(5, MIN_QUEUE_SIZE * 2);
-    const READINESS_TIMEOUT_MS = 10000;
     const DEFAULT_INTERVAL_MS = 15000;
     const MIN_INTERVAL_MS = 2000;
     const MAX_INTERVAL_MS = 3600000;
@@ -135,7 +136,6 @@ function createOrchestrator({
             ready: new Set(),
             phase: 'idle',               // 'idle' | 'loading' | 'displaying'
             timer: null,
-            readinessTimer: null,
             // Wall-clock deadline for the dwell timer. Set when entering
             // 'displaying'; survives visibility-driven pauses.
             dwellDeadline: null,
@@ -218,7 +218,7 @@ function createOrchestrator({
     function expectedReadersFor(channel) {
         // Hidden sessions are auto-ready: their displays won't render
         // while hidden, so demanding an imageReady from them would stall
-        // every cycle for the full 10 s timeout.
+        // the channel forever — there's no timeout to bail it out.
         const targets = broadcastTargets(channel).filter(sessionVisible);
         return new Set(targets);
     }
@@ -395,10 +395,6 @@ function createOrchestrator({
     function clearReadiness(channel) {
         channel.expectedReady = new Set();
         channel.ready = new Set();
-        if (channel.readinessTimer) {
-            clearTimeout(channel.readinessTimer);
-            channel.readinessTimer = null;
-        }
     }
 
     function stopDwellTimer(channel) {
@@ -433,22 +429,8 @@ function createOrchestrator({
 
     function promoteToDisplaying(channel) {
         channel.phase = 'displaying';
-        if (channel.readinessTimer) {
-            clearTimeout(channel.readinessTimer);
-            channel.readinessTimer = null;
-        }
         channel.dwellDeadline = Date.now() + Math.max(MIN_INTERVAL_MS, channel.interval);
         scheduleDwell(channel);
-    }
-
-    function armReadinessTimeout(channel) {
-        if (channel.readinessTimer) clearTimeout(channel.readinessTimer);
-        channel.readinessTimer = setTimeout(() => {
-            channel.readinessTimer = null;
-            // Bad-network fallback: anyone who hasn't reported by now is
-            // treated as ready so the channel doesn't stall forever.
-            if (channel.phase === 'loading') promoteToDisplaying(channel);
-        }, READINESS_TIMEOUT_MS);
     }
 
     async function advance(channel) {
@@ -548,9 +530,10 @@ function createOrchestrator({
             // the channel's wall-clock keeps advancing even when every
             // display on the channel is dark.
             promoteToDisplaying(channel);
-        } else {
-            armReadinessTimeout(channel);
         }
+        // Otherwise the channel stays in 'loading' until every visible
+        // session reports `imageReady`. No timeout: an unreporting client
+        // holds the channel here rather than letting it advance blind.
     }
 
     // ----- public API ------------------------------------------------------
@@ -674,10 +657,6 @@ function createOrchestrator({
             // deviceId rebinds to the same channel and resumes from the
             // same image; no slideshowConfig replay needed for state.
             stopDwellTimer(channel);
-            if (channel.readinessTimer) {
-                clearTimeout(channel.readinessTimer);
-                channel.readinessTimer = null;
-            }
             channel.parked = true;
         } else if (channel.phase === 'loading') {
             // Disconnect during the readiness barrier — re-check now that
@@ -837,10 +816,6 @@ function createOrchestrator({
             for (const c of channels.values()) {
                 if (c === channel) continue;
                 stopDwellTimer(c);
-                if (c.readinessTimer) {
-                    clearTimeout(c.readinessTimer);
-                    c.readinessTimer = null;
-                }
                 c.phase = 'idle';
                 c.dwellDeadline = null;
             }
@@ -849,7 +824,6 @@ function createOrchestrator({
             channel.phase = 'loading';
             broadcastPlayback(channel);
             if (channel.expectedReady.size === 0) promoteToDisplaying(channel);
-            else armReadinessTimeout(channel);
         } else if (channel === mergeDriverChannel) {
             // Any session on the driver channel can release the merge.
             releaseMerge();
@@ -868,7 +842,6 @@ function createOrchestrator({
                     channel.phase = 'loading';
                     broadcastPlayback(channel);
                     if (channel.expectedReady.size === 0) promoteToDisplaying(channel);
-                    else armReadinessTimeout(channel);
                 } else {
                     channel.phase = 'idle';
                 }
@@ -900,10 +873,6 @@ function createOrchestrator({
         clearInterval(idleRefillTimer);
         for (const channel of channels.values()) {
             stopDwellTimer(channel);
-            if (channel.readinessTimer) {
-                clearTimeout(channel.readinessTimer);
-                channel.readinessTimer = null;
-            }
             channel.sessions.clear();
             channel.queue.length = 0;
         }

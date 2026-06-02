@@ -198,7 +198,7 @@ test('readiness barrier: dwell timer waits for all expected ws to report imageRe
     assert.ok(ch.timer, 'dwell timer arms once everyone reports');
 });
 
-test('readiness fallback: 10s timer is armed while loading so a wedged client cannot stall the channel forever', async (t) => {
+test('no readiness fallback: a client that never reports imageReady holds the channel in loading forever', async (t) => {
     const { orch } = harness();
     t.after(() => orch.close());
     const a = makeFakeWs();
@@ -207,10 +207,16 @@ test('readiness fallback: 10s timer is armed while loading so a wedged client ca
     orch.register(b, { deviceId: 'screen1', interval: 5000 });
     await tick(); await tick(); await tick();
     const ch = orch._channels.get('screen1');
+    const stuckId = ch.currentId;
+    // No imageReady from either visible session: the barrier must not be
+    // bailed out by any timer. The channel parks on the current frame
+    // rather than advancing blind and wasting work the clients can't show.
     assert.equal(ch.phase, 'loading');
-    // The timer's existence is the contract; firing happens 10s out and
-    // is cleaned up by orch.close() in the test teardown.
-    assert.ok(ch.readinessTimer);
+    assert.equal(ch.timer, null, 'no dwell timer while still loading');
+    // Even after the configured interval would have elapsed, nothing moves.
+    await tick(); await tick(); await tick();
+    assert.equal(ch.phase, 'loading');
+    assert.equal(ch.currentId, stuckId, 'channel does not advance without imageReady');
 });
 
 test('node-display-style WS that never sends slideshowConfig is not in any channel', async (t) => {
