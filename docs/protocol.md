@@ -73,15 +73,20 @@ for a `(ws, sessionId)` pair. Closing the underlying ws drops every
 session attached to it; sending `sessionEnd { sessionId }` drops just
 that one without disturbing the others.
 
-### Channel grace window
+### Parked channels
 
 When the last session on a channel disconnects (or is `sessionEnd`-ed)
-the channel is *not* deleted immediately — its queue, cursor, mod tags,
-interval, currentId, and any held merge claim linger for 2 minutes. A
-reconnecting client (typical sleep/wake on a visionOS window) is rebound
-to the surviving channel automatically when its `slideshowConfig` lands.
-Cadence is paused for the duration; if no session rejoins by 2 min the
-channel is fully evicted and any held merge claim is released.
+the channel is *not* deleted — it is *parked* for the lifetime of the
+server process. Its queue, cursor, mod tags, interval, currentId, and
+any held merge claim are preserved verbatim, and every timer (dwell,
+prefetch, idle-refill) stops so no work runs for an unattended channel.
+A reconnecting client (visionOS sleep/wake, kiosk reboot, a network
+blip, or a return days later) is rebound to the surviving channel
+automatically when its `slideshowConfig` lands, resuming from the same
+image without replaying any state. There is no eviction timer: a parked
+channel and its merge claim survive until an explicit
+`displaySync {enabled:false}` from some session on the driver channel,
+or process shutdown (`close()`).
 
 ## Client → server messages
 
@@ -237,8 +242,9 @@ barrier waits on every visible session across all channels.
 `enabled: false` releases the merge — each channel resumes its own
 cadence and re-broadcasts to its own audience. All sessions on the
 driver channel are equals (any can release), and the original claimer
-disconnecting does *not* release the merge — it only releases when the
-driver channel is fully evicted (after the grace window).
+disconnecting does *not* release the merge — the driver channel parks
+with the claim held. It is released only by an explicit
+`displaySync {enabled:false}` or process shutdown.
 
 ### `reportDisplay`, `reportSensor`, `reportWebcam`, `reportSuppress`
 Hardware-state reports from node-display (or any controller) into the

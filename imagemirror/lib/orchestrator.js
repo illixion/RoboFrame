@@ -101,8 +101,9 @@ function createOrchestrator({
     // displaySync merge is tracked as a property of the *driver channel*,
     // not a specific ws or session. All sessions on the driver channel are
     // considered equal — any of them can release. Original claimer leaving
-    // doesn't tear down the merge; only the driver channel itself going
-    // fully empty (after grace) does.
+    // doesn't tear down the merge — the driver channel parks with the
+    // claim held. Only an explicit displaySync {enabled:false} or
+    // process shutdown releases it.
     let mergeDriverChannel = null;
 
     function makeChannel(deviceId) {
