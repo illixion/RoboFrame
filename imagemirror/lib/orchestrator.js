@@ -68,6 +68,7 @@ function createOrchestrator({
     prefetchVariant = null,
     getVisibility = null,
     getRatioWindow = null,
+    getSharedTags = null,
 }) {
     // Set ORCHESTRATOR_DEBUG=1 to trace the readiness barrier: every dropped
     // `imageReady` (with the reason) and the keys a loading channel is still
@@ -113,6 +114,33 @@ function createOrchestrator({
     // claim held. Only an explicit displaySync {enabled:false} or
     // process shutdown releases it.
     let mergeDriverChannel = null;
+
+    // Shared-tag-selection mode (config: server.slideshow.sharedTags). When
+    // enabled the active tag-list index and the mod tags are a single global
+    // selection that every channel shares, regardless of deviceId — distinct
+    // from displaySync, which merges *playback frames* but leaves each
+    // channel's query alone. Here the queries themselves converge: the
+    // per-channel currentTagsList / modTags getters and setters are
+    // short-circuited to read and write these globals instead. Read live via
+    // getSharedTags() so a config hot-reload can flip the mode without a
+    // restart. Seeded from the same source a fresh channel would use.
+    function sharedTagsEnabled() {
+        return !!(getSharedTags && getSharedTags());
+    }
+    let sharedTagsList = (() => {
+        const n = Number(getCurrentTagsList ? getCurrentTagsList() : 0);
+        return Number.isFinite(n) && n >= 0 ? n : 0;
+    })();
+    let sharedModTags = [];
+
+    // The tag-list index / mod tags a channel's query should actually use:
+    // the shared globals when shared mode is on, otherwise the channel's own.
+    function effectiveTagsList(channel) {
+        return sharedTagsEnabled() ? sharedTagsList : channel.currentTagsList;
+    }
+    function effectiveModTags(channel) {
+        return sharedTagsEnabled() ? sharedModTags : (channel.modTags || []);
+    }
 
     function makeChannel(deviceId) {
         return {
@@ -201,8 +229,8 @@ function createOrchestrator({
             deviceId: channel.deviceId,
             mergeDriver: isMergeActive() ? mergeDriverChannel.deviceId : null,
             interval: channel.interval,
-            currentList: channel.currentTagsList,
-            modTags: channel.modTags.slice(),
+            currentList: effectiveTagsList(channel),
+            modTags: effectiveModTags(channel).slice(),
             current: channel.queue[0] || null,
             next: upcoming[0] || null,
             upcoming,
@@ -334,10 +362,10 @@ function createOrchestrator({
 
     function buildQuery(channel) {
         const lists = getTagLists();
-        const idx = channel.currentTagsList;
+        const idx = effectiveTagsList(channel);
         const baseTags = Array.isArray(lists[idx]) ? lists[idx].slice() : [];
         const ratioClause = channelRatioClause(channel);
-        const all = baseTags.concat(channel.modTags || []);
+        const all = baseTags.concat(effectiveModTags(channel));
         if (ratioClause) all.push(ratioClause);
         return all.filter(Boolean).join(' ');
     }
@@ -737,6 +765,15 @@ function createOrchestrator({
         // displaySync.
     }
 
+    // Requery every channel against the current selection inputs and re-commit
+    // each. Used by the shared-tag setters: one selection change has to fan out
+    // to all channels at once, not just the caller's.
+    function clearAndRefillAll() {
+        for (const ch of channels.values()) {
+            clearAndRefill(ch).then(() => commitCurrent(ch));
+        }
+    }
+
     function setModTags(ws, sessionId, tags) {
         const key = sessionKeyOf(ws, sessionId);
         const sess = sessionsByKey.get(key);
@@ -748,6 +785,14 @@ function createOrchestrator({
         // what the driver channel set. Within the driver channel any
         // session can change them — all sessions are equal peers.
         if (isMergeActive() && channel !== mergeDriverChannel) return;
+        if (sharedTagsEnabled()) {
+            // Shared mode: mod tags are one global selection. Bypass the
+            // per-channel store entirely and requery every channel so they
+            // all switch together.
+            sharedModTags = sess.modTags.slice();
+            clearAndRefillAll();
+            return;
+        }
         channel.modTags = sess.modTags.slice();
         clearAndRefill(channel).then(() => commitCurrent(channel));
     }
@@ -842,6 +887,15 @@ function createOrchestrator({
         // active list. Audience channels are paused; honoring their request
         // would silently mutate state the driver doesn't know about.
         if (isMergeActive() && channel !== mergeDriverChannel) return;
+        if (sharedTagsEnabled()) {
+            // Shared mode: one global active list for every channel. The
+            // per-channel currentTagsList is bypassed; update the shared
+            // index and requery every channel so they all switch together.
+            if (sharedTagsList === n) return;
+            sharedTagsList = n;
+            clearAndRefillAll();
+            return;
+        }
         if (channel.currentTagsList === n) return;
         channel.currentTagsList = n;
         clearAndRefill(channel).then(() => commitCurrent(channel));

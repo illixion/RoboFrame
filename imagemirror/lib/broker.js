@@ -40,6 +40,15 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     }
     let ratioWindow = readRatioWindow(config);
 
+    // When enabled, the active tag-list index and mod tags become a single
+    // global selection shared by every channel regardless of deviceId — see
+    // orchestrator's shared-tag mode. Distinct from displaySync (which merges
+    // playback frames). Live-reloadable like ratioWindow.
+    function readSharedTags(cfg) {
+        return pickEnv('SLIDESHOW_SHARED_TAGS', cfg?.server?.slideshow?.sharedTags, false, { type: 'boolean' });
+    }
+    let sharedTags = readSharedTags(config);
+
     const rpcToken = pickEnv('RPC_TOKEN', srv.rpcToken, '');
     const accessToken = pickEnv('ACCESS_TOKEN', config.accessToken, '');
     const HA_URL = pickEnv('HA_URL', ha.url, '');
@@ -283,6 +292,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         prefetchVariant,
         getVisibility,
         getRatioWindow: () => ratioWindow,
+        getSharedTags: () => sharedTags,
     }) : null;
 
     // ----- Config watcher: hot-reload tunables -----------------------------
@@ -300,11 +310,19 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                     try { fresh = loadConfig({ reload: true }); }
                     catch (err) { console.warn(`Reload of ${configPath} failed: ${err.message}`); return; }
                     const next = readRatioWindow(fresh);
+                    const nextShared = readSharedTags(fresh);
+                    let requery = false;
                     if (next !== ratioWindow) {
                         console.log(`${configPath} changed; ratioWindow ${ratioWindow} -> ${next}`);
                         ratioWindow = next;
-                        if (orchestrator) orchestrator.requeryAll();
+                        requery = true;
                     }
+                    if (nextShared !== sharedTags) {
+                        console.log(`${configPath} changed; sharedTags ${sharedTags} -> ${nextShared}`);
+                        sharedTags = nextShared;
+                        requery = true;
+                    }
+                    if (requery && orchestrator) orchestrator.requeryAll();
                 }, 50);
             });
         } catch (err) {

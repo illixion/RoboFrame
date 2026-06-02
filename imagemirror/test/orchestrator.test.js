@@ -629,6 +629,116 @@ test('setTagList changes only the sender channel; other channels keep their list
     assert.equal(bLast.payload.currentList, 0);
 });
 
+test('sharedTags mode: setTagList on one channel switches every channel', async (t) => {
+    const queries = [];
+    const lists = [['listA'], ['listB']];
+    let shared = true;
+    const search = {
+        runSearch({ q }) {
+            queries.push(q);
+            return Promise.resolve({ results: [{ _id: 1, file_ext: 'jpg' }, { _id: 2, file_ext: 'jpg' }], nextCursor: 0 });
+        },
+        clearCache() {},
+    };
+    const orch = withDefaultSession(createOrchestrator({
+        search,
+        broadcast: () => {},
+        getCurrentTagsList: () => 0,
+        getTagLists: () => lists,
+        getSharedTags: () => shared,
+    }));
+    t.after(() => orch.close());
+    const a = makeFakeWs();
+    const b = makeFakeWs();
+    orch.register(a, { deviceId: 'kioskA', interval: 5000 });
+    orch.register(b, { deviceId: 'kioskB', interval: 5000 });
+    await tick(); await tick(); await tick();
+
+    queries.length = 0;
+    orch.setTagList(a, 1);
+    await tick(); await tick(); await tick();
+
+    // Both channels requeried against the shared list index.
+    const fromB = queries.filter((q) => /listB/.test(q));
+    assert.ok(fromB.length >= 2, 'expected both channels to query listB');
+    assert.ok(!queries.some((q) => /listA/.test(q)), 'no channel should keep listA');
+
+    const aLast = a.sent.filter((m) => m.action === 'playback').pop();
+    const bLast = b.sent.filter((m) => m.action === 'playback').pop();
+    assert.equal(aLast.payload.currentList, 1);
+    assert.equal(bLast.payload.currentList, 1, 'peer channel follows the shared list');
+});
+
+test('sharedTags mode: setModTags on one channel applies to every channel', async (t) => {
+    const queries = [];
+    let shared = true;
+    const search = {
+        runSearch({ q }) {
+            queries.push(q);
+            return Promise.resolve({ results: [{ _id: 1, file_ext: 'jpg' }, { _id: 2, file_ext: 'jpg' }], nextCursor: 0 });
+        },
+        clearCache() {},
+    };
+    const orch = withDefaultSession(createOrchestrator({
+        search,
+        broadcast: () => {},
+        getCurrentTagsList: () => 0,
+        getTagLists: () => [['baseTag']],
+        getSharedTags: () => shared,
+    }));
+    t.after(() => orch.close());
+    const a = makeFakeWs();
+    const b = makeFakeWs();
+    orch.register(a, { deviceId: 'kioskA', interval: 5000 });
+    orch.register(b, { deviceId: 'kioskB', interval: 5000 });
+    await tick(); await tick(); await tick();
+
+    queries.length = 0;
+    orch.setModTags(a, ['rating:s']);
+    await tick(); await tick(); await tick();
+
+    // Both channels picked up the shared mod tag.
+    assert.ok(queries.filter((q) => /rating:s/.test(q)).length >= 2,
+        'expected both channels to query the shared mod tag');
+
+    const aLast = a.sent.filter((m) => m.action === 'playback').pop();
+    const bLast = b.sent.filter((m) => m.action === 'playback').pop();
+    assert.deepEqual(aLast.payload.modTags, ['rating:s']);
+    assert.deepEqual(bLast.payload.modTags, ['rating:s'], 'peer channel follows the shared mod tags');
+});
+
+test('sharedTags off: setTagList stays per-channel (regression guard)', async (t) => {
+    const lists = [['listA'], ['listB']];
+    let shared = false;
+    const search = {
+        runSearch() {
+            return Promise.resolve({ results: [{ _id: 1, file_ext: 'jpg' }, { _id: 2, file_ext: 'jpg' }], nextCursor: 0 });
+        },
+        clearCache() {},
+    };
+    const orch = withDefaultSession(createOrchestrator({
+        search,
+        broadcast: () => {},
+        getCurrentTagsList: () => 0,
+        getTagLists: () => lists,
+        getSharedTags: () => shared,
+    }));
+    t.after(() => orch.close());
+    const a = makeFakeWs();
+    const b = makeFakeWs();
+    orch.register(a, { deviceId: 'kioskA', interval: 5000 });
+    orch.register(b, { deviceId: 'kioskB', interval: 5000 });
+    await tick(); await tick(); await tick();
+
+    orch.setTagList(a, 1);
+    await tick(); await tick();
+
+    const aLast = a.sent.filter((m) => m.action === 'playback').pop();
+    const bLast = b.sent.filter((m) => m.action === 'playback').pop();
+    assert.equal(aLast.payload.currentList, 1);
+    assert.equal(bLast.payload.currentList, 0, 'peer keeps its own list when sharing is off');
+});
+
 function ratioHarness(t, { getRatioWindow } = {}) {
     const queries = [];
     const search = {

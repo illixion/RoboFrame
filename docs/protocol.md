@@ -25,7 +25,9 @@ disagree, the code wins — please open a PR to fix the doc.
 - Wrong / missing token → server closes with code **1008** (policy violation). Don't keep reconnecting; surface the error.
 - On open, the server pushes one unsolicited frame: `tagLists` — the
   catalog of preset tag lists. The active list *index* is per-channel
-  and arrives in each `playback` frame's `currentList`.
+  and arrives in each `playback` frame's `currentList` — unless the
+  server has shared-tag mode enabled, in which case it is one global
+  selection (see [`setTagList`](#settaglist-session-scoped)).
 - Frames after that arrive as state changes happen.
 - The blocklist is server-only — clients never see it on the wire and
   shouldn't carry one. See [`block`](#block) below.
@@ -206,6 +208,11 @@ sessions). Triggers a clear+refill.
   "payload": { "tags": ["rating:s", "-blood"] } }
 ```
 
+When the server's `server.slideshow.sharedTags` option is enabled, mod
+tags are a single global selection: this action reselects for **every**
+channel at once and each one clears+refills. See `setTagList` below for
+the full description of shared-tag mode.
+
 ### `sessionEnd` (session-scoped, optional)
 Tear down one logical session without closing the underlying ws. Useful
 when a multiplexing client closes one of N viewer windows but keeps the
@@ -228,6 +235,22 @@ ignore the action.
 ```json
 { "sessionId": "win1", "action": "setTagList", "payload": { "listNumber": 1 } }
 ```
+
+**Shared-tag mode.** When the server is started with
+`server.slideshow.sharedTags` (env `SLIDESHOW_SHARED_TAGS`) enabled, the
+active list index *and* the mod tags stop being per-channel: they become
+one global selection every channel shares regardless of `deviceId`. A
+`setTagList` / `setModTags` from any session reselects for all displays
+at once, and each channel clears+refills so they converge on the same
+query. The per-channel selection is bypassed entirely. This is **not**
+`displaySync`: `displaySync` merges the *playback frames* (every display
+shows the same image in lockstep) while leaving each channel's query
+independent; shared-tag mode shares only the *query selection* — each
+channel still runs its own queue, interval, cursor, and readiness
+barrier, so displays show different images drawn from the same tag set.
+The option is hot-reloadable. The `displaySync` driver-channel guard
+still applies: while a merge is active, only driver-channel sessions can
+change the shared selection.
 
 ### `block`
 Add a post id to the persistent blocklist.
