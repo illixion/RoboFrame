@@ -266,14 +266,17 @@ function createOrchestrator({
         } catch (_) { /* socket gone */ }
     }
 
-    // Intersect every session's `ratio:"lo..hi"` advert into a single range
-    // for the channel. Sessions without a ratio claim are unconstrained and
-    // contribute nothing — the intersection narrows only when every session
-    // on the channel has one. Returns null if there's no constraint or the
-    // intersection collapses to empty (latter falls back to no filter so
-    // the channel doesn't deadlock on conflicting clients).
+    // Pick a single session's `ratio:"lo..hi"` advert for the channel: the
+    // one whose range is centered closest to square (1.0). Each client sends
+    // a window around its own aspect ratio (width/height), so on a channel
+    // with mixed-orientation windows — a landscape and a portrait, say —
+    // intersecting their ranges would collapse to empty and drop the filter
+    // entirely. Choosing the most-square advertiser instead keeps a usable
+    // constraint that crops acceptably on every window. Sessions without a
+    // ratio claim are unconstrained and don't participate; returns null when
+    // none advertise one.
     function channelRatioClause(channel) {
-        let lo = -Infinity, hi = Infinity, any = false;
+        let best = null, bestDist = Infinity;
         for (const sess of channel.sessions.values()) {
             const raw = sess.params && sess.params.ratio;
             if (typeof raw !== 'string') continue;
@@ -281,12 +284,14 @@ function createOrchestrator({
             if (!m) continue;
             const sLo = Number(m[1]), sHi = Number(m[2]);
             if (!Number.isFinite(sLo) || !Number.isFinite(sHi) || sLo > sHi) continue;
-            any = true;
-            if (sLo > lo) lo = sLo;
-            if (sHi < hi) hi = sHi;
+            const dist = Math.abs((sLo + sHi) / 2 - 1);
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = { lo: sLo, hi: sHi };
+            }
         }
-        if (!any || lo > hi) return null;
-        return `ratio:${lo.toFixed(2)}..${hi.toFixed(2)}`;
+        if (!best) return null;
+        return `ratio:${best.lo.toFixed(2)}..${best.hi.toFixed(2)}`;
     }
 
     function buildQuery(channel) {

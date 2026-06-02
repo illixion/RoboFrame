@@ -45,6 +45,17 @@ to join the **channel** for its `deviceId`. Two sessions on the same
 lockstep on the same image. Different `deviceId`s get independent
 channels with independent queues, intervals, and tag lists.
 
+Channel-wide params are not per-session: `interval`, `modTags`, and the
+active tag list are last-writer-wins across the sessions sharing a
+channel, and `ratio` is resolved to a single constraint — the channel
+adopts the advertised range whose center is closest to square (1.0).
+Each client sends a window around its own aspect ratio, so on a channel
+mixing orientations (a landscape window and a portrait one, say) the
+most-square advertiser wins rather than the ranges being intersected
+into nothing. Per-session params that *do* stay independent are the
+render-only ones the server applies when serving each session's image
+(`width`, `height`, `bright`, `convert`).
+
 A WebSocket that *never* sends `slideshowConfig` (e.g., node-display) has
 no sessions — it can still send `visibility`, `reportDisplay`, etc. to
 drive hardware state, but it isn't expected to render images and is

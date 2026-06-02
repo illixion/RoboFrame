@@ -8,14 +8,18 @@ const { createOrchestrator } = require('../lib/orchestrator');
 
 function makeFakeSearch(pages) {
     let call = 0;
+    const queries = [];
     return {
-        async runSearch() {
+        async runSearch({ q } = {}) {
+            queries.push(q);
             const page = pages[Math.min(call, pages.length - 1)];
             call += 1;
             return page;
         },
         clearCache() { call = 0; },
         get callCount() { return call; },
+        get queries() { return queries; },
+        get lastQuery() { return queries[queries.length - 1]; },
     };
 }
 
@@ -622,4 +626,40 @@ test('setTagList changes only the sender channel; other channels keep their list
     const bLast = b.sent.filter((m) => m.action === 'playback').pop();
     assert.equal(aLast.payload.currentList, 1);
     assert.equal(bLast.payload.currentList, 0);
+});
+
+test('channel ratio clause adopts the most-square advertiser, not the intersection', async (t) => {
+    const queries = [];
+    const search = {
+        runSearch({ q }) {
+            queries.push(q);
+            return Promise.resolve({ results: [{ _id: 1, file_ext: 'jpg' }, { _id: 2, file_ext: 'jpg' }], nextCursor: 0 });
+        },
+        clearCache() {},
+    };
+    const orch = withDefaultSession(createOrchestrator({
+        search,
+        broadcast: () => {},
+        getCurrentTagsList: () => 0,
+        getTagLists: () => [[]],
+    }));
+    t.after(() => orch.close());
+    // A 16:9 landscape window (mid 1.78) and a near-square window (mid 1.0)
+    // on one deviceId. Intersecting these would collapse to empty; the
+    // channel should instead pick the squarer advertiser's range.
+    const landscape = makeFakeWs();
+    const squareish = makeFakeWs();
+    orch.register(landscape, { deviceId: 'screen1', interval: 5000, ratio: '1.51..2.04' });
+    orch.register(squareish, { deviceId: 'screen1', interval: 5000, ratio: '0.80..1.20' });
+    await tick(); await tick(); await tick();
+
+    queries.length = 0;
+    orch.requestReshuffle(landscape); // rebuild the query with both sessions present
+    await tick(); await tick();
+
+    assert.ok(queries.length >= 1, 'reshuffle should rebuild the query');
+    assert.ok(queries.every((q) => /ratio:0\.80\.\.1\.20/.test(q)),
+        'channel should adopt the most-square advertiser\'s range');
+    assert.ok(!queries.some((q) => /ratio:1\.51/.test(q)),
+        'the landscape range must not win over the squarer one');
 });
