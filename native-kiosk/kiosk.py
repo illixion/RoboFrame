@@ -43,7 +43,6 @@ import sys
 import threading
 import time
 import urllib.parse
-from math import gcd
 from pathlib import Path
 
 import pygame
@@ -406,8 +405,10 @@ class Kiosk:
 
     def _send_slideshow_config(self):
         w, h = self.size
-        g = gcd(w, h) or 1
-        ratio = f"{w // g}:{h // g}"
+        # Advertise the raw aspect ratio (width/height); the server expands it
+        # into its ratio:lo..hi query window. A "W:H" string never matched the
+        # server's numeric parser and was silently ignored.
+        ratio = round(w / h, 4) if h else None
         self.conn.send({
             "sessionId": KIOSK_SESSION_ID,
             "action": "slideshowConfig",

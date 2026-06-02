@@ -50,10 +50,12 @@ export function getScreenSize() {
     };
 }
 
-export function calculateDisplayRatioRange(width, height) {
+// Advertise the display's raw aspect ratio (width/height). The server owns
+// the matching tolerance and expands this into a `ratio:lo..hi` query range,
+// so the client doesn't bake in a window of its own.
+export function calculateDisplayRatio(width, height) {
     const ratio = width / height;
-    const range = ratio * 0.15;
-    return `${(ratio - range).toFixed(2)}..${(ratio + range).toFixed(2)}`;
+    return Number.isFinite(ratio) && ratio > 0 ? Number(ratio.toFixed(4)) : null;
 }
 
 import { isNightLightActive } from './nightlight.js';
@@ -70,7 +72,7 @@ export function getRenderParams() {
         bright: (manualBright || isNightLightActive()) ? 1 : 0,
         convert: Number(params.convert) ? 1 : 0,
         lowmem: Number(params.lowmem) === 1 ? 1 : 0,
-        ratio: Number(params.ratio) ? calculateDisplayRatioRange(width, height) : null,
+        ratio: Number(params.ratio) ? calculateDisplayRatio(width, height) : null,
     };
 }
 

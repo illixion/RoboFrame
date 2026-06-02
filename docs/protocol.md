@@ -48,11 +48,11 @@ channels with independent queues, intervals, and tag lists.
 Channel-wide params are not per-session: `interval`, `modTags`, and the
 active tag list are last-writer-wins across the sessions sharing a
 channel, and `ratio` is resolved to a single constraint — the channel
-adopts the advertised range whose center is closest to square (1.0).
-Each client sends a window around its own aspect ratio, so on a channel
-mixing orientations (a landscape window and a portrait one, say) the
-most-square advertiser wins rather than the ranges being intersected
-into nothing. Per-session params that *do* stay independent are the
+adopts the advert whose aspect is closest to square (1.0) and expands
+it into the query window. So on a channel mixing orientations (a
+landscape window and a portrait one, say) the most-square advertiser
+wins rather than the ranges being intersected into nothing. Per-session
+params that *do* stay independent are the
 render-only ones the server applies when serving each session's image
 (`width`, `height`, `bright`, `convert`).
 
@@ -113,7 +113,7 @@ Joins this session to the channel for `deviceId`. Send on every
 { "sessionId": "win1", "action": "slideshowConfig", "payload": {
   "deviceId": "screen1",
   "interval": 15000,
-  "ratio": "1.32..1.79",
+  "ratio": 1.778,
   "width": 1920,
   "height": 1080,
   "bright": false,
@@ -127,17 +127,18 @@ Joins this session to the channel for `deviceId`. Send on every
 - `modTags` is optional; when present, the orchestrator's first refill
   query already includes them — without that the initial query is
   discarded a few ms later when a separate `setModTags` arrives.
-- `ratio` is optional; when present it's a numeric `"lo..hi"` range
-  (image aspect = width/height) that the orchestrator folds into the
-  channel query as a `ratio:lo..hi` clause. The web kiosk computes a
-  `±15%` window around its viewport aspect (see
-  `public/modules/config.js:calculateDisplayRatioRange`); other clients
-  should do the same so the server can pick posts that suit the panel.
-  Multiple sessions on the same channel are intersected — if the
-  intersection is empty the channel falls back to no ratio filter
-  rather than deadlocking on conflicting clients. Re-send
-  `slideshowConfig` with a new `ratio` to trigger a queue refill (e.g.
-  after a window resize).
+- `ratio` is optional and is the display's raw aspect (width/height) as
+  a number, e.g. `1.778` for 16:9. The server owns the tolerance: it
+  expands the value into a `ratio:lo..hi` query clause with a ±15%
+  window (so `1.778` becomes `ratio:1.51..2.04`) and picks posts that
+  suit the panel. A legacy `"lo..hi"` range *string* (and a numeric
+  string like `"1.778"`) is still accepted for back-compat — the range
+  form is used verbatim without re-expansion. When multiple sessions
+  share a channel the server keeps the single advert whose aspect is
+  closest to square (1.0) rather than intersecting them, so a channel
+  mixing a landscape and a portrait window still gets a usable filter
+  instead of none. Re-send `slideshowConfig` with a new `ratio` to
+  trigger a queue refill (e.g. after a window resize).
 - `bright`, `convert`, `lowmem`, `width`, `height` are the variant
   fingerprint the server uses for background pre-conversion of upcoming
   images. They must match the corresponding `/get?…` query parameters

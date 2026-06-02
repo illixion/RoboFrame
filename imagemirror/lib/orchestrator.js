@@ -266,10 +266,36 @@ function createOrchestrator({
         } catch (_) { /* socket gone */ }
     }
 
-    // Pick a single session's `ratio:"lo..hi"` advert for the channel: the
-    // one whose range is centered closest to square (1.0). Each client sends
-    // a window around its own aspect ratio (width/height), so on a channel
-    // with mixed-orientation windows — a landscape and a portrait, say —
+    // The ±window the server expands a bare aspect-ratio advert into. Clients
+    // send their raw `width/height`; the server owns the tolerance so it can
+    // be tuned in one place without reshipping every client.
+    const RATIO_WINDOW = 0.15;
+
+    // Resolve a session's ratio advert into { center, lo, hi }. The preferred
+    // form is a bare aspect-ratio number (e.g. 1.78) which the server expands
+    // by ±RATIO_WINDOW. A legacy `"lo..hi"` range string is honored as-is —
+    // its window was already baked in by an older client. Returns null for a
+    // missing or malformed advert.
+    function parseRatioAdvert(raw) {
+        const expand = (r) => ({ center: r, lo: r * (1 - RATIO_WINDOW), hi: r * (1 + RATIO_WINDOW) });
+        if (typeof raw === 'number') {
+            return Number.isFinite(raw) && raw > 0 ? expand(raw) : null;
+        }
+        if (typeof raw !== 'string') return null;
+        const m = raw.match(/^(-?\d+(?:\.\d+)?)\.\.(-?\d+(?:\.\d+)?)$/);
+        if (m) {
+            const lo = Number(m[1]), hi = Number(m[2]);
+            if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo > hi) return null;
+            return { center: (lo + hi) / 2, lo, hi };
+        }
+        const num = Number(raw);
+        return Number.isFinite(num) && num > 0 ? expand(num) : null;
+    }
+
+    // Pick a single session's ratio advert for the channel: the one whose
+    // range is centered closest to square (1.0). Each client sends a window
+    // around its own aspect ratio (width/height), so on a channel with
+    // mixed-orientation windows — a landscape and a portrait, say —
     // intersecting their ranges would collapse to empty and drop the filter
     // entirely. Choosing the most-square advertiser instead keeps a usable
     // constraint that crops acceptably on every window. Sessions without a
@@ -278,16 +304,12 @@ function createOrchestrator({
     function channelRatioClause(channel) {
         let best = null, bestDist = Infinity;
         for (const sess of channel.sessions.values()) {
-            const raw = sess.params && sess.params.ratio;
-            if (typeof raw !== 'string') continue;
-            const m = raw.match(/^(-?\d+(?:\.\d+)?)\.\.(-?\d+(?:\.\d+)?)$/);
-            if (!m) continue;
-            const sLo = Number(m[1]), sHi = Number(m[2]);
-            if (!Number.isFinite(sLo) || !Number.isFinite(sHi) || sLo > sHi) continue;
-            const dist = Math.abs((sLo + sHi) / 2 - 1);
+            const adv = parseRatioAdvert(sess.params && sess.params.ratio);
+            if (!adv) continue;
+            const dist = Math.abs(adv.center - 1);
             if (dist < bestDist) {
                 bestDist = dist;
-                best = { lo: sLo, hi: sHi };
+                best = adv;
             }
         }
         if (!best) return null;

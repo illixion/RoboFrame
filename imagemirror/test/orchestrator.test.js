@@ -628,7 +628,7 @@ test('setTagList changes only the sender channel; other channels keep their list
     assert.equal(bLast.payload.currentList, 0);
 });
 
-test('channel ratio clause adopts the most-square advertiser, not the intersection', async (t) => {
+function ratioHarness(t) {
     const queries = [];
     const search = {
         runSearch({ q }) {
@@ -644,6 +644,11 @@ test('channel ratio clause adopts the most-square advertiser, not the intersecti
         getTagLists: () => [[]],
     }));
     t.after(() => orch.close());
+    return { orch, queries };
+}
+
+test('channel ratio clause adopts the most-square advertiser, not the intersection (legacy range strings)', async (t) => {
+    const { orch, queries } = ratioHarness(t);
     // A 16:9 landscape window (mid 1.78) and a near-square window (mid 1.0)
     // on one deviceId. Intersecting these would collapse to empty; the
     // channel should instead pick the squarer advertiser's range.
@@ -662,4 +667,40 @@ test('channel ratio clause adopts the most-square advertiser, not the intersecti
         'channel should adopt the most-square advertiser\'s range');
     assert.ok(!queries.some((q) => /ratio:1\.51/.test(q)),
         'the landscape range must not win over the squarer one');
+});
+
+test('bare float ratio advert is expanded ±15% server-side; squarest wins', async (t) => {
+    const { orch, queries } = ratioHarness(t);
+    const landscape = makeFakeWs();
+    const squareish = makeFakeWs();
+    // Clients now send their raw aspect ratio; the server applies the window.
+    orch.register(landscape, { deviceId: 'screen1', interval: 5000, ratio: 1.78 });
+    orch.register(squareish, { deviceId: 'screen1', interval: 5000, ratio: 1.0 });
+    await tick(); await tick(); await tick();
+
+    queries.length = 0;
+    orch.requestReshuffle(landscape);
+    await tick(); await tick();
+
+    assert.ok(queries.length >= 1, 'reshuffle should rebuild the query');
+    // 1.0 is squarest → expanded to 0.85..1.15.
+    assert.ok(queries.every((q) => /ratio:0\.85\.\.1\.15/.test(q)),
+        'square float advert should be expanded by ±15% and win');
+    assert.ok(!queries.some((q) => /ratio:1\.51/.test(q)),
+        'the landscape float must not win over the squarer one');
+});
+
+test('numeric-string and float ratio adverts are treated identically', async (t) => {
+    const { orch, queries } = ratioHarness(t);
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 5000, ratio: '1.50' });
+    await tick(); await tick(); await tick();
+
+    queries.length = 0;
+    orch.requestReshuffle(ws);
+    await tick(); await tick();
+
+    // 1.50 expanded ±15% → 1.275..1.725, formatted to 2dp as 1.27..1.72.
+    assert.ok(queries.every((q) => /ratio:1\.27\.\.1\.72/.test(q)),
+        'a numeric string advert should expand like a bare float');
 });
