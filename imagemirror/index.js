@@ -596,7 +596,16 @@ let searchRef = null;
 
 // Connect to DuckDB
 const DUCKDB_PATH = pickEnv('DUCKDB_PATH', srv.duckdbPath, 'posts.duckdb');
-const RANDOM_RANK_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+// How often the in-memory random_ranks table (random ordering + per-post
+// display_count) is rebuilt from scratch — reshuffling the deck and zeroing
+// view counts so the slideshow doesn't ossify around the same images.
+// Configurable in hours; `0` (or any non-positive / non-finite value)
+// disables the periodic rebuild entirely, leaving the ranks created at
+// startup in place until the next manual reshuffle.
+const RANDOM_RANK_REFRESH_HOURS = pickEnv('RANDOM_RANK_REFRESH_HOURS', srv.slideshow?.rankRefreshHours, 24, { type: 'number' });
+const RANDOM_RANK_REFRESH_INTERVAL_MS = RANDOM_RANK_REFRESH_HOURS > 0
+  ? RANDOM_RANK_REFRESH_HOURS * 60 * 60 * 1000
+  : 0;
 
 // In-memory DB is the main connection
 const memDb = new duckdb.Database(':memory:');
@@ -636,7 +645,12 @@ async function refreshRandomRanks() {
     await attachReadOnlyFileDb();
     await refreshRandomRanks();
 
-    setInterval(refreshRandomRanks, RANDOM_RANK_REFRESH_INTERVAL_MS);
+    if (RANDOM_RANK_REFRESH_INTERVAL_MS > 0) {
+      setInterval(refreshRandomRanks, RANDOM_RANK_REFRESH_INTERVAL_MS);
+      console.log(`random_ranks refresh scheduled every ${RANDOM_RANK_REFRESH_HOURS}h`);
+    } else {
+      console.log('random_ranks periodic refresh disabled (rankRefreshHours <= 0)');
+    }
 
     // The server is the single DuckDB reader. It feeds the slideshow
     // orchestrator, which broadcasts a `playback` channel over WebSocket

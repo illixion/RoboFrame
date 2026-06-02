@@ -20,9 +20,13 @@
     "djxlPath": "djxl",
     "chunkSize": 0,
     "slideshow": {
-      "_comment": "Slideshow orchestrator tunables. Hot-reloaded: editing these in roboframe.config.json takes effect without a server restart.",
+      "_comment": "Slideshow orchestrator tunables. Most are hot-reloaded: editing them in roboframe.config.json takes effect without a server restart (see each key's comment for exceptions).",
       "ratioWindow": 0.15,
-      "_ratioWindowComment": "Aspect-ratio match tolerance. Clients advertise their raw width/height; the server expands it by ±this fraction into the ratio:lo..hi query window (0.15 = ±15%, so a 1.78 display matches 1.51..2.04). Larger = looser cropping match / more candidate images; smaller = stricter. Range (0,1); invalid values fall back to 0.15. Env override: SLIDESHOW_RATIO_WINDOW."
+      "_ratioWindowComment": "Aspect-ratio match tolerance. Clients advertise their raw width/height; the server expands it by ±this fraction into the ratio:lo..hi query window (0.15 = ±15%, so a 1.78 display matches 1.51..2.04). Larger = looser cropping match / more candidate images; smaller = stricter. Range (0,1); invalid values fall back to 0.15. Env override: SLIDESHOW_RATIO_WINDOW.",
+      "sharedTags": false,
+      "_sharedTagsComment": "When true, the active tag-list index and mod tags become one global selection every channel shares regardless of deviceId — a setTagList/setModTags from any session reselects for all displays at once. Distinct from displaySync (which merges playback frames but leaves each channel's query independent). Hot-reloaded. Env override: SLIDESHOW_SHARED_TAGS.",
+      "rankRefreshHours": 24,
+      "_rankRefreshHoursComment": "How often (hours) the in-memory random_ranks table is rebuilt — reshuffling the random ordering and zeroing every post's view count so the slideshow keeps cycling fresh material. Set to 0 (or any non-positive value) to disable the periodic rebuild entirely; ranks built at startup then persist until a manual reshuffle. Applied at startup, NOT hot-reloaded. Env override: RANDOM_RANK_REFRESH_HOURS."
     },
     "ha": {
       "_comment": "Read-only sensor forwarder. With url+token set, the broker subscribes to the listed HA entities and pushes their state to kiosks via the `update` action so the frontend can render outdoor temperature, humidity, etc. Set enabled:false to force-disable.",

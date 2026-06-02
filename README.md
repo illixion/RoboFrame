@@ -191,6 +191,7 @@ The merged Node server: image API + WebSocket broker + optional Home Assistant b
 | — | `server.mqtt.discoveryPrefix` | `homeassistant` | HA MQTT-discovery topic prefix |
 | — | `server.mqtt.topicPrefix` | `roboframe` | Per-device state/command topic prefix |
 | `SLIDESHOW_RATIO_WINDOW` | `server.slideshow.ratioWindow` | `0.15` | ±tolerance the orchestrator expands a client's raw aspect ratio into when matching posts. Hot-reloaded. |
+| `RANDOM_RANK_REFRESH_HOURS` | `server.slideshow.rankRefreshHours` | `24` | How often (in hours) the in-memory `random_ranks` table is rebuilt — reshuffling the random ordering and zeroing every post's view count so the slideshow keeps cycling fresh material. Set to `0` (or any non-positive value) to **disable** the periodic rebuild entirely; the ranks built at startup then persist until a manual `reshuffle`. Applied at startup (not hot-reloaded). |
 | `SLIDESHOW_SHARED_TAGS` | `server.slideshow.sharedTags` | `false` | When `true`, the active tag-list index **and** the mod tags become one global selection shared by every channel regardless of `deviceId`: a `setTagList` / `setModTags` from any session reselects for all displays at once, and the per-channel state is bypassed. Distinct from `displaySync` (which merges *playback frames* but leaves each channel's query independent) — here only the *query selection* is shared, each channel still runs its own queue, interval, and cursor. Hot-reloaded. |
 
 ### Display daemon (`display.*`)
