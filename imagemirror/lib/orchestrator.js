@@ -168,6 +168,13 @@ function createOrchestrator({
             })(),
             interval: DEFAULT_INTERVAL_MS,
             currentId: null,
+            // Longest media duration (ms) any session reported for the
+            // current image via `imageReady`. Images report nothing; a video
+            // reports its clip length. The dwell time is max(interval,
+            // currentDurationMs) — a clip shorter than the interval loops
+            // until the interval elapses, a longer clip delays the advance
+            // until it has played through once. Reset to 0 on every commit.
+            currentDurationMs: 0,
             // Readiness barrier for the current image. expectedReady is
             // the set of sessionKeys snapshotted when we last advanced;
             // ready accumulates as those sessions send `imageReady`. Hidden
@@ -513,7 +520,12 @@ function createOrchestrator({
 
     function promoteToDisplaying(channel) {
         channel.phase = 'displaying';
-        channel.dwellDeadline = Date.now() + Math.max(MIN_INTERVAL_MS, channel.interval);
+        // A video longer than the interval delays the advance until it has
+        // played through; a shorter video (or any image) dwells for the
+        // configured interval. currentDurationMs is 0 unless a session
+        // reported a clip length via imageReady.
+        const dwell = Math.max(MIN_INTERVAL_MS, channel.interval, channel.currentDurationMs || 0);
+        channel.dwellDeadline = Date.now() + dwell;
         scheduleDwell(channel);
     }
 
@@ -597,6 +609,7 @@ function createOrchestrator({
     function commitCurrent(channel) {
         const current = channel.queue[0] || null;
         channel.currentId = current ? current.id : null;
+        channel.currentDurationMs = 0;
         clearReadiness(channel);
         channel.expectedReady = expectedReadersFor(channel);
         channel.dwellDeadline = null;
@@ -825,7 +838,7 @@ function createOrchestrator({
         commitCurrent(target);
     }
 
-    function notifyImageReady(ws, sessionId, id) {
+    function notifyImageReady(ws, sessionId, id, durationMs) {
         const key = sessionKeyOf(ws, sessionId);
         const sess = sessionsByKey.get(key);
         if (!sess) { dbg(`imageReady dropped: no session for key=${key} id=${id}`); return; }
@@ -841,6 +854,14 @@ function createOrchestrator({
         if (!target.expectedReady.has(key)) {
             dbg(`imageReady dropped: key=${key} not in expectedReady={${Array.from(target.expectedReady).join(',')}} on ${target.deviceId}`);
             return;
+        }
+        // Track the longest clip length reported for this image so the dwell
+        // (computed in promoteToDisplaying, which fires below on first-ready)
+        // can extend to cover a video that outruns the interval. Ignored for
+        // images, which don't send a duration.
+        const dur = Number(durationMs);
+        if (Number.isFinite(dur) && dur > 0) {
+            target.currentDurationMs = Math.max(target.currentDurationMs || 0, dur);
         }
         target.ready.add(key);
         dbg(`imageReady accepted: key=${key} id=${id} on ${target.deviceId} ready=${target.ready.size}/${target.expectedReady.size}`);

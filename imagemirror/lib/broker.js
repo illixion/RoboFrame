@@ -593,7 +593,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
             } else if (action === 'imageReady') {
                 if (!requireSessionId('imageReady')) return;
                 if (orchestrator && payload?.id != null) {
-                    orchestrator.notifyImageReady(ws, sessionId, payload.id);
+                    orchestrator.notifyImageReady(ws, sessionId, payload.id, payload.durationMs);
                 }
 
             } else if (action === 'setTagList') {

@@ -51,7 +51,7 @@ function withDefaultSession(orch) {
         setModTags: (ws, tags) => orch.setModTags(ws, sid(ws), tags),
         requestAdvance: (ws) => orch.requestAdvance(ws, sid(ws)),
         requestReshuffle: (ws) => orch.requestReshuffle(ws, sid(ws)),
-        notifyImageReady: (ws, id) => orch.notifyImageReady(ws, sid(ws), id),
+        notifyImageReady: (ws, id, durationMs) => orch.notifyImageReady(ws, sid(ws), id, durationMs),
         claimDisplaySync: (ws, enabled) => orch.claimDisplaySync(ws, sid(ws), enabled),
         notifyVisibility: (...args) => orch.notifyVisibility(...args),
         setTagList: (ws, listNumber) => orch.setTagList(ws, sid(ws), listNumber),
@@ -200,6 +200,56 @@ test('readiness barrier: first imageReady from any expected ws starts the dwell 
     orch.notifyImageReady(a, ch.currentId);
     assert.equal(ch.phase, 'displaying');
     assert.ok(ch.timer, 'dwell timer arms on the first imageReady');
+});
+
+test('imageReady durationMs longer than the interval extends the dwell to the clip length', async (t) => {
+    const { orch } = harness();
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 5000 });
+    await tick(); await tick(); await tick();
+    const ch = orch._channels.get('screen1');
+
+    // A 22s clip on a 5s interval: dwell must stretch to the clip length so
+    // the video plays through instead of being cut off after the interval.
+    orch.notifyImageReady(ws, ch.currentId, 22000);
+    assert.equal(ch.phase, 'displaying');
+    assert.ok(ch.dwellDeadline - Date.now() > 5000, 'dwell extended past the interval');
+    assert.ok(ch.dwellDeadline - Date.now() <= 22000);
+});
+
+test('imageReady durationMs shorter than the interval keeps the plain interval dwell', async (t) => {
+    const { orch } = harness();
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 5000 });
+    await tick(); await tick(); await tick();
+    const ch = orch._channels.get('screen1');
+
+    // A 2s clip loops until the 5s interval; the dwell stays at the interval.
+    orch.notifyImageReady(ws, ch.currentId, 2000);
+    assert.equal(ch.phase, 'displaying');
+    assert.ok(ch.dwellDeadline - Date.now() <= 5000);
+    assert.ok(ch.dwellDeadline - Date.now() > 2000, 'dwell not shrunk below the interval');
+});
+
+test('imageReady durationMs resets per image so a long clip does not stretch the next image', async (t) => {
+    const { orch } = harness();
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 5000 });
+    await tick(); await tick(); await tick();
+    const ch = orch._channels.get('screen1');
+
+    orch.notifyImageReady(ws, ch.currentId, 22000);
+    assert.equal(ch.currentDurationMs, 22000);
+    orch.requestAdvance(ws);
+    await tick(); await tick(); await tick();
+    assert.equal(ch.currentDurationMs, 0, 'duration cleared on commit');
+
+    // Next image is an ordinary image (no durationMs) → plain interval.
+    orch.notifyImageReady(ws, ch.currentId);
+    assert.ok(ch.dwellDeadline - Date.now() <= 5000, 'next image dwells for the interval, not the prior clip');
 });
 
 test('readiness barrier: a client leaving before reporting does not wedge the channel', async (t) => {

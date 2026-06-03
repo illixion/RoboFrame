@@ -226,7 +226,7 @@ export function crossfadeFullscreenMedia(container, newMediaUrl, postId, isVideo
     const nextLayer = container.querySelector('.fullscreen-layer.next');
     nextLayer.innerHTML = '';
 
-    const finishLoad = () => {
+    const finishLoad = (durationMs) => {
         if (renderToken !== currentRenderToken) return;
         if (nextLayer.children.length > 1) {
             console.error('More than one child in nextLayer:', nextLayer.children);
@@ -237,7 +237,10 @@ export function crossfadeFullscreenMedia(container, newMediaUrl, postId, isVideo
         // 15s dwell starts from render time, not render+crossfade time.
         // Holding this until the crossfade settles added ~1s of slop to
         // every cycle (15s interval → ~16s wall-clock cadence).
-        reportImageReady(postId);
+        // For videos we also report the clip length: the server dwells for
+        // max(interval, durationMs), so a clip longer than the interval
+        // delays the advance until it has played through.
+        reportImageReady(postId, durationMs);
         setTimeout(() => {
             if (renderToken !== currentRenderToken) return;
             state.currentPost = postId;
@@ -256,14 +259,20 @@ export function crossfadeFullscreenMedia(container, newMediaUrl, postId, isVideo
         const video = document.createElement('video');
         video.src = newMediaUrl;
         video.autoplay = true;
-        video.loop = true;
         video.muted = true;
         video.playsInline = true;
         video.classList.add('fullscreen-media');
         if (Number(params.noclock)) video.classList.add('alt-fit');
         video.onloadeddata = () => {
             if (renderToken !== currentRenderToken) return;
-            finishLoad();
+            const durSec = video.duration;
+            const durationMs = Number.isFinite(durSec) && durSec > 0 ? Math.round(durSec * 1000) : 0;
+            // Loop a clip that fits inside the dwell interval; let a longer
+            // clip play once and freeze on its last frame until the server
+            // advances (dwell ≈ duration). Looping a long clip would restart
+            // it just before the advance and flash the opening frame.
+            video.loop = durationMs === 0 || durationMs <= state.interval;
+            finishLoad(durationMs);
         };
         video.onerror = handleError;
         nextLayer.appendChild(video);
@@ -348,13 +357,15 @@ export function requestReshuffle() {
 // readiness barrier waits for every visible client on the channel before
 // starting the dwell timer, so without this report the channel stalls for
 // up to 10 s on its bad-network fallback.
-function reportImageReady(postId) {
+function reportImageReady(postId, durationMs) {
     if (!postId) return;
     if (state.socket && state.socket.readyState === WebSocket.OPEN) {
+        const payload = { id: postId };
+        if (Number.isFinite(durationMs) && durationMs > 0) payload.durationMs = durationMs;
         state.socket.send(JSON.stringify({
             sessionId: KIOSK_SESSION_ID,
             action: 'imageReady',
-            payload: { id: postId },
+            payload,
         }));
     }
 }

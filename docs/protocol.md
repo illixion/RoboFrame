@@ -158,6 +158,21 @@ Tell the server the channel's current image is fully on screen.
 { "sessionId": "win1", "action": "imageReady", "payload": { "id": 4181569 } }
 ```
 
+For a video, include the clip length in milliseconds so the server can
+size the dwell to the playback:
+
+```json
+{ "sessionId": "win1", "action": "imageReady", "payload": { "id": 4181569, "durationMs": 22000 } }
+```
+
+`durationMs` is optional and only meaningful for video. The dwell for the
+image is `max(interval, durationMs)`: a clip shorter than the interval
+loops until the interval elapses (set `video.loop = true`), a clip longer
+than the interval delays the advance until it has played through once
+(set `video.loop = false` so it doesn't restart just before the advance).
+Images omit it and dwell for the plain interval. The longest `durationMs`
+reported across the channel's sessions for the current image wins.
+
 The orchestrator's readiness barrier starts the dwell timer as soon as
 the **first** visible session on the channel reports for the current
 image — first-ready wins, not all-ready. When several clients share a
@@ -383,11 +398,13 @@ with `sessionIds: ["win1", ..., "win10"]`).
   streams them straight from disk (no resize, no transcode; `convert`,
   `bright`, `lowmem`, `width`, `height` are ignored) with
   `Accept-Ranges: bytes` and single-range support. Clients should
-  render with `<video autoplay loop muted playsInline>` pointed at the
+  render with `<video autoplay muted playsInline>` pointed at the
   `/get` URL directly — do **not** fetch-to-blob and reuse, the clip
   may be ~100 MB and is likely to be cut off mid-loop by the next
   playback tick. Fire `imageReady` on `loadeddata` (first frame
-  decoded), the same barrier as images.
+  decoded), the same barrier as images, and include `durationMs` (and
+  set `loop` to whether the clip is shorter than the interval — see
+  `imageReady` above) so a long clip plays through before the advance.
 - A new `current.id` is your cue to start loading. Send `imageReady`
   when the transition completes.
 - Clients MUST pause video playback when the display is off
