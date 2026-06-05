@@ -183,6 +183,29 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         return merged;
     }
 
+    // ----- Device telemetry (reportMetrics / reportLog) --------------------
+    // Append-only JSONL sink for client device telemetry, emitted by
+    // web frontend JS and Spatialshash slideshows. Kept separate from
+    // data.json — that file is hand-editable config; this is high-volume
+    // machine output. Rotated at ~5 MB to a single .1 backup so it can't
+    // grow unbounded. See docs/protocol.md `reportMetrics` / `reportLog`.
+    const telemetryPath = path.join(path.dirname(dataPath), 'telemetry.jsonl');
+    const TELEMETRY_MAX_BYTES = 5 * 1024 * 1024;
+    function appendTelemetry(kind, payload) {
+        try {
+            const line = JSON.stringify({ kind, recvTs: Date.now(), ...payload }) + '\n';
+            try {
+                const st = fs.statSync(telemetryPath);
+                if (st.size + Buffer.byteLength(line) > TELEMETRY_MAX_BYTES) {
+                    fs.renameSync(telemetryPath, telemetryPath + '.1');
+                }
+            } catch { /* not created yet — first write makes it */ }
+            fs.appendFileSync(telemetryPath, line);
+        } catch (err) {
+            console.warn(`Failed to append telemetry: ${err.message}`);
+        }
+    }
+
     ensureDataFile();
     // Snapshot used by the file watcher to dedupe broadcasts. Updated when
     // the broker writes its own changes (see saveBlockedIds) so the watcher
@@ -564,6 +587,30 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 if (typeof deviceId === 'string') {
                     attachDeviceId(ws, deviceId);
                     mqtt.publishWebcam(deviceId, { state: payload.state });
+                }
+
+            } else if (action === 'reportMetrics') {
+                // Device → broker: periodic process-wide memory/state sample
+                // (web kiosk JS errors or Spatialstash). Appended to telemetry.jsonl
+                // for diagnosing multi-window slideshow memory pressure during
+                // live playback. Not part of the slideshow loop.
+                const deviceId = payload?.deviceId;
+                if (typeof deviceId === 'string') {
+                    attachDeviceId(ws, deviceId);
+                    appendTelemetry('metrics', payload);
+                }
+
+            } else if (action === 'reportLog') {
+                // Device → broker: event-driven diagnostic log line (memory
+                // warnings, working-set trims, oversized-decode guard hits).
+                // Paired with reportMetrics; appended to telemetry.jsonl and
+                // echoed to stdout so it shows up alongside server logs.
+                const deviceId = payload?.deviceId;
+                if (typeof deviceId === 'string') {
+                    attachDeviceId(ws, deviceId);
+                    appendTelemetry('log', payload);
+                    const lvl = String(payload?.level || 'info');
+                    console.log(`[device ${deviceId}] ${lvl}: ${payload?.message || ''}`);
                 }
 
             } else if (action === 'slideshowConfig') {

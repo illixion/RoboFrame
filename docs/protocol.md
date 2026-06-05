@@ -339,6 +339,53 @@ commands and effect actions (`playVideo`, `showText`, `playAudio`,
 `setSuppress { target, state }` — sent by the broker when HA writes the
 switch's command topic.
 
+### `reportMetrics`, `reportLog` (connection-wide, optional)
+Device telemetry for diagnostics — emitted by Spatialstash when its Console
+developer toggle is on (quasi-dev-mode), not by default. Both are
+connection-wide (no `sessionId`) and the broker appends them to an
+append-only `imagemirror/telemetry.jsonl` (rotated at ~5 MB to a single `.1`
+backup). They are **not** part of the slideshow loop and never rebroadcast.
+
+`reportMetrics` is a periodic process-wide sample (~every 7 s while a viewer
+is connected). It exists to catch the memory ramp that precedes an
+out-of-memory jetsam *during live playback* — post-mortem device logs only
+show the app already trimmed/suspended.
+
+```json
+{ "action": "reportMetrics", "payload": {
+  "deviceId": "vision1",
+  "app": "spatialstash",
+  "footprintMB": 1840,
+  "availableMB": 920,
+  "gpuMB": 1420,
+  "photoWindows": 2,
+  "slideshowWindows": 3,
+  "gpuHigh": false,
+  "ts": 1700000000000
+}}
+```
+
+- `footprintMB` — `task_vm_info.phys_footprint` (what jetsam judges).
+- `availableMB` — `os_proc_available_memory()` (headroom to the per-process limit).
+- `gpuMB` — Metal `currentAllocatedSize` (GPU-private textures).
+- `gpuHigh` — whether the client's oversized-decode / server-convert heuristic
+  considers the device pressured.
+- `ts` — client wall-clock (ms since epoch); the broker also stamps `recvTs`.
+
+`reportLog` is an event-driven line (memory warnings, working-set trims,
+oversized-decode guard hits). The broker appends it and echoes it to stdout.
+
+```json
+{ "action": "reportLog", "payload": {
+  "deviceId": "vision1",
+  "app": "spatialstash",
+  "level": "warning",
+  "domain": "memory",
+  "message": "Memory warning — trimmed 3 slideshow window(s), 2 photo window(s)",
+  "ts": 1700000000000
+}}
+```
+
 ### `getDisplayState`, `ping`
 Diagnostics. `getDisplayState { target: "<deviceId>" }` echoes the
 cached `displayState` frame for that device (its `state`, including a
