@@ -374,6 +374,10 @@ show the app already trimmed/suspended.
 
 `reportLog` is an event-driven line (memory warnings, working-set trims,
 oversized-decode guard hits). The broker appends it and echoes it to stdout.
+The web kiosk also emits it for uncaught JS errors / unhandled promise
+rejections (`domain: "js" | "promise" | "resource"`, `app: "roboframe-web"`),
+rate-limited and deduped per page load — so a headless kiosk's frontend
+crashes are visible without a console attached.
 
 ```json
 { "action": "reportLog", "payload": {

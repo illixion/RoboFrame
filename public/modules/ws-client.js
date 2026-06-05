@@ -39,6 +39,60 @@ function showFatalBanner(text) {
 // per-window ids; the kiosk only ever has one slideshow per page.
 export const KIOSK_SESSION_ID = 'main';
 
+// --- Client error reporting -------------------------------------------
+// Forward uncaught JS errors / promise rejections to the broker's reportLog
+// sink (telemetry.jsonl) so frontend crashes on headless kiosks are visible
+// without a console attached. Rate-limited and deduped so a tight error loop
+// can't flood the socket or the log file, and buffered until the socket opens
+// so early-boot errors aren't lost.
+const ERROR_APP_NAME = 'roboframe-web';
+let errorBudget = 20;            // max distinct reports per page load
+const seenErrors = new Set();    // dedupe identical messages
+const pendingLogs = [];          // buffered until the socket is OPEN
+
+export function reportLog(level, domain, message) {
+    const payload = {
+        deviceId: state.deviceID || 'web',
+        app: ERROR_APP_NAME,
+        level,
+        domain,
+        message: String(message).slice(0, 2000),
+        ts: Date.now(),
+    };
+    if (state.socket && state.socket.readyState === WebSocket.OPEN) {
+        state.socket.send(JSON.stringify({ action: 'reportLog', payload }));
+    } else if (pendingLogs.length < 50) {
+        pendingLogs.push(payload);
+    }
+}
+
+function reportClientError(level, domain, message) {
+    if (errorBudget <= 0) return;
+    const key = `${domain}:${message}`;
+    if (seenErrors.has(key)) return;
+    seenErrors.add(key);
+    errorBudget--;
+    reportLog(level, domain, message);
+}
+
+// Capture phase so resource-load failures (img/script with no bubbling error)
+// are caught too. Registered once at module load — not per-connect — so
+// reconnects don't stack duplicate listeners.
+window.addEventListener('error', (event) => {
+    if (event.error || event.message) {
+        const where = event.filename ? ` (${event.filename}:${event.lineno}:${event.colno})` : '';
+        reportClientError('error', 'js', `${event.message || event.error}${where}`);
+    } else if (event.target && event.target.src) {
+        reportClientError('warning', 'resource', `Failed to load ${event.target.src}`);
+    }
+}, true);
+
+window.addEventListener('unhandledrejection', (event) => {
+    const reason = event.reason;
+    const msg = reason?.stack || reason?.message || String(reason);
+    reportClientError('error', 'promise', msg);
+});
+
 function sendSlideshowConfig() {
     const r = getRenderParams();
     state.socket.send(JSON.stringify({
@@ -94,6 +148,10 @@ export function connectWebSocket() {
                 action: 'getDisplayState',
                 payload: { target: state.deviceID },
             }));
+        }
+        // Flush any error reports captured before the socket was open.
+        while (pendingLogs.length) {
+            state.socket.send(JSON.stringify({ action: 'reportLog', payload: pendingLogs.shift() }));
         }
     });
 
