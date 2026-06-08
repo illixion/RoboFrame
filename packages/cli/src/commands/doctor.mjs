@@ -31,7 +31,7 @@ export async function run(argv) {
     const dbPath = resolve(values.db ?? './posts.duckdb');
     if (!existsSync(dbPath)) throw new Error(`No such file: ${dbPath}`);
 
-    const handle = open(dbPath);
+    const handle = await open(dbPath);
     try {
         const tables = (await handle.all(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'`))
             .map((r) => r.table_name);

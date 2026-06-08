@@ -74,7 +74,7 @@ export async function run(argv) {
     console.log(`Folders:   ${useFolders ? 'on' : 'off'}    Sidecars: ${useSidecar ? 'on' : 'off'}    Videos: ${includeVideos ? (hasFfprobe() ? 'on' : 'on (no ffprobe!)') : 'off'}`);
     console.log(`Extensions: ${extensions.join(', ')}`);
 
-    const handle = dryRun ? null : open(dbPath);
+    const handle = dryRun ? null : await open(dbPath);
     if (handle) await ensureSchema(handle);
 
     let knownPaths = new Set();

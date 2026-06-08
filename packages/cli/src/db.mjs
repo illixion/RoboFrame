@@ -1,22 +1,53 @@
-import { promisify } from 'node:util';
-import duckdb from 'duckdb';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { DuckDBInstance } from '@duckdb/node-api';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCHEMA_DIR = join(__dirname, '..', 'sql');
 
-export function open(path) {
-    const db = new duckdb.Database(path);
-    const conn = db.connect();
-    const run = promisify(conn.run.bind(conn));
-    const all = promisify(conn.all.bind(conn));
-    const exec = promisify(conn.exec.bind(conn));
+// Normalize @duckdb/node-api values into plain JS for ergonomic consumers:
+//   - BIGINT/HUGEINT arrive as BigInt; ids and counts here are small, so coerce
+//     to Number (matches the behavior the old `duckdb` package gave us).
+//   - LIST values (e.g. tags VARCHAR[]) arrive as { items: [...] }; unwrap to a
+//     plain array.
+function normalize(value) {
+    if (typeof value === 'bigint') return Number(value);
+    if (value && typeof value === 'object' && Array.isArray(value.items)) {
+        return value.items.map(normalize);
+    }
+    return value;
+}
+
+// Open a DuckDB file (or ':memory:') and return a small handle whose methods
+// mirror the old promisified shape: all()/run()/exec()/close(). Async now,
+// because the neo API creates the instance and connection asynchronously.
+export async function open(path) {
+    const instance = await DuckDBInstance.create(path);
+    const connection = await instance.connect();
+
+    const all = async (sql) => {
+        const reader = await connection.runAndReadAll(sql);
+        return reader.getRowObjects().map((row) => {
+            const out = {};
+            for (const key of Object.keys(row)) out[key] = normalize(row[key]);
+            return out;
+        });
+    };
+    // The neo API's run() executes one or more ';'-separated statements, so it
+    // covers both single statements and the multi-statement migration file that
+    // ensureSchema feeds through exec().
+    const run = async (sql) => { await connection.run(sql); };
+
     return {
-        db, conn, run, all, exec,
+        instance,
+        connection,
+        run,
+        exec: run,
+        all,
         async close() {
-            await new Promise((resolve, reject) => db.close((err) => err ? reject(err) : resolve()));
+            connection.closeSync();
+            instance.closeSync();
         },
     };
 }

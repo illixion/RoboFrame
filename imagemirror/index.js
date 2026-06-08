@@ -7,7 +7,7 @@ const axios = require('axios');
 const cookieParser = require('cookie-parser');
 const sharp = require('sharp');
 const { spawn } = require('child_process');
-const duckdb = require('duckdb');
+const { DuckDBInstance } = require('@duckdb/node-api');
 const bodyParser = require("body-parser");
 const cors = require('cors');
 const zlib = require('zlib');
@@ -607,9 +607,46 @@ const RANDOM_RANK_REFRESH_INTERVAL_MS = RANDOM_RANK_REFRESH_HOURS > 0
   ? RANDOM_RANK_REFRESH_HOURS * 60 * 60 * 1000
   : 0;
 
-// In-memory DB is the main connection
-const memDb = new duckdb.Database(':memory:');
-const db = memDb.connect();
+// Unwrap @duckdb/node-api list values (DuckDBListValue { items: [...] }) into
+// plain JS arrays, matching how the old `duckdb` package returned VARCHAR[]
+// columns like `tags`. BIGINT columns are left as BigInt — callers already
+// handle that via Number()/bigint JSON replacers, so behavior is unchanged.
+function normalizeValue(v) {
+  if (v && typeof v === 'object' && Array.isArray(v.items)) return v.items.map(normalizeValue);
+  return v;
+}
+function normalizeRow(row) {
+  const out = {};
+  for (const k of Object.keys(row)) out[k] = normalizeValue(row[k]);
+  return out;
+}
+
+// Callback-compatible shim over a neo-API connection, preserving the
+// db.run(sql, cb) and db.all(sql, [params], cb) signatures that the rest of
+// this file — and lib/searchQuery.js, plus its test stubs — depend on.
+function wrapConnection(connection) {
+  return {
+    connection,
+    run(sql, cb) {
+      connection.run(sql).then(() => cb && cb(null), (err) => cb && cb(err));
+    },
+    all(sql, paramsOrCb, maybeCb) {
+      const cb = typeof paramsOrCb === 'function' ? paramsOrCb : maybeCb;
+      const params = typeof paramsOrCb === 'function' ? undefined : paramsOrCb;
+      const reader = params === undefined
+        ? connection.runAndReadAll(sql)
+        : connection.runAndReadAll(sql, params);
+      reader.then(
+        (r) => cb && cb(null, r.getRowObjects().map(normalizeRow)),
+        (err) => cb && cb(err),
+      );
+    },
+  };
+}
+
+// In-memory DB is the main connection; assigned in the async init IIFE below
+// once the neo-API instance + connection are open (both are created async).
+let db;
 
 async function attachReadOnlyFileDb() {
   return new Promise((resolve, reject) => {
@@ -642,6 +679,8 @@ async function refreshRandomRanks() {
 
 (async () => {
   try {
+    const instance = await DuckDBInstance.create(':memory:');
+    db = wrapConnection(await instance.connect());
     await attachReadOnlyFileDb();
     await refreshRandomRanks();
 
