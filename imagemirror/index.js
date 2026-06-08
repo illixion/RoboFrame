@@ -51,7 +51,7 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 
 app.use(cookieParser());
 
-app.use(['/get', '/save', '/history', '/history.json', '/addtohistory', '/post', '/search', '/count', '/custom_page', '/rpc/tags.json'], requireToken);
+app.use(['/get', '/save', '/history', '/history.json', '/addtohistory', '/post', '/search', '/random', '/count', '/custom_page', '/rpc/tags.json'], requireToken);
 
 // Folder of user-supplied HTML files surfaced by /custom_page (P key
 // "custom page" mode on the kiosk). Per-install, gitignored — see README.
@@ -593,6 +593,7 @@ async function processRequestV2(req, res) {
 }
 
 let searchRef = null;
+let brokerRef = null;
 
 // Connect to DuckDB
 const DUCKDB_PATH = pickEnv('DUCKDB_PATH', srv.duckdbPath, 'posts.duckdb');
@@ -718,7 +719,7 @@ async function refreshRandomRanks() {
     // /get arriving mid-compute shares the same promise.
     const prefetchVariant = (parts) =>
       imageCache.getOrCompute(parts, () => computeVariant(parts));
-    setupBroker({
+    brokerRef = setupBroker({
       server, app, config, dataPath: DATA_PATH, search, reshuffle, incrementDisplayCount,
       imageCache, prefetcher, prefetchVariant,
     });
@@ -821,6 +822,56 @@ app.get('/search', async (req, res) => {
   } catch (err) {
     console.error(`search error: ${err.message}`);
     res.status(500).send('Search failed');
+  }
+});
+
+// Pick one genuinely-random post matching a query and serve it. Built for
+// scheduled clients (e.g. an iOS Shortcut that sets a wallpaper): unlike the
+// slideshow's stable random_ranks deck, runRandomOne re-rolls on every call.
+//
+//   q=     raw query (same syntax as /search)
+//   list=N join the server-side tag list at index N (combined with q)
+//   ratio= bare aspect ratio (width/height); expanded by the same ±window
+//          the kiosks use into a `ratio:lo..hi` clause
+//   convert/bright/width/height/lowmem  passthrough to the variant pipeline
+//   json=1 return { id, ext } instead of the image bytes
+app.get('/random', async (req, res) => {
+  if (!searchRef) return res.status(503).send('Search not ready');
+
+  const parts = [];
+  const listIdx = Number(req.query.list);
+  if (Number.isInteger(listIdx) && listIdx >= 0 && brokerRef) {
+    const lists = brokerRef.getTagLists() || [];
+    if (Array.isArray(lists[listIdx])) parts.push(...lists[listIdx]);
+  }
+  if (req.query.q) parts.push(String(req.query.q));
+
+  const ratio = Number(req.query.ratio);
+  if (Number.isFinite(ratio) && ratio > 0) {
+    const rawW = brokerRef ? Number(brokerRef.getRatioWindow()) : 0.15;
+    const w = Number.isFinite(rawW) && rawW > 0 && rawW < 1 ? rawW : 0.15;
+    parts.push(`ratio:${(ratio * (1 - w)).toFixed(2)}..${(ratio * (1 + w)).toFixed(2)}`);
+  }
+
+  const q = parts.filter(Boolean).join(' ');
+
+  try {
+    const row = await searchRef.runRandomOne({ q });
+    if (!row) return res.status(404).send('No matching post');
+    const id = Number(row._id);
+
+    if (Number(req.query.json) === 1) {
+      const ext = path.extname(row.path || '').slice(1).toLowerCase();
+      return res.json({ id, ext });
+    }
+
+    // Hand off to the same id-based delivery path /get uses, so videos
+    // stream and images flow through the variant cache + prefetch sharing.
+    req.query.id = String(id);
+    return processRequestV2(req, res);
+  } catch (err) {
+    console.error(`random error: ${err.message}`);
+    if (!res.headersSent) res.status(500).send('Random selection failed');
   }
 });
 

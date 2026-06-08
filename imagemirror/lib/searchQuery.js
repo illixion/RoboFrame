@@ -68,6 +68,31 @@ function createSearch({ db, cacheSize = 20 } = {}) {
         cache.length = 0;
     }
 
+    // Pick a single genuinely-random post matching `q`. Unlike runSearch's
+    // random mode (which pages a stable display_count/random_rank deck so the
+    // slideshow shows unseen posts first), this re-rolls DuckDB's RANDOM() on
+    // every call — the right semantics for a one-shot "give me any matching
+    // image" request (e.g. the /random HTTP route). Returns a single row
+    // (post + path) or null when nothing matches. Not cached.
+    function runRandomOne({ q = '' } = {}) {
+        const { where } = parseQuery(q);
+        const baseWhere = where && where !== 'TRUE' ? where : 'TRUE';
+        const sql = `
+            SELECT p.*, pp.path
+            FROM file_db.posts p
+            LEFT JOIN file_db.posts_paths pp ON pp._id = p._id
+            WHERE ${baseWhere} AND ${HAS_PATH}
+            ORDER BY RANDOM()
+            LIMIT 1;
+        `;
+        return new Promise((resolve, reject) => {
+            db.all(sql, (err, rows) => {
+                if (err) return reject(err);
+                resolve(rows && rows.length ? rows[0] : null);
+            });
+        });
+    }
+
     function runCount({ q = '' } = {}) {
         const { where } = parseQuery(q);
         const baseWhere = where && where !== 'TRUE' ? where : 'TRUE';
@@ -81,7 +106,7 @@ function createSearch({ db, cacheSize = 20 } = {}) {
         });
     }
 
-    return { runSearch, runCount, clearCache };
+    return { runSearch, runCount, runRandomOne, clearCache };
 }
 
 function buildRandomSql({ where, cursor, limit }) {

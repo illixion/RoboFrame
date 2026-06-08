@@ -809,7 +809,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         wss.close();
     }
 
-    return { broadcast, close, orchestrator, mqtt };
+    return { broadcast, close, orchestrator, mqtt, getTagLists, getRatioWindow: () => ratioWindow };
 }
 
 module.exports = { setupBroker };
