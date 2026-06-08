@@ -867,7 +867,9 @@ app.get('/random', async (req, res) => {
 
     // Hand off to the same id-based delivery path /get uses, so videos
     // stream and images flow through the variant cache + prefetch sharing.
-    req.query.id = String(id);
+    // Express's req.query is a getter that re-parses req.url on each access,
+    // so the id has to go on the URL — a property assignment wouldn't survive.
+    req.url += (req.url.includes('?') ? '&' : '?') + 'id=' + id;
     return processRequestV2(req, res);
   } catch (err) {
     console.error(`random error: ${err.message}`);
