@@ -81,6 +81,35 @@ test('runRandomOne with an empty query falls back to TRUE', async () => {
     assert.match(db.calls[0], /WHERE TRUE AND/);
 });
 
+test('runRankedRandomOne walks the deck least-seen-first off random_ranks', async () => {
+    const db = stubDb([{ _id: 3n, display_count: 0n, random_rank: 0.1 }]);
+    const search = createSearch({ db });
+    const row = await search.runRankedRandomOne({ q: 'cats' });
+
+    assert.equal(Number(row._id), 3);
+    const sql = db.calls[0];
+    assert.match(sql, /JOIN memory\.random_ranks r ON p\._id = r\._id/);
+    assert.match(sql, /ORDER BY r\.display_count ASC, r\.random_rank ASC/);
+    assert.match(sql, /LIMIT 1/);
+    assert.doesNotMatch(sql, /ORDER BY RANDOM\(\)/);
+});
+
+test('runRankedRandomOne honors query, blocklist, and orphan guard', async () => {
+    const db = stubDb([{ _id: 1n }]);
+    const search = createSearch({ db });
+    await search.runRankedRandomOne({
+        q: 'cats -comic',
+        blockedIds: [11],
+        blockedTags: ['nsfw'],
+    });
+    const sql = db.calls[0];
+    assert.match(sql, /p\.tags @> ARRAY\['cats'\]/);
+    assert.match(sql, /NOT p\.tags && ARRAY\['comic'\]/);
+    assert.match(sql, /p\._id NOT IN \(11\)/);
+    assert.match(sql, /NOT p\.tags && ARRAY\['nsfw'\]/);
+    assert.match(sql, /EXISTS \(SELECT 1 FROM file_db\.posts_paths/);
+});
+
 test('runRandomOne is not served from runSearch cache', async () => {
     // Distinct rows on each db.all call prove no caching layer intercepts.
     let n = 0;

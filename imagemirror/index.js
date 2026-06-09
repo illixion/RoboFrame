@@ -594,6 +594,7 @@ async function processRequestV2(req, res) {
 
 let searchRef = null;
 let brokerRef = null;
+let incrementDisplayCountRef = null;
 
 // Connect to DuckDB
 const DUCKDB_PATH = pickEnv('DUCKDB_PATH', srv.duckdbPath, 'posts.duckdb');
@@ -711,6 +712,7 @@ async function refreshRandomRanks() {
         });
         if (search?.clearCache) search.clearCache();
     };
+    incrementDisplayCountRef = incrementDisplayCount;
 
     // Wire the WebSocket broker (and HA bridge if configured) onto the same
     // http.Server that serves the image API. One process, one port, no proxy.
@@ -826,13 +828,17 @@ app.get('/search', async (req, res) => {
 });
 
 // Pick one genuinely-random post matching a query and serve it. Built for
-// scheduled clients (e.g. an iOS Shortcut that sets a wallpaper): unlike the
-// slideshow's stable random_ranks deck, runRandomOne re-rolls on every call.
+// scheduled clients (e.g. an iOS Shortcut that sets a wallpaper).
 //
 //   q=     raw query (same syntax as /search)
 //   list=N join the server-side tag list at index N (combined with q)
 //   ratio= bare aspect ratio (width/height); expanded by the same ±window
 //          the kiosks use into a `ratio:lo..hi` clause
+//   order= `random` for independent uniform draws (with replacement);
+//          anything else (default) walks the shared random_ranks deck
+//          least-seen-first and bumps the view count, so repeated calls
+//          shuffle through the library without replacement — better spread
+//          for a scheduled wallpaper.
 //   convert/bright/width/height/lowmem  passthrough to the variant pipeline
 //   json=1 return { id, ext } instead of the image bytes
 app.get('/random', async (req, res) => {
@@ -861,10 +867,18 @@ app.get('/random', async (req, res) => {
   const blockedIds = brokerRef ? brokerRef.getBlockedPosts() : [];
   const blockedTags = brokerRef ? brokerRef.getBlockedTags() : [];
 
+  const pureRandom = String(req.query.order) === 'random';
+
   try {
-    const row = await searchRef.runRandomOne({ q, blockedIds, blockedTags });
+    const row = pureRandom
+      ? await searchRef.runRandomOne({ q, blockedIds, blockedTags })
+      : await searchRef.runRankedRandomOne({ q, blockedIds, blockedTags });
     if (!row) return res.status(404).send('No matching post');
     const id = Number(row._id);
+
+    // Advance the shared deck so the next ranked call picks a different post.
+    // Skipped for pure-random draws, which intentionally ignore view counts.
+    if (!pureRandom && incrementDisplayCountRef) incrementDisplayCountRef(id);
 
     if (Number(req.query.json) === 1) {
       const ext = path.extname(row.path || '').slice(1).toLowerCase();

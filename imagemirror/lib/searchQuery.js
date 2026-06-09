@@ -68,39 +68,64 @@ function createSearch({ db, cacheSize = 20 } = {}) {
         cache.length = 0;
     }
 
-    // Pick a single genuinely-random post matching `q`. Unlike runSearch's
-    // random mode (which pages a stable display_count/random_rank deck so the
-    // slideshow shows unseen posts first), this re-rolls DuckDB's RANDOM() on
-    // every call — the right semantics for a one-shot "give me any matching
-    // image" request (e.g. the /random HTTP route). Returns a single row
-    // (post + path) or null when nothing matches. Not cached.
-    //
-    // `blockedIds` / `blockedTags` apply the server-side blocklist in SQL, so
-    // a blocked post is never picked (rather than picked-then-rejected). They
-    // are additive to any `-tag` exclusions already in `q`: the orchestrator
-    // filters its queue the same way, and a one-shot client can't enforce the
-    // blocklist itself.
-    function runRandomOne({ q = '', blockedIds = [], blockedTags = [] } = {}) {
+    // Compose the WHERE clauses shared by the one-shot random selectors: the
+    // parsed query, the orphan-path guard, and the server-side blocklist.
+    // `blockedIds` / `blockedTags` are additive to any `-tag` exclusions in
+    // `q` (the orchestrator filters its queue the same way; a one-shot client
+    // can't enforce the blocklist itself), so a blocked post is excluded in
+    // SQL rather than picked-then-rejected.
+    function randomWhere(q, blockedIds, blockedTags) {
         const { where } = parseQuery(q);
         const clauses = [where && where !== 'TRUE' ? where : 'TRUE', HAS_PATH];
         const ids = blockedIds.map(Number).filter(Number.isFinite);
         if (ids.length) clauses.push(`p._id NOT IN (${ids.join(', ')})`);
         const tags = blockedTags.filter(Boolean).map((t) => `'${String(t).replace(/'/g, "''")}'`);
         if (tags.length) clauses.push(`NOT p.tags && ARRAY[${tags.join(', ')}]`);
-        const sql = `
-            SELECT p.*, pp.path
-            FROM file_db.posts p
-            LEFT JOIN file_db.posts_paths pp ON pp._id = p._id
-            WHERE ${clauses.join(' AND ')}
-            ORDER BY RANDOM()
-            LIMIT 1;
-        `;
+        return clauses.join(' AND ');
+    }
+
+    function fetchOne(sql) {
         return new Promise((resolve, reject) => {
             db.all(sql, (err, rows) => {
                 if (err) return reject(err);
                 resolve(rows && rows.length ? rows[0] : null);
             });
         });
+    }
+
+    // Pick one matching post by re-rolling DuckDB's RANDOM() on every call —
+    // independent uniform draws, with replacement (a post can recur, and the
+    // selection ignores the slideshow's view counts). Returns a single row
+    // (post + path) or null when nothing matches. Not cached.
+    function runRandomOne({ q = '', blockedIds = [], blockedTags = [] } = {}) {
+        return fetchOne(`
+            SELECT p.*, pp.path
+            FROM file_db.posts p
+            LEFT JOIN file_db.posts_paths pp ON pp._id = p._id
+            WHERE ${randomWhere(q, blockedIds, blockedTags)}
+            ORDER BY RANDOM()
+            LIMIT 1;
+        `);
+    }
+
+    // Pick one matching post off the shared random_ranks deck the slideshow
+    // uses: least-seen first, ties broken by the deck's frozen random_rank.
+    // The caller is expected to bump display_count for the returned id so the
+    // next call advances — that turns repeated calls into a shuffle *without*
+    // replacement (every post once before any repeats), which spreads a
+    // scheduled wallpaper across the whole library far better than independent
+    // RANDOM() draws. Shares the deck with the slideshow, so a pick here also
+    // deprioritises that post on the frame until the next reshuffle.
+    function runRankedRandomOne({ q = '', blockedIds = [], blockedTags = [] } = {}) {
+        return fetchOne(`
+            SELECT p.*, pp.path, r.random_rank, r.display_count
+            FROM file_db.posts p
+            JOIN memory.random_ranks r ON p._id = r._id
+            LEFT JOIN file_db.posts_paths pp ON pp._id = p._id
+            WHERE ${randomWhere(q, blockedIds, blockedTags)}
+            ORDER BY r.display_count ASC, r.random_rank ASC
+            LIMIT 1;
+        `);
     }
 
     function runCount({ q = '' } = {}) {
@@ -116,7 +141,7 @@ function createSearch({ db, cacheSize = 20 } = {}) {
         });
     }
 
-    return { runSearch, runCount, runRandomOne, clearCache };
+    return { runSearch, runCount, runRandomOne, runRankedRandomOne, clearCache };
 }
 
 function buildRandomSql({ where, cursor, limit }) {
