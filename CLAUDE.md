@@ -121,9 +121,12 @@ updates to track a server change, ship those too:
   `slideshowConfig`. A held merge claim is only released by an
   explicit `displaySync {enabled:false}` from some session on the
   driver channel, or by `close()` at process shutdown.
-- **Server-side blocklist.** The orchestrator filters blocked posts
-  out of every channel's queue and advances any channel that was just
-  showing one. Don't add client-side defensive filtering.
+- **Server-side blocklist.** Blocked posts are filtered out server-side
+  on every path that selects images: the orchestrator drops them from
+  each channel's queue and advances any channel that was just showing
+  one, and the `/random` HTTP route excludes them in SQL so a blocked
+  post is never picked. Both read the same `blockedIds`/`blockedTags`
+  from `data.json`. Don't add client-side defensive filtering.
 - **node-display is not a session.** It never sends `slideshowConfig`,
   so it never appears in any channel's `sessions`. It still drives
   per-deviceId visibility via `visibility {deviceId, ...}` — the broker
