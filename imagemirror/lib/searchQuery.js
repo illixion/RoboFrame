@@ -74,14 +74,24 @@ function createSearch({ db, cacheSize = 20 } = {}) {
     // every call — the right semantics for a one-shot "give me any matching
     // image" request (e.g. the /random HTTP route). Returns a single row
     // (post + path) or null when nothing matches. Not cached.
-    function runRandomOne({ q = '' } = {}) {
+    //
+    // `blockedIds` / `blockedTags` apply the server-side blocklist in SQL, so
+    // a blocked post is never picked (rather than picked-then-rejected). They
+    // are additive to any `-tag` exclusions already in `q`: the orchestrator
+    // filters its queue the same way, and a one-shot client can't enforce the
+    // blocklist itself.
+    function runRandomOne({ q = '', blockedIds = [], blockedTags = [] } = {}) {
         const { where } = parseQuery(q);
-        const baseWhere = where && where !== 'TRUE' ? where : 'TRUE';
+        const clauses = [where && where !== 'TRUE' ? where : 'TRUE', HAS_PATH];
+        const ids = blockedIds.map(Number).filter(Number.isFinite);
+        if (ids.length) clauses.push(`p._id NOT IN (${ids.join(', ')})`);
+        const tags = blockedTags.filter(Boolean).map((t) => `'${String(t).replace(/'/g, "''")}'`);
+        if (tags.length) clauses.push(`NOT p.tags && ARRAY[${tags.join(', ')}]`);
         const sql = `
             SELECT p.*, pp.path
             FROM file_db.posts p
             LEFT JOIN file_db.posts_paths pp ON pp._id = p._id
-            WHERE ${baseWhere} AND ${HAS_PATH}
+            WHERE ${clauses.join(' AND ')}
             ORDER BY RANDOM()
             LIMIT 1;
         `;

@@ -855,8 +855,14 @@ app.get('/random', async (req, res) => {
 
   const q = parts.filter(Boolean).join(' ');
 
+  // Apply the server-side blocklist in SQL — additive to any `-tag`
+  // exclusions in `q` — so a one-shot client gets the same filtering the
+  // slideshow's queue does without having to enforce it itself.
+  const blockedIds = brokerRef ? brokerRef.getBlockedPosts() : [];
+  const blockedTags = brokerRef ? brokerRef.getBlockedTags() : [];
+
   try {
-    const row = await searchRef.runRandomOne({ q });
+    const row = await searchRef.runRandomOne({ q, blockedIds, blockedTags });
     if (!row) return res.status(404).send('No matching post');
     const id = Number(row._id);
 

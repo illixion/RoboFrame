@@ -34,6 +34,40 @@ test('runRandomOne orders by RANDOM() and returns a single row', async () => {
     assert.match(sql, /EXISTS \(SELECT 1 FROM file_db\.posts_paths/);
 });
 
+test('runRandomOne applies the blocklist additively with -tag exclusions', async () => {
+    const db = stubDb([{ _id: 9n }]);
+    const search = createSearch({ db });
+    await search.runRandomOne({
+        q: 'cats -comic',
+        blockedIds: [11, 22],
+        blockedTags: ['nsfw', "o'brien"],
+    });
+    const sql = db.calls[0];
+    // The `-comic` exclusion from q survives...
+    assert.match(sql, /NOT p\.tags && ARRAY\['comic'\]/);
+    // ...alongside the blocked-tag exclusion (single quotes escaped)...
+    assert.match(sql, /NOT p\.tags && ARRAY\['nsfw', 'o''brien'\]/);
+    // ...and the blocked-id exclusion, all AND-joined.
+    assert.match(sql, /p\._id NOT IN \(11, 22\)/);
+    assert.match(sql, /p\.tags @> ARRAY\['cats'\][\s\S]*AND[\s\S]*NOT p\.tags/);
+});
+
+test('runRandomOne drops non-numeric blocked ids', async () => {
+    const db = stubDb([{ _id: 1n }]);
+    const search = createSearch({ db });
+    await search.runRandomOne({ q: 'cats', blockedIds: [5, 'bogus', NaN, 7] });
+    assert.match(db.calls[0], /p\._id NOT IN \(5, 7\)/);
+});
+
+test('runRandomOne omits blocklist clauses when nothing is blocked', async () => {
+    const db = stubDb([{ _id: 1n }]);
+    const search = createSearch({ db });
+    await search.runRandomOne({ q: 'cats' });
+    const sql = db.calls[0];
+    assert.doesNotMatch(sql, /NOT IN/);
+    assert.doesNotMatch(sql, /&& ARRAY/); // no exclusion arrays (only the @> include)
+});
+
 test('runRandomOne returns null when nothing matches', async () => {
     const db = stubDb([]);
     const search = createSearch({ db });
