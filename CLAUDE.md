@@ -95,9 +95,16 @@ updates to track a server change, ship those too:
 - **Readiness barrier.** After each `playback` broadcast the channel
   waits for the *first* visible session's `imageReady { id }` before
   starting the dwell timer (first-ready wins, so a slow or leaving
-  co-tenant on the same deviceId can't wedge it). No timeout: if no
-  visible session ever reports, the channel parks on the frame. Hidden
-  sessions are auto-ready (all-hidden → promotes immediately).
+  co-tenant on the same deviceId can't wedge it). Hidden sessions are
+  auto-ready (all-hidden → promotes immediately). A per-channel
+  readiness-timeout fallback (`server.slideshow.readyTimeoutMs`, default
+  15 s, `0` disables) promotes the frame anyway if no visible session
+  reports within the budget — the recovery path for a client that stays
+  on the socket but stops reporting (frozen render loop). It's
+  per-channel, so it keys on deviceId; the all-hidden short-circuit
+  already covers the legitimate "nobody can display" case, so the
+  timeout only fires on a wedged *visible* session. With it disabled the
+  channel parks on the frame forever until a report arrives.
 - **Visibility = pause/resume, not reset.** A `visibility {deviceId, false}`
   pauses the dwell countdown using a wall-clock deadline; `true`
   resumes the *remaining* time. A wake never bumps the deadline. Web

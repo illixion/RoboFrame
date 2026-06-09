@@ -49,6 +49,18 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     }
     let sharedTags = readSharedTags(config);
 
+    // Readiness-barrier fallback budget (ms). A client that stays on the
+    // socket but stops sending `imageReady` — a frozen render loop, not a dead
+    // socket — would otherwise park its channel on one frame indefinitely. If
+    // no expected session reports within this budget the orchestrator promotes
+    // the frame anyway and logs the laggards. 0 disables (park forever, the
+    // old behaviour). Per-channel, so it keys on deviceId. Live-reloadable;
+    // takes effect on the next loading phase, no requery needed.
+    function readReadyTimeout(cfg) {
+        return pickEnv('SLIDESHOW_READY_TIMEOUT_MS', cfg?.server?.slideshow?.readyTimeoutMs, 15000, { type: 'number' });
+    }
+    let readyTimeout = readReadyTimeout(config);
+
     const rpcToken = pickEnv('RPC_TOKEN', srv.rpcToken, '');
     const accessToken = pickEnv('ACCESS_TOKEN', config.accessToken, '');
     const HA_URL = pickEnv('HA_URL', ha.url, '');
@@ -316,12 +328,14 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         getVisibility,
         getRatioWindow: () => ratioWindow,
         getSharedTags: () => sharedTags,
+        getReadyTimeout: () => readyTimeout,
     }) : null;
 
     // ----- Config watcher: hot-reload tunables -----------------------------
     // Re-read roboframe.config.json on change and apply the slideshow
-    // tunables that are safe to swap live. Only ratioWindow is wired today;
-    // structural settings (tokens, ports, paths) still require a restart.
+    // tunables that are safe to swap live (ratioWindow, sharedTags,
+    // readyTimeoutMs); structural settings (tokens, ports, paths) still
+    // require a restart.
     let configReloadTimer = null;
     const configPath = config.configPath;
     if (configPath) {
@@ -344,6 +358,13 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                         console.log(`${configPath} changed; sharedTags ${sharedTags} -> ${nextShared}`);
                         sharedTags = nextShared;
                         requery = true;
+                    }
+                    // readyTimeout is read live by the orchestrator on each
+                    // loading phase — no requery, just swap the value.
+                    const nextReady = readReadyTimeout(fresh);
+                    if (nextReady !== readyTimeout) {
+                        console.log(`${configPath} changed; readyTimeoutMs ${readyTimeout} -> ${nextReady}`);
+                        readyTimeout = nextReady;
                     }
                     if (requery && orchestrator) orchestrator.requeryAll();
                 }, 50);

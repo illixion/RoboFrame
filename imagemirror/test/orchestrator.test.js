@@ -68,7 +68,7 @@ function withDefaultSession(orch) {
 // `pages` is consumed shared across all channels (the fake search returns
 // the next page on each call regardless of which channel asked). Tests that
 // need per-channel isolation provide explicit pages or override.
-function harness({ tagLists = [['cats']], pages, blockedIds = [], blockedTags = [] } = {}) {
+function harness({ tagLists = [['cats']], pages, blockedIds = [], blockedTags = [], readyTimeout = 0 } = {}) {
     const broadcasts = [];
     const broadcast = (msg) => broadcasts.push(msg);
     const search = makeFakeSearch(pages || [
@@ -85,6 +85,7 @@ function harness({ tagLists = [['cats']], pages, blockedIds = [], blockedTags = 
         getTagLists: () => tagLists,
         getBlockedIds: () => blockIds,
         getBlockedTags: () => blockTags,
+        getReadyTimeout: () => readyTimeout,
     });
     const orch = withDefaultSession(rawOrch);
     return {
@@ -98,6 +99,7 @@ function harness({ tagLists = [['cats']], pages, blockedIds = [], blockedTags = 
 }
 
 const tick = () => new Promise((res) => setImmediate(res));
+const delay = (ms) => new Promise((res) => setTimeout(res, ms));
 
 // Walk the readiness barrier: all expected ws on the channel report
 // imageReady for the channel's currentId. Returns the id they reported.
@@ -274,8 +276,8 @@ test('readiness barrier: a client leaving before reporting does not wedge the ch
     assert.ok(ch.timer, 'channel keeps running after the non-reporting peer leaves');
 });
 
-test('no readiness fallback: a client that never reports imageReady holds the channel in loading forever', async (t) => {
-    const { orch } = harness();
+test('readiness timeout disabled (0): a client that never reports holds the channel in loading forever', async (t) => {
+    const { orch } = harness({ readyTimeout: 0 });
     t.after(() => orch.close());
     const a = makeFakeWs();
     const b = makeFakeWs();
@@ -284,15 +286,93 @@ test('no readiness fallback: a client that never reports imageReady holds the ch
     await tick(); await tick(); await tick();
     const ch = orch._channels.get('screen1');
     const stuckId = ch.currentId;
-    // No imageReady from either visible session: the barrier must not be
-    // bailed out by any timer. The channel parks on the current frame
-    // rather than advancing blind and wasting work the clients can't show.
+    // No imageReady from either visible session and the fallback disabled:
+    // the barrier must not be bailed out by any timer. The channel parks on
+    // the current frame rather than advancing blind and wasting work the
+    // clients can't show.
     assert.equal(ch.phase, 'loading');
     assert.equal(ch.timer, null, 'no dwell timer while still loading');
+    assert.equal(ch.readyTimer, null, 'no readiness timer when disabled');
     // Even after the configured interval would have elapsed, nothing moves.
     await tick(); await tick(); await tick();
     assert.equal(ch.phase, 'loading');
     assert.equal(ch.currentId, stuckId, 'channel does not advance without imageReady');
+});
+
+test('readiness timeout: a never-reporting visible client is promoted after the budget', async (t) => {
+    const { orch } = harness({ readyTimeout: 40 });
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 5000 });
+    await tick(); await tick(); await tick();
+    const ch = orch._channels.get('screen1');
+    const stuckId = ch.currentId;
+    // A single visible session that never reports: the barrier arms a
+    // readiness timer keyed on this channel.
+    assert.equal(ch.phase, 'loading');
+    assert.ok(ch.readyTimer, 'readiness timer armed while waiting');
+    assert.ok(ch.readyDeadline - Date.now() > 0, 'readiness deadline in the future');
+    // After the budget the channel promotes the frame anyway and starts the
+    // dwell — recovering without a manual next or a reconnect.
+    await delay(70);
+    assert.equal(ch.phase, 'displaying', 'channel promotes after the readiness timeout');
+    assert.equal(ch.readyTimer, null, 'readiness timer cleared on promote');
+    assert.equal(ch.currentId, stuckId, 'promotes the same frame, does not skip it');
+    assert.ok(ch.timer, 'dwell timer running after the timeout promote');
+});
+
+test('readiness timeout is per-channel: one wedged deviceId does not promote a co-tenant', async (t) => {
+    const { orch } = harness({ readyTimeout: 40 });
+    t.after(() => orch.close());
+    // Two distinct deviceIds (as Spatialstash multiplexes over one socket).
+    const wedged = makeFakeWs();
+    const healthy = makeFakeWs();
+    orch.register(wedged, { deviceId: 'screenA', interval: 5000 });
+    orch.register(healthy, { deviceId: 'screenB', interval: 5000 });
+    await tick(); await tick(); await tick();
+    const chA = orch._channels.get('screenA');
+    const chB = orch._channels.get('screenB');
+    // screenB reports promptly and leaves loading; screenA never reports.
+    orch.notifyImageReady(healthy, chB.currentId);
+    assert.equal(chB.phase, 'displaying');
+    assert.equal(chB.readyTimer, null, 'healthy channel has no readiness timer pending');
+    assert.equal(chA.phase, 'loading', 'wedged channel still waiting');
+    // Only the wedged channel rides its timeout; the healthy one is untouched.
+    await delay(70);
+    assert.equal(chA.phase, 'displaying', 'wedged channel promotes on its own timeout');
+    assert.equal(chB.phase, 'displaying', 'co-tenant channel never entered a readiness timeout');
+});
+
+test('readiness timeout does not fire once the first report promotes the channel', async (t) => {
+    const { orch } = harness({ readyTimeout: 40 });
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 5000 });
+    await tick(); await tick(); await tick();
+    const ch = orch._channels.get('screen1');
+    orch.notifyImageReady(ws, ch.currentId);
+    assert.equal(ch.phase, 'displaying');
+    assert.equal(ch.readyTimer, null, 'readiness timer cleared by the first report');
+    const dwellDeadline = ch.dwellDeadline;
+    // Past the readiness budget the dwell must be untouched — no stray
+    // promote re-running and bumping the deadline.
+    await delay(70);
+    assert.equal(ch.phase, 'displaying');
+    assert.equal(ch.dwellDeadline, dwellDeadline, 'readiness timeout must not disturb a displaying channel');
+});
+
+test('readiness timeout: an all-hidden channel still promotes immediately, not on the timer', async (t) => {
+    const { orch } = harness({ readyTimeout: 40 });
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.notifyVisibility('screen1', false);
+    orch.register(ws, { deviceId: 'screen1', interval: 5000 });
+    await tick(); await tick(); await tick();
+    const ch = orch._channels.get('screen1');
+    // No visible readers → empty expectedReady → immediate promote, with no
+    // readiness timer armed (nothing to wait on).
+    assert.equal(ch.phase, 'displaying', 'all-hidden promotes without waiting for the budget');
+    assert.equal(ch.readyTimer, null, 'no readiness timer when there is nothing to wait on');
 });
 
 test('node-display-style WS that never sends slideshowConfig is not in any channel', async (t) => {

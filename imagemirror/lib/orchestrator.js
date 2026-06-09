@@ -16,11 +16,20 @@
 // { id }` for the new image before starting the dwell-time interval timer.
 // First-ready wins rather than all-ready: when several clients share a
 // deviceId (a web kiosk and Spatialstash, say) the slowest must not gate the
-// channel, and a client leaving mid-barrier must not wedge it. There is no
-// timeout: if no visible session ever reports, the channel parks on the
-// current frame rather than advancing blind, so the server never burns work
-// no client can display. A channel with only hidden sessions has nothing to
-// wait for and promotes immediately.
+// channel, and a client leaving mid-barrier must not wedge it. A channel with
+// only hidden sessions has nothing to wait for and promotes immediately.
+//
+// The barrier is backed by a per-channel readiness timeout (getReadyTimeout(),
+// ms; 0 disables). If no expected session reports within the budget the
+// channel promotes anyway and logs which session keys it gave up on. This is
+// the recovery path for a client that stays on the socket but stops reporting
+// — a frozen render loop a dead-socket check would never catch. The timeout is
+// per-channel, so it keys on deviceId: one wedged display (or one of the
+// distinct deviceIds Spatialstash multiplexes over a single connection) is
+// promoted independently without disturbing its co-tenants. The "all hidden →
+// promote immediately" short-circuit already covers the legitimate "no client
+// can display this" case, so the timeout only ever fires on a visible session
+// that should have reported and didn't.
 //
 // Visibility for a deviceId pauses/resumes the dwell timer using a wall-clock
 // deadline (`dwellDeadline`). It never resets the deadline.
@@ -72,6 +81,7 @@ function createOrchestrator({
     getVisibility = null,
     getRatioWindow = null,
     getSharedTags = null,
+    getReadyTimeout = null,
 }) {
     // Set ORCHESTRATOR_DEBUG=1 to trace the readiness barrier: every dropped
     // `imageReady` (with the reason) and the keys a loading channel is still
@@ -186,6 +196,13 @@ function createOrchestrator({
             // Wall-clock deadline for the dwell timer. Set when entering
             // 'displaying'; survives visibility-driven pauses.
             dwellDeadline: null,
+            // Readiness-barrier fallback. Armed when entering 'loading' with a
+            // non-empty expectedReady; cleared on promote. If it fires the
+            // channel promotes without the laggards (see armReadyTimer). A
+            // hidden device leaves 'loading' via the empty-expectedReady
+            // promote, so this never needs to pause for visibility.
+            readyDeadline: null,
+            readyTimer: null,
             // In-flight refill promise; coalesces concurrent refillQueue
             // callers onto a single search round-trip.
             refillPromise: null,
@@ -486,6 +503,45 @@ function createOrchestrator({
         }
     }
 
+    // Readiness-barrier budget in ms. 0 (or a missing/invalid getter) disables
+    // the fallback, restoring the park-forever-until-a-report behaviour. Read
+    // live so a config hot-reload takes effect on the next loading phase.
+    function readyTimeoutMs() {
+        const v = Number(getReadyTimeout ? getReadyTimeout() : 0);
+        return Number.isFinite(v) && v > 0 ? v : 0;
+    }
+
+    function stopReadyTimer(channel) {
+        if (channel.readyTimer) {
+            clearTimeout(channel.readyTimer);
+            channel.readyTimer = null;
+        }
+        channel.readyDeadline = null;
+    }
+
+    // Arm the readiness fallback for a channel that just entered 'loading'.
+    // No-op when the timeout is disabled or there's nothing to wait on (an
+    // empty expectedReady promotes immediately on its own). The deadline is
+    // absolute from loading-start and is not extended when a session joins or
+    // leaves mid-barrier — a flapping client must not be able to postpone the
+    // fallback indefinitely.
+    function armReadyTimer(channel) {
+        stopReadyTimer(channel);
+        const ms = readyTimeoutMs();
+        if (!ms) return;
+        if (channel.phase !== 'loading') return;
+        if (channel.expectedReady.size === 0) return;
+        channel.readyDeadline = Date.now() + ms;
+        channel.readyTimer = setTimeout(() => {
+            channel.readyTimer = null;
+            channel.readyDeadline = null;
+            if (channel.phase !== 'loading') return;
+            const waiting = Array.from(channel.expectedReady).filter((k) => !channel.ready.has(k));
+            console.warn(`[orchestrator] readiness timeout (${channel.deviceId}): no imageReady for id=${channel.currentId} within ${ms}ms; promoting without {${waiting.join(',')}}`);
+            promoteToDisplaying(channel);
+        }, ms);
+    }
+
     function scheduleDwell(channel) {
         stopDwellTimer(channel);
         if (!channelActive(channel)) return;
@@ -519,6 +575,7 @@ function createOrchestrator({
     }
 
     function promoteToDisplaying(channel) {
+        stopReadyTimer(channel);
         channel.phase = 'displaying';
         // A video longer than the interval delays the advance until it has
         // played through; a shorter video (or any image) dwells for the
@@ -614,6 +671,7 @@ function createOrchestrator({
         channel.expectedReady = expectedReadersFor(channel);
         channel.dwellDeadline = null;
         stopDwellTimer(channel);
+        stopReadyTimer(channel);
         if (channel.currentId === null) {
             channel.phase = 'idle';
             broadcastPlayback(channel);
@@ -627,10 +685,12 @@ function createOrchestrator({
             // the channel's wall-clock keeps advancing even when every
             // display on the channel is dark.
             promoteToDisplaying(channel);
+        } else {
+            // Wait for the first `imageReady`, but arm the readiness fallback
+            // so a client that stays connected yet never reports can't park
+            // the channel here forever.
+            armReadyTimer(channel);
         }
-        // Otherwise the channel stays in 'loading' until every visible
-        // session reports `imageReady`. No timeout: an unreporting client
-        // holds the channel here rather than letting it advance blind.
     }
 
     // ----- public API ------------------------------------------------------
@@ -754,6 +814,7 @@ function createOrchestrator({
             // deviceId rebinds to the same channel and resumes from the
             // same image; no slideshowConfig replay needed for state.
             stopDwellTimer(channel);
+            stopReadyTimer(channel);
             channel.parked = true;
         } else if (channel.phase === 'loading') {
             // Disconnect during the readiness barrier — re-check now that
@@ -972,6 +1033,7 @@ function createOrchestrator({
             for (const c of channels.values()) {
                 if (c === channel) continue;
                 stopDwellTimer(c);
+                stopReadyTimer(c);
                 c.phase = 'idle';
                 c.dwellDeadline = null;
             }
@@ -980,6 +1042,7 @@ function createOrchestrator({
             channel.phase = 'loading';
             broadcastPlayback(channel);
             if (channel.expectedReady.size === 0) promoteToDisplaying(channel);
+            else armReadyTimer(channel);
         } else if (channel === mergeDriverChannel) {
             // Any session on the driver channel can release the merge.
             releaseMerge();
@@ -998,6 +1061,7 @@ function createOrchestrator({
                     channel.phase = 'loading';
                     broadcastPlayback(channel);
                     if (channel.expectedReady.size === 0) promoteToDisplaying(channel);
+                    else armReadyTimer(channel);
                 } else {
                     channel.phase = 'idle';
                 }
@@ -1029,6 +1093,7 @@ function createOrchestrator({
         clearInterval(idleRefillTimer);
         for (const channel of channels.values()) {
             stopDwellTimer(channel);
+            stopReadyTimer(channel);
             channel.sessions.clear();
             channel.queue.length = 0;
         }
@@ -1066,6 +1131,7 @@ function createOrchestrator({
                 ready: c.ready.size,
                 hasTimer: !!c.timer,
                 dwellRemaining: c.dwellDeadline ? c.dwellDeadline - Date.now() : null,
+                readyRemaining: c.readyDeadline ? c.readyDeadline - Date.now() : null,
             })),
         }),
     };

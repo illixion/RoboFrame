@@ -177,13 +177,25 @@ The orchestrator's readiness barrier starts the dwell timer as soon as
 the **first** visible session on the channel reports for the current
 image — first-ready wins, not all-ready. When several clients share a
 `deviceId` (e.g. a web kiosk and Spatialstash), the slowest doesn't gate
-the channel and a client leaving mid-barrier can't wedge it. There is no
-timeout: **if *no* visible session ever reports, the channel stays on the
-current frame and never advances** — the server won't advance blind and
-waste work no client can display. Send it once per successful transition
-(matching the broadcast `current.id`). A channel whose sessions are all
-hidden (each reported `visibility {false}`) has nothing to wait for and
-advances on its own.
+the channel and a client leaving mid-barrier can't wedge it. Send it
+once per successful transition (matching the broadcast `current.id`). A
+channel whose sessions are all hidden (each reported `visibility {false}`)
+has nothing to wait for and advances on its own.
+
+The barrier has a **readiness-timeout fallback** (`server.slideshow.readyTimeoutMs`,
+default 15 s; `0` disables). If no visible session reports within the
+budget the channel promotes the frame anyway, starts the dwell, and logs
+the session keys it gave up on. This recovers a client that stays on the
+socket but stops reporting — a frozen render loop, which a dead-socket
+check would never catch — without a manual *next* or a reconnect. The
+timeout is **per-channel, so it keys on `deviceId`**: one wedged display
+(or one of the distinct `deviceId`s a single connection multiplexes) is
+promoted on its own without disturbing co-tenant channels. A late
+`imageReady` arriving after the fallback fired is harmless — it's dropped
+because the channel is no longer `loading`. With the fallback disabled
+(`0`) a channel where no visible session ever reports stays on the
+current frame and never advances; the server won't advance blind into
+work no client can display.
 
 ### `visibility`
 Report whether this `deviceId` is visible (page in foreground, screen
@@ -565,20 +577,23 @@ For each image:
    new `current.id`. Channel state is *loading*.
 2. Every visible session on the channel begins fetching/decoding/transitioning.
 3. As each session finishes, it sends `imageReady { id: <current.id> }`.
-4. When every session has reported (or 10 s passes — bad-network fallback),
-   the channel transitions to *displaying* and starts the dwell timer
-   (`interval` ms).
+4. The **first** visible session to report flips the channel to
+   *displaying* and starts the dwell timer (`interval` ms) — first-ready
+   wins, the rest don't gate it. If *no* visible session reports within
+   `readyTimeoutMs` (default 15 s), the channel promotes anyway and logs
+   the laggards.
 5. On dwell expiry, server advances the queue and goes back to step 1.
 
-**Why this matters for client implementers:** if your client doesn't
-send `imageReady`, the channel always rides the 10 s timeout. The
-visible symptom is that the effective interval is `interval + 10 s`,
-which drifts the server's broadcasts behind any client running its
-own local timer at the configured `interval` — every other cycle
-the local timer fires before the server's, the client drains its
-prefetch queue, and shows a placeholder until the server catches up.
-Send `imageReady` exactly once per successful transition, with the
-exact `id` from the most recent `playback.current`.
+**Why this matters for client implementers:** the readiness timeout is a
+recovery backstop, not the normal path. A healthy client reports within
+a few hundred ms and the channel advances on that report. If your client
+stops sending `imageReady` while staying connected — a frozen render
+loop, a wedged decode — the channel rides the timeout every cycle: the
+effective interval becomes `interval + readyTimeoutMs`, the server's
+broadcasts drift behind any client running its own local timer at the
+configured `interval`, and you'll see the timeout warning in the server
+log naming your session. Send `imageReady` exactly once per successful
+transition, with the exact `id` from the most recent `playback.current`.
 
 Hidden sessions (visibility=false on their deviceId) are auto-considered
 ready, so a dark display never stalls the barrier.
