@@ -24,7 +24,7 @@ one process, serves the page, the API, and the WebSocket.
 There is **one server process**. It runs from the `imagemirror/` workspace
 (historical name; absorbs everything formerly split across `rpcserver/`):
 - serves the kiosk frontend (`public/index.html`, `sobel.js`, `auth-overlay.{js,css}`),
-- serves the image API (`/search`, `/get`, `/save`, `/history`, `/addtohistory`),
+- serves the image API (`/search`, `/random`, `/get`, `/save`, `/history`, `/addtohistory`),
 - runs the WebSocket broker on `/rpc/ws` and HTTP RPC routes (`/rpc/send`, `/rpc/deviceDC`, `/rpc/tags.json`),
 - optionally bridges to Home Assistant — auto-enabled when both `HA_URL` and `HA_TOKEN` are set.
 
@@ -95,7 +95,7 @@ Without those params, everything is same-origin and relative.
 
 | Component | Port | Purpose |
 |---|---|---|
-| `imagemirror` (the server) | 3123 | One process. Serves the kiosk, the image API (`/search`, `/get`, `/save`, `/history`, `/addtohistory`), the WebSocket broker (`/rpc/ws`) and HTTP RPC routes (`/rpc/send`, `/rpc/deviceDC`, `/rpc/tags.json`), and the optional Home Assistant bridge (auto-enabled when `HA_URL` + `HA_TOKEN` are set). Reads `posts.duckdb` read-only. |
+| `imagemirror` (the server) | 3123 | One process. Serves the kiosk, the image API (`/search`, `/random`, `/get`, `/save`, `/history`, `/addtohistory`), the WebSocket broker (`/rpc/ws`) and HTTP RPC routes (`/rpc/send`, `/rpc/deviceDC`, `/rpc/tags.json`), and the optional Home Assistant bridge (auto-enabled when `HA_URL` + `HA_TOKEN` are set). Reads `posts.duckdb` read-only. |
 | `node-display` | — | On-device daemon (per kiosk). Turns the display on/off and adjusts brightness based on WebSocket messages, PIR motion, ambient light. macOS / Raspberry Pi (DDC/CI) / generic Linux. |
 | `public/index.html` | — | Slideshow frontend, served by the server. Configurable via URL params. |
 | `packages/cli` | — | `roboframe-cli bootstrap` (build a DB) and `roboframe-cli doctor` (validate one). |
@@ -283,6 +283,9 @@ Picks a random `.htm`/`.html` file from `CUSTOM_PAGES_PATH` (default `imagemirro
 
 `GET /search?q=&limit=` *(debug)*
 Runs `q` through the same parser the slideshow orchestrator uses (`tag`, `-tag`, `score:`, `limit:N`, `order:`, etc.) and returns `{ results, nextCursor }` as JSON. `limit` defaults to 40 unless overridden by `?limit=` or `limit:N` inside `q`. Token-gated. Exposed on the web kiosk as `await searchPosts(q, limit)` in devtools. The slideshow itself still consumes posts via the `playback` WebSocket channel — this endpoint is for inspection only.
+
+`GET /random?q=&list=&ratio=&convert=&bright=&width=&height=&lowmem=&json=`
+Picks one genuinely-random matching post and serves it. Built for scheduled clients (e.g. an iOS Shortcut that sets a wallpaper): unlike `/search`'s random mode — which pages the stable `random_ranks` deck (reshuffled every `rankRefreshHours`, so `limit=1` returns the same post all day) — `/random` re-rolls `RANDOM()` on every call. `q` is a query string (same syntax as `/search`); `list=N` joins the server-side tag list at index `N` (combined with `q` if both are given); `ratio=` is a bare aspect ratio (`width/height`) expanded into a `ratio:lo..hi` clause using the same `server.slideshow.ratioWindow` the kiosks use. `convert`/`bright`/`width`/`height`/`lowmem` pass through to the same variant pipeline as `/get`, and videos stream with Range support. `json=1` returns `{ id, ext }` instead of the bytes. 404 if nothing matches. Token-gated. The server-side blocklist is *not* applied here (that filtering lives in the orchestrator's queue, not the HTTP search path).
 
 ### Server WebSocket `/rpc/ws`
 
