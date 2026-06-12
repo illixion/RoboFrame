@@ -184,18 +184,31 @@ has nothing to wait for and advances on its own.
 
 The barrier has a **readiness-timeout fallback** (`server.slideshow.readyTimeoutMs`,
 default 15 s; `0` disables). If no visible session reports within the
-budget the channel promotes the frame anyway, starts the dwell, and logs
-the session keys it gave up on. This recovers a client that stays on the
-socket but stops reporting — a frozen render loop, which a dead-socket
-check would never catch — without a manual *next* or a reconnect. The
-timeout is **per-channel, so it keys on `deviceId`**: one wedged display
-(or one of the distinct `deviceId`s a single connection multiplexes) is
-promoted on its own without disturbing co-tenant channels. A late
-`imageReady` arriving after the fallback fired is harmless — it's dropped
-because the channel is no longer `loading`. With the fallback disabled
-(`0`) a channel where no visible session ever reports stays on the
-current frame and never advances; the server won't advance blind into
-work no client can display.
+budget the channel promotes the frame anyway and starts the dwell. This
+recovers a client that stays on the socket but stops reporting — a
+frozen render loop, which a dead-socket check would never catch —
+without a manual *next* or a reconnect. The timeout is **per-channel, so
+it keys on `deviceId`**: one wedged display (or one of the distinct
+`deviceId`s a single connection multiplexes) is promoted on its own
+without disturbing co-tenant channels. A late `imageReady` arriving
+after the fallback fired is harmless — it's dropped because the channel
+is no longer `loading`.
+
+The fallback degrades rather than loops: after **3 consecutive timeouts
+with zero reports** the channel *stalls* — it parks on the current frame
+(barrier still armed, no timers) instead of advancing blind through
+broadcasts, deck bumps, and prefetch conversions nobody will display.
+This is the steady state for a display that's powered off but never
+reported `visibility {false}` (visibility state is in-memory, so it
+resets on a server restart). Any sign of life resumes the channel and
+clears the streak: an accepted `imageReady`, a `visibility` report for
+the device (reporting `false` flips it to the legitimate dark-display
+mode — wall-clock advance with prefetch suppressed), a session
+(re)registering, or any user action on the channel (`requestNext`,
+`setModTags`, `setTagList`, `reshuffle`, `displaySync`). With the
+fallback disabled (`0`) a channel where no visible session ever reports
+stays on the current frame and never advances; the server won't advance
+blind into work no client can display.
 
 ### `visibility`
 Report whether this `deviceId` is visible (page in foreground, screen
@@ -580,20 +593,23 @@ For each image:
 4. The **first** visible session to report flips the channel to
    *displaying* and starts the dwell timer (`interval` ms) — first-ready
    wins, the rest don't gate it. If *no* visible session reports within
-   `readyTimeoutMs` (default 15 s), the channel promotes anyway and logs
-   the laggards.
+   `readyTimeoutMs` (default 15 s), the channel promotes anyway; after 3
+   such cycles in a row it stalls on the current frame until some session
+   shows a sign of life (see the readiness-timeout fallback above).
 5. On dwell expiry, server advances the queue and goes back to step 1.
 
 **Why this matters for client implementers:** the readiness timeout is a
 recovery backstop, not the normal path. A healthy client reports within
 a few hundred ms and the channel advances on that report. If your client
 stops sending `imageReady` while staying connected — a frozen render
-loop, a wedged decode — the channel rides the timeout every cycle: the
-effective interval becomes `interval + readyTimeoutMs`, the server's
-broadcasts drift behind any client running its own local timer at the
-configured `interval`, and you'll see the timeout warning in the server
-log naming your session. Send `imageReady` exactly once per successful
-transition, with the exact `id` from the most recent `playback.current`.
+loop, a wedged decode — the channel rides the timeout for three cycles
+(effective interval `interval + readyTimeoutMs`) and then stalls until
+your client reports again; the stall is logged once naming the device.
+Send `imageReady` exactly once per successful transition, with the exact
+`id` from the most recent `playback.current`. If your client knows its
+display is off, report `visibility {false}` instead of going silent —
+that's the supported dark-display mode and keeps the channel advancing
+on wall-clock time.
 
 Hidden sessions (visibility=false on their deviceId) are auto-considered
 ready, so a dark display never stalls the barrier.

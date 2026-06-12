@@ -107,6 +107,17 @@ function createOrchestrator({
     // etc.) and re-attempts the refill so the slideshow recovers without
     // an external nudge.
     const IDLE_REFILL_INTERVAL_MS = 15000;
+    // Consecutive readiness timeouts (zero imageReady from every expected
+    // session) after which a channel stops advancing instead of promoting
+    // blind. One or two timeouts are a hiccup worth riding out; a streak
+    // means nobody on the channel is rendering — e.g. a display that's
+    // powered off but never reported visibility:false (in-memory visibility
+    // state starts over on every server restart) — and each blind advance
+    // costs a broadcast, a deck bump, and prefetch image conversions for
+    // pixels nobody shows. The stall parks the channel on the current frame;
+    // any sign of life (imageReady, a visibility report, a session joining,
+    // or a user action on the channel) resets the streak and resumes.
+    const READY_TIMEOUT_STALL_STREAK = 3;
 
     const channels = new Map();           // deviceId → channel
     // Stable per-ws id used to build session keys. Stored on the ws object
@@ -209,6 +220,11 @@ function createOrchestrator({
             // promote, so this never needs to pause for visibility.
             readyDeadline: null,
             readyTimer: null,
+            // Consecutive readiness timeouts with zero reports — see
+            // READY_TIMEOUT_STALL_STREAK. Survives commits (an autonomous
+            // re-commit must not launder an unresponsive display back to a
+            // fresh streak); cleared only by markAlive().
+            readyTimeoutStreak: 0,
             // In-flight refill promise; coalesces concurrent refillQueue
             // callers onto a single search round-trip.
             refillPromise: null,
@@ -541,6 +557,15 @@ function createOrchestrator({
             channel.readyTimer = null;
             channel.readyDeadline = null;
             if (channel.phase !== 'loading') return;
+            channel.readyTimeoutStreak += 1;
+            if (channel.readyTimeoutStreak >= READY_TIMEOUT_STALL_STREAK) {
+                // Park in 'loading' with the barrier armed: an accepted
+                // imageReady (or any markAlive trigger) resumes from here.
+                const msg = `[orchestrator] display unresponsive (${channel.deviceId}): ${channel.readyTimeoutStreak} readiness timeouts in a row; pausing cadence until a session reports`;
+                if (channel.readyTimeoutStreak === READY_TIMEOUT_STALL_STREAK) console.warn(msg);
+                else dbg(msg);
+                return;
+            }
             const waiting = Array.from(channel.expectedReady).filter((k) => !channel.ready.has(k));
             // dbg, not warn: a display that's powered off without reporting
             // visibility:false hits this every frame, flooding the log with
@@ -548,6 +573,16 @@ function createOrchestrator({
             dbg(`readiness timeout (${channel.deviceId}): no imageReady for id=${channel.currentId} within ${ms}ms; promoting without {${waiting.join(',')}}`);
             promoteToDisplaying(channel);
         }, ms);
+    }
+
+    // A live signal from the channel's audience: a session (re)joined, an
+    // imageReady landed, a visibility report arrived, or a user drove the
+    // channel. Clears the unresponsive streak so the readiness fallback
+    // promotes again; the caller's own path (startTimerIfReady, a
+    // commitCurrent, an advance) is what actually gets a stalled channel
+    // moving.
+    function markAlive(channel) {
+        channel.readyTimeoutStreak = 0;
     }
 
     function scheduleDwell(channel) {
@@ -726,6 +761,7 @@ function createOrchestrator({
         // reset path, so the slideshow restarts the readiness barrier
         // for the same image rather than firing immediately.
         channel.parked = false;
+        markAlive(channel);
         const sess = sessionsByKey.get(key) || { ws, sessionId, channel, modTags: [] };
         sess.ws = ws;
         sess.sessionId = sessionId;
@@ -868,6 +904,7 @@ function createOrchestrator({
         const sess = sessionsByKey.get(key);
         if (!sess) return;
         const channel = sess.channel;
+        markAlive(channel);
         sess.modTags = Array.isArray(tags) ? tags.map(String).filter(Boolean) : [];
         // While merged, only sessions on the driver channel can change
         // mod tags. Audience channels are borrowed and shouldn't override
@@ -891,6 +928,7 @@ function createOrchestrator({
         const sess = sessionsByKey.get(key);
         if (!sess) return;
         const target = isMergeActive() ? mergeDriverChannel : sess.channel;
+        markAlive(target);
         advance(target);
     }
 
@@ -903,6 +941,7 @@ function createOrchestrator({
             catch (err) { console.warn(`[orchestrator] reshuffle failed: ${err.message}`); }
         }
         const target = isMergeActive() ? mergeDriverChannel : sess.channel;
+        markAlive(target);
         await clearAndRefill(target);
         commitCurrent(target);
     }
@@ -933,6 +972,7 @@ function createOrchestrator({
             target.currentDurationMs = Math.max(target.currentDurationMs || 0, dur);
         }
         target.ready.add(key);
+        markAlive(target);
         dbg(`imageReady accepted: key=${key} id=${id} on ${target.deviceId} ready=${target.ready.size}/${target.expectedReady.size}`);
         startTimerIfReady(target);
     }
@@ -952,6 +992,7 @@ function createOrchestrator({
                 || broadcastTargets(c).some((k) => sessionsByKey.get(k)?.channel.deviceId === deviceId));
 
         for (const channel of affected) {
+            markAlive(channel);
             if (channel.phase === 'loading') {
                 channel.expectedReady = expectedReadersFor(channel);
                 for (const key of Array.from(channel.ready)) {
@@ -978,6 +1019,7 @@ function createOrchestrator({
         const sess = sessionsByKey.get(key);
         if (!sess) return;
         const channel = sess.channel;
+        markAlive(channel);
         const n = Number(listNumber);
         if (!Number.isFinite(n) || n < 0) return;
         // While merged, only the driver channel's sessions can change the
@@ -1033,6 +1075,7 @@ function createOrchestrator({
         const sess = sessionsByKey.get(key);
         if (!sess) return;
         const channel = sess.channel;
+        markAlive(channel);
         if (enabled) {
             if (mergeDriverChannel === channel) return;
             mergeDriverChannel = channel;
@@ -1135,6 +1178,7 @@ function createOrchestrator({
                 sessionCount: c.sessions.size,
                 expectedReady: c.expectedReady.size,
                 ready: c.ready.size,
+                readyTimeoutStreak: c.readyTimeoutStreak,
                 hasTimer: !!c.timer,
                 dwellRemaining: c.dwellDeadline ? c.dwellDeadline - Date.now() : null,
                 readyRemaining: c.readyDeadline ? c.readyDeadline - Date.now() : null,

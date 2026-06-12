@@ -102,9 +102,15 @@ updates to track a server change, ship those too:
   reports within the budget — the recovery path for a client that stays
   on the socket but stops reporting (frozen render loop). It's
   per-channel, so it keys on deviceId; the all-hidden short-circuit
-  already covers the legitimate "nobody can display" case, so the
-  timeout only fires on a wedged *visible* session. With it disabled the
-  channel parks on the frame forever until a report arrives.
+  covers sessions that *reported* themselves hidden. After 3 consecutive
+  timeouts with zero reports the channel stalls (parks on the frame, no
+  blind advances / deck bumps / prefetch) — the steady state for a
+  display that's off but never reported visibility:false, e.g. right
+  after a server restart wiped the in-memory visibility map. Any sign of
+  life (accepted imageReady, visibility report, re-register, user action
+  on the channel) clears the streak and resumes. With the timeout
+  disabled the channel parks on the frame immediately until a report
+  arrives.
 - **Visibility = pause/resume, not reset.** A `visibility {deviceId, false}`
   pauses the dwell countdown using a wall-clock deadline; `true`
   resumes the *remaining* time. A wake never bumps the deadline. Web

@@ -322,6 +322,68 @@ test('readiness timeout: a never-reporting visible client is promoted after the 
     assert.ok(ch.timer, 'dwell timer running after the timeout promote');
 });
 
+test('a streak of readiness timeouts stalls the channel instead of advancing blind', async (t) => {
+    const { orch } = harness({ readyTimeout: 40 });
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 5000 });
+    await tick(); await tick(); await tick();
+    const ch = orch.raw._channels.get('screen1');
+    assert.equal(ch.phase, 'loading');
+    const stuckId = ch.currentId;
+    // Two prior cycles already timed out (set directly — accumulating them
+    // for real means riding full dwell cycles); the next fire crosses the
+    // stall threshold.
+    ch.readyTimeoutStreak = 2;
+    await delay(70);
+    assert.equal(ch.readyTimeoutStreak, 3);
+    assert.equal(ch.phase, 'loading', 'stalled channel parks on the frame instead of promoting');
+    assert.equal(ch.readyTimer, null, 'no readiness timer re-armed while stalled');
+    assert.equal(ch.timer, null, 'no dwell timer while stalled');
+    assert.equal(ch.currentId, stuckId, 'no blind advance');
+
+    // First sign of life — the wedged client finally reports — resumes.
+    orch.notifyImageReady(ws, stuckId);
+    assert.equal(ch.readyTimeoutStreak, 0, 'streak cleared by the accepted report');
+    assert.equal(ch.phase, 'displaying', 'accepted report promotes the stalled frame');
+});
+
+test('a visibility report resumes a stalled channel', async (t) => {
+    const { orch } = harness({ readyTimeout: 40 });
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 5000 });
+    await tick(); await tick(); await tick();
+    const ch = orch.raw._channels.get('screen1');
+    ch.readyTimeoutStreak = 2;
+    await delay(70);
+    assert.equal(ch.phase, 'loading', 'stalled');
+    // The display agent finally reports the screen is off: the streak clears
+    // and the all-hidden short-circuit takes over (wall-clock advance with
+    // prefetch suppressed), which is the legitimate dark-display mode.
+    orch.notifyVisibility('screen1', false);
+    assert.equal(ch.readyTimeoutStreak, 0);
+    assert.equal(ch.phase, 'displaying', 'hidden short-circuit promotes');
+});
+
+test('a re-registering session resumes a stalled channel', async (t) => {
+    const { orch } = harness({ readyTimeout: 40 });
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 5000 });
+    await tick(); await tick(); await tick();
+    const ch = orch.raw._channels.get('screen1');
+    ch.readyTimeoutStreak = 2;
+    await delay(70);
+    assert.equal(ch.phase, 'loading', 'stalled');
+    assert.equal(ch.readyTimer, null);
+    // Kiosk reboots and replays slideshowConfig on the same deviceId.
+    orch.register(ws, { deviceId: 'screen1', interval: 5000 });
+    await tick(); await tick(); await tick();
+    assert.equal(ch.readyTimeoutStreak, 0);
+    assert.ok(ch.readyTimer, 'barrier re-armed for the rejoined session');
+});
+
 test('readiness timeout is per-channel: one wedged deviceId does not promote a co-tenant', async (t) => {
     const { orch } = harness({ readyTimeout: 40 });
     t.after(() => orch.close());
