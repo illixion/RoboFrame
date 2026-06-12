@@ -73,6 +73,10 @@ function createOrchestrator({
     getTagLists,
     getBlockedIds = () => [],
     getBlockedTags = () => [],
+    // Resolves blocked tags to every tag name they cover (aliases +
+    // implication antecedents) so the in-JS queue filter agrees with the
+    // SQL layer about what "matches tag T" means on an unflattened library.
+    expandBlockedTags = (tags) => new Set((tags || []).filter(Boolean).map(String)),
     reshuffle,
     incrementDisplayCount,
     prefetcher = null,
@@ -436,7 +440,7 @@ function createOrchestrator({
                 const beforeLen = channel.queue.length;
                 const present = new Set(channel.queue.map((e) => e.id));
                 const blockedIdSet = new Set((getBlockedIds() || []).map(Number));
-                const blockedTagSet = new Set((getBlockedTags() || []).map(String));
+                const blockedTagSet = expandBlockedTags(getBlockedTags() || []);
                 for (const post of results) {
                     if (!post || !post._id) continue;
                     const id = Number(post._id);
@@ -991,7 +995,7 @@ function createOrchestrator({
 
     function notifyBlockedChange() {
         const blockedIdSet = new Set((getBlockedIds() || []).map(Number));
-        const blockedTagSet = new Set((getBlockedTags() || []).map(String));
+        const blockedTagSet = expandBlockedTags(getBlockedTags() || []);
         for (const channel of channels.values()) {
             const before = channel.queue.length;
             channel.queue = channel.queue.filter((entry) => !blockedIdSet.has(Number(entry.id)));

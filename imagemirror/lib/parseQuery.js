@@ -1,10 +1,15 @@
-// Translate a user query string into a DuckDB SQL WHERE clause + paging options.
-// Pure function; lives in its own module so it can be unit-tested without booting the server.
+// Translate a user query string into a DuckDB SQL WHERE clause (non-tag
+// constraints only), structured tag terms, and paging options. Tag terms are
+// returned as data rather than SQL because the search layer routes them
+// through alias/implication expansion and (when available) the posts_tags
+// inverted index — see lib/searchQuery.js and lib/tagExpansion.js.
+// Pure function; lives in its own module so it can be unit-tested without
+// booting the server.
 //
 // Supported syntax:
-//   bare-tag      include — `p.tags @> ARRAY[bare-tag]`
-//   -tag          exclude — `NOT p.tags && ARRAY[tag]`
-//   ~tag          optional/has-any — `p.tags && ARRAY[tag]`
+//   bare-tag      include — every include term must match
+//   -tag          exclude — none may match
+//   ~tag          optional/has-any — at least one optional term matches
 //   col:val       exact match (rating, file_ext) or numeric =
 //   col:>=N       numeric comparison: <, <=, >, >=, !=
 //   col:N..M      numeric range
@@ -26,12 +31,14 @@ function num(s) {
     return Number.isFinite(n) ? n : null;
 }
 
+const EMPTY_TERMS = Object.freeze({ include: [], exclude: [], optional: [] });
+
 function parseQuery(query) {
     const whereClauses = [];
     let limit = 40;
     let orderBy = 'RANDOM()';
 
-    if (!query) return { where: 'TRUE', limit, orderBy };
+    if (!query) return { where: 'TRUE', tagTerms: EMPTY_TERMS, limit, orderBy };
 
     const includeTags = [];
     const excludeTags = [];
@@ -44,10 +51,13 @@ function parseQuery(query) {
         const key = colonIdx === -1 ? part : part.slice(0, colonIdx);
         const value = colonIdx === -1 ? undefined : part.slice(colonIdx + 1);
 
+        // Tag terms stay raw here — the search layer owns expansion and SQL
+        // escaping for them; escapeTag below is only for string-column values
+        // that go straight into the WHERE clause.
         if (value === undefined) {
-            if (key.startsWith('-')) excludeTags.push(escapeTag(key.substring(1)));
-            else if (key.startsWith('~')) optionalTags.push(escapeTag(key.substring(1)));
-            else if (key) includeTags.push(escapeTag(key));
+            if (key.startsWith('-')) excludeTags.push(key.substring(1));
+            else if (key.startsWith('~')) optionalTags.push(key.substring(1));
+            else if (key) includeTags.push(key);
             continue;
         }
 
@@ -102,11 +112,12 @@ function parseQuery(query) {
         console.warn(`Unknown query part: ${part}`);
     }
 
-    if (includeTags.length) whereClauses.push(`p.tags @> ARRAY[${includeTags.map((t) => `'${t}'`).join(', ')}]`);
-    if (excludeTags.length) whereClauses.push(`NOT p.tags && ARRAY[${excludeTags.map((t) => `'${t}'`).join(', ')}]`);
-    if (optionalTags.length) whereClauses.push(`p.tags && ARRAY[${optionalTags.map((t) => `'${t}'`).join(', ')}]`);
-
-    return { where: whereClauses.length ? whereClauses.join(' AND ') : 'TRUE', limit, orderBy };
+    return {
+        where: whereClauses.length ? whereClauses.join(' AND ') : 'TRUE',
+        tagTerms: { include: includeTags, exclude: excludeTags, optional: optionalTags },
+        limit,
+        orderBy,
+    };
 }
 
 module.exports = { parseQuery };

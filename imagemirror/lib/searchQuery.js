@@ -2,12 +2,16 @@
 // DuckDB query path used by the /search and /count HTTP helpers and the
 // slideshow orchestrator. One implementation, one match-set cache.
 //
-// The expensive part of any query is the tag filter: `p.tags @> ARRAY[...]`
-// is a full scan of a multi-million-row varchar[] column that DuckDB
-// parallelizes across every core. So the scan runs once per *distinct WHERE
-// clause* and its matching ids are materialized into a temp table
+// The expensive part of any query is the tag filter — without an inverted
+// index it's a full scan of a multi-million-row varchar[] column that DuckDB
+// parallelizes across every core; with file_db.posts_tags it's an id-list
+// probe, but still worth doing once. So the filter runs once per *distinct
+// WHERE clause* and its matching ids are materialized into a temp table
 // (`match_<hash>`); every page, count, and one-shot random pick then works
-// off that id set with a cheap join. Ordering data (display_count /
+// off that id set with a cheap join. Query tags pass through the
+// alias/implication expander (lib/tagExpansion.js) before hitting SQL, so
+// the same query selects the same posts on flattened and unflattened
+// libraries. Ordering data (display_count /
 // random_rank) is read live from memory.random_ranks at page time, so
 // view-count bumps never invalidate a set — membership only depends on
 // file_db, which is attached READ_ONLY at startup and can't change under us
@@ -30,6 +34,7 @@
 
 const crypto = require('crypto');
 const { parseQuery } = require('./parseQuery');
+const { identityExpander } = require('./tagExpansion');
 
 // Hide posts whose file row was deleted (image removed on disk → CLI
 // dropped the posts_paths entry but kept the posts row for history /
@@ -37,10 +42,47 @@ const { parseQuery } = require('./parseQuery');
 // orphans that 404 on /get and warn from the prefetcher.
 const HAS_PATH = 'EXISTS (SELECT 1 FROM file_db.posts_paths pp WHERE pp._id = p._id)';
 
-function createSearch({ db, maxSets = 16 } = {}) {
+// `expander` resolves a query tag to every tag name that should match it
+// (aliases + transitive implication antecedents — see lib/tagExpansion.js).
+// `hasPostsTags` routes tag terms through the file_db.posts_tags inverted
+// index (id lists per tag, clustered by tag) instead of scanning the
+// posts.tags arrays — ~20x cheaper set builds when the CLI shipped the table.
+function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPostsTags = false } = {}) {
     // WHERE-clause key → { key, table, count, lastUsed, ready: Promise<entry> }
     const sets = new Map();
     let tick = 0;
+
+    function quoteList(tags) {
+        return tags.map((t) => `'${String(t).replace(/'/g, "''")}'`).join(', ');
+    }
+
+    // "post has at least one of these tag spellings".
+    function anyTagClause(expandedTags) {
+        return hasPostsTags
+            ? `p._id IN (SELECT _id FROM file_db.posts_tags WHERE tag IN (${quoteList(expandedTags)}))`
+            : `p.tags && ARRAY[${quoteList(expandedTags)}]`;
+    }
+
+    function noneTagClause(expandedTags) {
+        return hasPostsTags
+            ? `p._id NOT IN (SELECT _id FROM file_db.posts_tags WHERE tag IN (${quoteList(expandedTags)}))`
+            : `NOT p.tags && ARRAY[${quoteList(expandedTags)}]`;
+    }
+
+    // Full WHERE for a parsed query: each include term must match through its
+    // expansion; excludes and optionals work on the union of theirs. Terms
+    // are sorted so equivalent queries share one set key.
+    function composeWhere({ where, tagTerms }) {
+        const clauses = [];
+        const include = (tagTerms?.include || []).slice().sort();
+        for (const t of include) clauses.push(anyTagClause(expander.expand(t)));
+        const exclude = tagTerms?.exclude || [];
+        if (exclude.length) clauses.push(noneTagClause(Array.from(expander.expandAll(exclude)).sort()));
+        const optional = tagTerms?.optional || [];
+        if (optional.length) clauses.push(anyTagClause(Array.from(expander.expandAll(optional)).sort()));
+        if (where && where !== 'TRUE') clauses.push(where);
+        return clauses.length ? clauses.join(' AND ') : 'TRUE';
+    }
 
     function runAsync(sql) {
         return new Promise((resolve, reject) => db.run(sql, (err) => (err ? reject(err) : resolve())));
@@ -116,9 +158,10 @@ function createSearch({ db, maxSets = 16 } = {}) {
     }
 
     async function runSearch({ q = '', cursor = null, limit } = {}) {
-        const { where, limit: parsedLimit, orderBy } = parseQuery(q);
+        const parsed = parseQuery(q);
+        const { limit: parsedLimit, orderBy } = parsed;
         const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : parsedLimit;
-        const set = await getMatchSet(where);
+        const set = await getMatchSet(composeWhere(parsed));
         if (set.count === 0) return { results: [], nextCursor: null };
 
         const isRandom = orderBy === 'RANDOM()';
@@ -161,10 +204,9 @@ function createSearch({ db, maxSets = 16 } = {}) {
         let sql = '';
         const ids = blockedIds.map(Number).filter(Number.isFinite);
         if (ids.length) sql += ` AND m._id NOT IN (${ids.join(', ')})`;
-        const tags = Array.from(new Set(blockedTags.filter(Boolean).map(String))).sort();
+        const tags = Array.from(expander.expandAll(blockedTags)).sort();
         if (tags.length) {
-            const where = `p.tags && ARRAY[${tags.map((t) => `'${t.replace(/'/g, "''")}'`).join(', ')}]`;
-            const set = await getMatchSet(where);
+            const set = await getMatchSet(anyTagClause(tags));
             if (set.count > 0) sql += ` AND m._id NOT IN (SELECT _id FROM ${set.table})`;
         }
         return sql;
@@ -184,8 +226,7 @@ function createSearch({ db, maxSets = 16 } = {}) {
     // independent uniform draws, with replacement (a post can recur, and the
     // selection ignores the slideshow's view counts).
     async function runRandomOne({ q = '', blockedIds = [], blockedTags = [] } = {}) {
-        const { where } = parseQuery(q);
-        const set = await getMatchSet(where);
+        const set = await getMatchSet(composeWhere(parseQuery(q)));
         if (set.count === 0) return null;
         const blocked = await blockedClause({ blockedIds, blockedTags });
         const rows = await allAsync(hydrateOneSql(`
@@ -207,8 +248,7 @@ function createSearch({ db, maxSets = 16 } = {}) {
     // RANDOM() draws. Shares the deck with the slideshow, so a pick here also
     // deprioritises that post on the frame until the next reshuffle.
     async function runRankedRandomOne({ q = '', blockedIds = [], blockedTags = [] } = {}) {
-        const { where } = parseQuery(q);
-        const set = await getMatchSet(where);
+        const set = await getMatchSet(composeWhere(parseQuery(q)));
         if (set.count === 0) return null;
         const blocked = await blockedClause({ blockedIds, blockedTags });
         const rows = await allAsync(hydrateOneSql(`
@@ -225,8 +265,7 @@ function createSearch({ db, maxSets = 16 } = {}) {
     // Set membership is exactly "matches the WHERE and has a path", so the
     // count captured at build time is the answer — no extra scan.
     async function runCount({ q = '' } = {}) {
-        const { where } = parseQuery(q);
-        const set = await getMatchSet(where);
+        const set = await getMatchSet(composeWhere(parseQuery(q)));
         return set.count;
     }
 

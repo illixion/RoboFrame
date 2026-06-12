@@ -14,6 +14,7 @@ const zlib = require('zlib');
 const { loadConfig, pickEnv } = require('@roboframe/shared');
 const { setupBroker } = require('./lib/broker');
 const { createSearch } = require('./lib/searchQuery');
+const { createTagExpander, identityExpander } = require('./lib/tagExpansion');
 const { createHistory } = require('./lib/history');
 const { createImageCache } = require('./lib/imageCache');
 const { createPrefetcher } = require('./lib/prefetcher');
@@ -666,6 +667,46 @@ async function attachReadOnlyFileDb() {
   });
 }
 
+function allAsync(sql) {
+  return new Promise((resolve, reject) => db.all(sql, (err, rows) => (err ? reject(err) : resolve(rows || []))));
+}
+
+// What the attached library ships determines how tag queries run. posts_tags
+// (the inverted index) marks the unflattened layout: posts carry only their
+// direct tags, so queries MUST expand through the alias/implication tables —
+// and the index is what makes those wide expansions cheap (id-list probes).
+// Without posts_tags the library is either flattened (implications baked into
+// every row, expansion would re-match the same posts through a pathologically
+// wide && ARRAY[...] scan) or a folder import with no relations at all; both
+// want identity expansion and the array-scan fallback.
+async function detectFileDbTables() {
+  const rows = await allAsync(`SELECT table_name FROM duckdb_tables() WHERE database_name = 'file_db';`);
+  return new Set(rows.map((r) => String(r.table_name)));
+}
+
+async function loadTagExpander(tables) {
+  if (!tables.has('posts_tags') || (!tables.has('tag_aliases') && !tables.has('tag_implications'))) {
+    return identityExpander();
+  }
+  const aliases = new Map();
+  if (tables.has('tag_aliases')) {
+    const rows = await allAsync(`SELECT antecedent_name, consequent_name FROM file_db.tag_aliases WHERE status = 'active';`);
+    for (const r of rows) aliases.set(String(r.antecedent_name), String(r.consequent_name));
+  }
+  const implications = new Map();
+  if (tables.has('tag_implications')) {
+    const rows = await allAsync(`SELECT antecedent_name, consequent_name FROM file_db.tag_implications WHERE status = 'active';`);
+    for (const r of rows) {
+      const ante = String(r.antecedent_name);
+      let arr = implications.get(ante);
+      if (!arr) { arr = []; implications.set(ante, arr); }
+      arr.push(String(r.consequent_name));
+    }
+  }
+  console.log(`Tag expansion loaded: ${aliases.size} aliases, ${implications.size} implication antecedents`);
+  return createTagExpander({ aliases, implications });
+}
+
 async function refreshRandomRanks() {
   return new Promise((resolve, reject) => {
     db.run(`DROP TABLE IF EXISTS random_ranks;`, (err) => {
@@ -704,10 +745,15 @@ async function refreshRandomRanks() {
       console.log('random_ranks periodic refresh disabled (rankRefreshHours <= 0)');
     }
 
+    const fileDbTables = await detectFileDbTables();
+    const expander = await loadTagExpander(fileDbTables);
+    const hasPostsTags = fileDbTables.has('posts_tags');
+    if (hasPostsTags) console.log('posts_tags inverted index found — tag queries route through it');
+
     // The server is the single DuckDB reader. It feeds the slideshow
     // orchestrator, which broadcasts a `playback` channel over WebSocket
     // and is what every kiosk renders from.
-    const search = createSearch({ db });
+    const search = createSearch({ db, expander, hasPostsTags });
     searchRef = search;
 
     const reshuffle = async () => {
@@ -736,6 +782,7 @@ async function refreshRandomRanks() {
     brokerRef = setupBroker({
       server, app, config, dataPath: DATA_PATH, search, reshuffle, incrementDisplayCount,
       imageCache, prefetcher, prefetchVariant,
+      expandBlockedTags: (tags) => expander.expandAll(tags),
     });
     server.listen(PORT, HOST, () => {
       console.log(`Server running on http://${HOST}:${PORT}`);

@@ -43,7 +43,7 @@ test('set build carries the tag filter and orphan guard; pages do not rescan', a
     assert.deepEqual(row, { _id: 7n, path: '/x/7.jxl' });
     const creates = db.creates();
     assert.equal(creates.length, 1);
-    assert.match(creates[0], /p\.tags @> ARRAY\['cats'\]/);
+    assert.match(creates[0], /p\.tags && ARRAY\['cats'\]/);
     assert.match(creates[0], /EXISTS \(SELECT 1 FROM file_db\.posts_paths/);
     // The page query works off the set — no tag filter, no orphan guard.
     const pages = db.pages();
@@ -258,6 +258,48 @@ test('a failed build does not poison its key', async () => {
     const { results } = await search.runSearch({ q: 'cats' });
     assert.deepEqual(results, []);
     assert.equal(db.creates().length, 2);
+});
+
+test('each include term must match through its expansion; terms sort into one key', async () => {
+    const { createTagExpander } = require('../lib/tagExpansion');
+    const expander = createTagExpander({
+        aliases: new Map([['kitty', 'cat']]),
+        implications: new Map([['cat', ['felid']], ['felid', ['mammal']]]),
+    });
+    const db = stubDb({ rows: [] });
+    const search = createSearch({ db, expander });
+    await search.runSearch({ q: 'mammal dogs' });
+    const create = db.creates()[0];
+    // Transitive implication antecedents + alias antecedents, one && per term.
+    assert.match(create, /p\.tags && ARRAY\['cat', 'felid', 'kitty', 'mammal'\]/);
+    assert.match(create, /p\.tags && ARRAY\['dogs'\]/);
+    // Term order doesn't fork the set.
+    await search.runSearch({ q: 'dogs mammal' });
+    assert.equal(db.creates().length, 1);
+});
+
+test('excluded and blocked tags expand the same way', async () => {
+    const { createTagExpander } = require('../lib/tagExpansion');
+    const expander = createTagExpander({
+        aliases: new Map(),
+        implications: new Map([['cat', ['felid']]]),
+    });
+    const db = stubDb({ rows: [{ _id: 1n }] });
+    const search = createSearch({ db, expander });
+    await search.runRandomOne({ q: '-felid', blockedTags: ['felid'] });
+    const creates = db.creates();
+    assert.match(creates[0], /NOT p\.tags && ARRAY\['cat', 'felid'\]/);
+    assert.match(creates[1], /p\.tags && ARRAY\['cat', 'felid'\]/);
+});
+
+test('posts_tags routes tag terms through the inverted index', async () => {
+    const db = stubDb({ rows: [] });
+    const search = createSearch({ db, hasPostsTags: true });
+    await search.runSearch({ q: "cats -o'brien" });
+    const create = db.creates()[0];
+    assert.match(create, /p\._id IN \(SELECT _id FROM file_db\.posts_tags WHERE tag IN \('cats'\)\)/);
+    assert.match(create, /p\._id NOT IN \(SELECT _id FROM file_db\.posts_tags WHERE tag IN \('o''brien'\)\)/);
+    assert.doesNotMatch(create, /p\.tags/);
 });
 
 test('an empty query materializes the TRUE set', async () => {

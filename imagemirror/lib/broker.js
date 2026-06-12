@@ -26,7 +26,7 @@ const { pickEnv, loadConfig } = require('@roboframe/shared');
 const { createOrchestrator } = require('./orchestrator');
 const { createMqttBridge } = require('./mqtt-bridge');
 
-function setupBroker({ server, app, config, dataPath, search, reshuffle, incrementDisplayCount, imageCache, prefetcher, prefetchVariant }) {
+function setupBroker({ server, app, config, dataPath, search, reshuffle, incrementDisplayCount, imageCache, prefetcher, prefetchVariant, expandBlockedTags }) {
     const srv = config.server || {};
     const ha = srv.ha || {};
     const mqttCfg = srv.mqtt || {};
@@ -320,6 +320,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         getTagLists,
         getBlockedIds: getBlockedPosts,
         getBlockedTags,
+        ...(expandBlockedTags ? { expandBlockedTags } : {}),
         reshuffle,
         incrementDisplayCount,
         prefetcher,

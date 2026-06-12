@@ -9,29 +9,29 @@ const { parseQuery } = require('../lib/parseQuery');
 // so failures show up clearly. Restore at the end of each test where it matters.
 const realWarn = console.warn;
 
-test('empty query → TRUE', () => {
-    assert.deepEqual(parseQuery(''), { where: 'TRUE', limit: 40, orderBy: 'RANDOM()' });
-    assert.deepEqual(parseQuery(undefined), { where: 'TRUE', limit: 40, orderBy: 'RANDOM()' });
+const NO_TAGS = { include: [], exclude: [], optional: [] };
+
+test('empty query → TRUE with no tag terms', () => {
+    assert.deepEqual(parseQuery(''), { where: 'TRUE', tagTerms: NO_TAGS, limit: 40, orderBy: 'RANDOM()' });
+    assert.deepEqual(parseQuery(undefined), { where: 'TRUE', tagTerms: NO_TAGS, limit: 40, orderBy: 'RANDOM()' });
 });
 
-test('bare tag becomes include-array', () => {
-    const r = parseQuery('foo');
-    assert.equal(r.where, "p.tags @> ARRAY['foo']");
-});
-
-test('multiple bare tags compose into one include-array', () => {
+test('bare tags become include terms, not SQL', () => {
     const r = parseQuery('foo bar');
-    assert.equal(r.where, "p.tags @> ARRAY['foo', 'bar']");
+    assert.deepEqual(r.tagTerms, { include: ['foo', 'bar'], exclude: [], optional: [] });
+    assert.equal(r.where, 'TRUE');
 });
 
-test('-tag becomes exclude clause', () => {
+test('-tag becomes an exclude term', () => {
     const r = parseQuery('-bar');
-    assert.equal(r.where, "NOT p.tags && ARRAY['bar']");
+    assert.deepEqual(r.tagTerms, { include: [], exclude: ['bar'], optional: [] });
+    assert.equal(r.where, 'TRUE');
 });
 
-test('~tag becomes optional/has-any clause', () => {
+test('~tag becomes an optional term', () => {
     const r = parseQuery('~maybe');
-    assert.equal(r.where, "p.tags && ARRAY['maybe']");
+    assert.deepEqual(r.tagTerms, { include: [], exclude: [], optional: ['maybe'] });
+    assert.equal(r.where, 'TRUE');
 });
 
 test('numeric comparisons cover all operators', () => {
@@ -61,9 +61,10 @@ test('order: rewrites orderBy and limit: rewrites limit', () => {
     assert.equal(parseQuery('limit:80').limit, 80);
 });
 
-test('SQL injection guard: apostrophes inside tags are doubled', () => {
+test('tag terms stay raw — escaping is the search layer\'s job', () => {
     const r = parseQuery("weird'tag");
-    assert.equal(r.where, "p.tags @> ARRAY['weird''tag']");
+    assert.deepEqual(r.tagTerms.include, ["weird'tag"]);
+    assert.doesNotMatch(r.where, /weird/);
 });
 
 test('unknown column is rejected (no SQL emitted)', () => {
@@ -97,9 +98,10 @@ test('NaN range guard: score:.. does not produce BETWEEN NaN AND NaN', () => {
     }
 });
 
-test('multi-clause query joins with AND', () => {
+test('mixed query splits SQL clauses from tag terms', () => {
     const r = parseQuery('foo -bar score:>=50 limit:5 order:random');
-    assert.equal(r.where, "p.score >= 50 AND p.tags @> ARRAY['foo'] AND NOT p.tags && ARRAY['bar']");
+    assert.equal(r.where, 'p.score >= 50');
+    assert.deepEqual(r.tagTerms, { include: ['foo'], exclude: ['bar'], optional: [] });
     assert.equal(r.limit, 5);
     assert.equal(r.orderBy, 'RANDOM()');
 });
