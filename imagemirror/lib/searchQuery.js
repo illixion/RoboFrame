@@ -1,17 +1,34 @@
 'use strict';
-// DuckDB query path used by both the (now-removed-from-HTTP) search endpoint
-// and the slideshow orchestrator. One implementation, one cache.
+// DuckDB query path used by the /search and /count HTTP helpers and the
+// slideshow orchestrator. One implementation, one match-set cache.
 //
-// The orchestrator is the only caller in production; the export is a factory
-// so tests can stub `db`.
+// The expensive part of any query is the tag filter: `p.tags @> ARRAY[...]`
+// is a full scan of a multi-million-row varchar[] column that DuckDB
+// parallelizes across every core. So the scan runs once per *distinct WHERE
+// clause* and its matching ids are materialized into a temp table
+// (`match_<hash>`); every page, count, and one-shot random pick then works
+// off that id set with a cheap join. Ordering data (display_count /
+// random_rank) is read live from memory.random_ranks at page time, so
+// view-count bumps never invalidate a set — membership only depends on
+// file_db, which is attached READ_ONLY at startup and can't change under us
+// (a regenerated .duckdb has always required a server restart).
+//
+// Concurrent callers for the same WHERE — e.g. every channel of a sharedTags
+// fleet refilling at once — await the same in-flight build promise, so the
+// fleet costs one scan. Sets are LRU-evicted (DROP TABLE) beyond `maxSets`.
 //
 // Two paging modes:
 //   - random (orderBy = RANDOM()): joins memory.random_ranks and orders by
 //     (display_count, random_rank) so unseen posts appear first; cursor is
 //     the (display_count, random_rank) tuple of the last row returned.
-//   - deterministic (any explicit order:id|score|score_asc): direct query
-//     with OFFSET-based cursor.
+//   - deterministic (any explicit order:id|score|score_asc): OFFSET cursor.
+//
+// The server-side blocklist (blockedIds / blockedTags) is deliberately NOT
+// part of a set's key or contents — it changes independently of the query
+// (data.json edits) and is cheap to apply as page-time clauses against an
+// already-filtered set.
 
+const crypto = require('crypto');
 const { parseQuery } = require('./parseQuery');
 
 // Hide posts whose file row was deleted (image removed on disk → CLI
@@ -20,92 +37,165 @@ const { parseQuery } = require('./parseQuery');
 // orphans that 404 on /get and warn from the prefetcher.
 const HAS_PATH = 'EXISTS (SELECT 1 FROM file_db.posts_paths pp WHERE pp._id = p._id)';
 
-function createSearch({ db, cacheSize = 20 } = {}) {
-    const cache = []; // LRU: [{ key, value }]
+function createSearch({ db, maxSets = 16 } = {}) {
+    // WHERE-clause key → { key, table, count, lastUsed, ready: Promise<entry> }
+    const sets = new Map();
+    let tick = 0;
 
-    function runSearch({ q = '', cursor = null, limit } = {}) {
+    function runAsync(sql) {
+        return new Promise((resolve, reject) => db.run(sql, (err) => (err ? reject(err) : resolve())));
+    }
+    function allAsync(sql) {
+        return new Promise((resolve, reject) => db.all(sql, (err, rows) => (err ? reject(err) : resolve(rows || []))));
+    }
+
+    function setKeyOf(where) {
+        return where && where !== 'TRUE' ? where : 'TRUE';
+    }
+    function tableNameOf(key) {
+        return 'match_' + crypto.createHash('sha1').update(key).digest('hex').slice(0, 16);
+    }
+
+    async function buildSet(key, table) {
+        const t0 = Date.now();
+        // CREATE OR REPLACE so a retry after a half-failed build can't trip
+        // over a leftover table.
+        await runAsync(`CREATE OR REPLACE TEMP TABLE ${table} AS
+            SELECT p._id FROM file_db.posts p
+            WHERE (${key}) AND ${HAS_PATH};`);
+        const rows = await allAsync(`SELECT COUNT(*)::BIGINT AS n FROM ${table};`);
+        const count = Number(rows[0] ? rows[0].n : 0);
+        const label = key.length > 160 ? `${key.slice(0, 160)}… (${key.length} chars)` : key;
+        console.log(`[search] built ${table} (${count} rows, ${Date.now() - t0}ms) for: ${label}`);
+        return count;
+    }
+
+    // Resolve (building if needed) the match set for a WHERE clause. The
+    // entry goes into the map before the build resolves, so concurrent
+    // callers share one scan; a failed build removes the entry so the key
+    // isn't poisoned.
+    function getMatchSet(where) {
+        const key = setKeyOf(where);
+        let entry = sets.get(key);
+        if (entry) {
+            entry.lastUsed = ++tick;
+            return entry.ready;
+        }
+        const table = tableNameOf(key);
+        entry = { key, table, count: null, lastUsed: ++tick };
+        entry.ready = buildSet(key, table).then(
+            (count) => { entry.count = count; return entry; },
+            (err) => { sets.delete(key); throw err; },
+        );
+        sets.set(key, entry);
+        evictIfNeeded();
+        return entry.ready;
+    }
+
+    // DROP only after the build settles so a DROP can never overtake its own
+    // CREATE on the connection. A page query already queued against a
+    // just-dropped table fails once and the caller's next attempt rebuilds —
+    // the same narrow race refreshRandomRanks has always had.
+    function dropSet(entry) {
+        entry.ready
+            .catch(() => {})
+            .then(() => runAsync(`DROP TABLE IF EXISTS ${entry.table};`))
+            .catch(() => {});
+    }
+
+    function evictIfNeeded() {
+        while (sets.size > maxSets) {
+            let oldest = null;
+            for (const e of sets.values()) {
+                if (!oldest || e.lastUsed < oldest.lastUsed) oldest = e;
+            }
+            if (!oldest) break;
+            sets.delete(oldest.key);
+            dropSet(oldest);
+        }
+    }
+
+    async function runSearch({ q = '', cursor = null, limit } = {}) {
         const { where, limit: parsedLimit, orderBy } = parseQuery(q);
         const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : parsedLimit;
-        const cacheKey = JSON.stringify({ q: q || '', cursor, limit: effectiveLimit });
-
-        const cachedIdx = cache.findIndex((e) => e.key === cacheKey);
-        if (cachedIdx !== -1) {
-            const hit = cache.splice(cachedIdx, 1)[0];
-            cache.unshift(hit);
-            return Promise.resolve(hit.value);
-        }
+        const set = await getMatchSet(where);
+        if (set.count === 0) return { results: [], nextCursor: null };
 
         const isRandom = orderBy === 'RANDOM()';
         const sql = isRandom
-            ? buildRandomSql({ where, cursor, limit: effectiveLimit })
-            : buildDeterministicSql({ where, orderBy, cursor, limit: effectiveLimit });
+            ? buildRandomPageSql({ table: set.table, cursor, limit: effectiveLimit })
+            : buildDeterministicPageSql({ table: set.table, orderBy, cursor, limit: effectiveLimit });
+        const rows = await allAsync(sql);
 
-        return new Promise((resolve, reject) => {
-            db.all(sql, (err, rows) => {
-                if (err) return reject(err);
-                let nextCursor = null;
-                if (rows.length === effectiveLimit) {
-                    if (isRandom) {
-                        const last = rows[rows.length - 1];
-                        nextCursor = {
-                            dc: Number(last.display_count) || 0,
-                            rank: Number(last.random_rank),
-                        };
-                    } else {
-                        const offset = (cursor && Number(cursor.offset)) || 0;
-                        nextCursor = { offset: offset + effectiveLimit };
-                    }
-                }
-                const value = { results: rows, nextCursor };
-                cache.unshift({ key: cacheKey, value });
-                if (cache.length > cacheSize) cache.pop();
-                resolve(value);
-            });
-        });
+        let nextCursor = null;
+        if (rows.length === effectiveLimit) {
+            if (isRandom) {
+                const last = rows[rows.length - 1];
+                nextCursor = {
+                    dc: Number(last.display_count) || 0,
+                    rank: Number(last.random_rank),
+                };
+            } else {
+                const offset = (cursor && Number(cursor.offset)) || 0;
+                nextCursor = { offset: offset + effectiveLimit };
+            }
+        }
+        return { results: rows, nextCursor };
     }
 
+    // Drop every materialized set. Wired to the explicit `reshuffle` action —
+    // the user-facing "reset everything" — not to routine state changes.
     function clearCache() {
-        cache.length = 0;
+        const entries = Array.from(sets.values());
+        sets.clear();
+        for (const entry of entries) dropSet(entry);
     }
 
-    // Compose the WHERE clauses shared by the one-shot random selectors: the
-    // parsed query, the orphan-path guard, and the server-side blocklist.
-    // `blockedIds` / `blockedTags` are additive to any `-tag` exclusions in
-    // `q` (the orchestrator filters its queue the same way; a one-shot client
-    // can't enforce the blocklist itself), so a blocked post is excluded in
-    // SQL rather than picked-then-rejected.
-    function randomWhere(q, blockedIds, blockedTags) {
-        const { where } = parseQuery(q);
-        const clauses = [where && where !== 'TRUE' ? where : 'TRUE', HAS_PATH];
+    // Page-time blocklist clauses for the one-shot random selectors. The id
+    // list filters the match set directly. Blocked *tags* are resolved to
+    // their own materialized id set (same registry, keyed on the sorted tag
+    // list) and anti-joined — evaluating `tags && ARRAY[...]` inline against
+    // every candidate row would re-scan the tags column on every page, which
+    // is the exact cost the match sets exist to avoid.
+    async function blockedClause({ blockedIds = [], blockedTags = [] } = {}) {
+        let sql = '';
         const ids = blockedIds.map(Number).filter(Number.isFinite);
-        if (ids.length) clauses.push(`p._id NOT IN (${ids.join(', ')})`);
-        const tags = blockedTags.filter(Boolean).map((t) => `'${String(t).replace(/'/g, "''")}'`);
-        if (tags.length) clauses.push(`NOT p.tags && ARRAY[${tags.join(', ')}]`);
-        return clauses.join(' AND ');
+        if (ids.length) sql += ` AND m._id NOT IN (${ids.join(', ')})`;
+        const tags = Array.from(new Set(blockedTags.filter(Boolean).map(String))).sort();
+        if (tags.length) {
+            const where = `p.tags && ARRAY[${tags.map((t) => `'${t.replace(/'/g, "''")}'`).join(', ')}]`;
+            const set = await getMatchSet(where);
+            if (set.count > 0) sql += ` AND m._id NOT IN (SELECT _id FROM ${set.table})`;
+        }
+        return sql;
     }
 
-    function fetchOne(sql) {
-        return new Promise((resolve, reject) => {
-            db.all(sql, (err, rows) => {
-                if (err) return reject(err);
-                resolve(rows && rows.length ? rows[0] : null);
-            });
-        });
+    function hydrateOneSql(pageCte, extraCols = '') {
+        return `
+            WITH page AS (${pageCte})
+            SELECT p.*, pp.path${extraCols}
+            FROM page
+            JOIN file_db.posts p ON p._id = page._id
+            LEFT JOIN file_db.posts_paths pp ON pp._id = page._id;
+        `;
     }
 
     // Pick one matching post by re-rolling DuckDB's RANDOM() on every call —
     // independent uniform draws, with replacement (a post can recur, and the
-    // selection ignores the slideshow's view counts). Returns a single row
-    // (post + path) or null when nothing matches. Not cached.
-    function runRandomOne({ q = '', blockedIds = [], blockedTags = [] } = {}) {
-        return fetchOne(`
-            SELECT p.*, pp.path
-            FROM file_db.posts p
-            LEFT JOIN file_db.posts_paths pp ON pp._id = p._id
-            WHERE ${randomWhere(q, blockedIds, blockedTags)}
+    // selection ignores the slideshow's view counts).
+    async function runRandomOne({ q = '', blockedIds = [], blockedTags = [] } = {}) {
+        const { where } = parseQuery(q);
+        const set = await getMatchSet(where);
+        if (set.count === 0) return null;
+        const blocked = await blockedClause({ blockedIds, blockedTags });
+        const rows = await allAsync(hydrateOneSql(`
+            SELECT m._id
+            FROM ${set.table} m
+            WHERE TRUE${blocked}
             ORDER BY RANDOM()
-            LIMIT 1;
-        `);
+            LIMIT 1
+        `));
+        return rows.length ? rows[0] : null;
     }
 
     // Pick one matching post off the shared random_ranks deck the slideshow
@@ -116,63 +206,74 @@ function createSearch({ db, cacheSize = 20 } = {}) {
     // scheduled wallpaper across the whole library far better than independent
     // RANDOM() draws. Shares the deck with the slideshow, so a pick here also
     // deprioritises that post on the frame until the next reshuffle.
-    function runRankedRandomOne({ q = '', blockedIds = [], blockedTags = [] } = {}) {
-        return fetchOne(`
-            SELECT p.*, pp.path, r.random_rank, r.display_count
-            FROM file_db.posts p
-            JOIN memory.random_ranks r ON p._id = r._id
-            LEFT JOIN file_db.posts_paths pp ON pp._id = p._id
-            WHERE ${randomWhere(q, blockedIds, blockedTags)}
+    async function runRankedRandomOne({ q = '', blockedIds = [], blockedTags = [] } = {}) {
+        const { where } = parseQuery(q);
+        const set = await getMatchSet(where);
+        if (set.count === 0) return null;
+        const blocked = await blockedClause({ blockedIds, blockedTags });
+        const rows = await allAsync(hydrateOneSql(`
+            SELECT m._id, r.random_rank, r.display_count
+            FROM ${set.table} m
+            JOIN memory.random_ranks r ON r._id = m._id
+            WHERE TRUE${blocked}
             ORDER BY r.display_count ASC, r.random_rank ASC
-            LIMIT 1;
-        `);
+            LIMIT 1
+        `, ', page.random_rank, page.display_count'));
+        return rows.length ? rows[0] : null;
     }
 
-    function runCount({ q = '' } = {}) {
+    // Set membership is exactly "matches the WHERE and has a path", so the
+    // count captured at build time is the answer — no extra scan.
+    async function runCount({ q = '' } = {}) {
         const { where } = parseQuery(q);
-        const baseWhere = where && where !== 'TRUE' ? where : 'TRUE';
-        const sql = `SELECT COUNT(*)::BIGINT AS n FROM file_db.posts p WHERE ${baseWhere} AND ${HAS_PATH};`;
-        return new Promise((resolve, reject) => {
-            db.all(sql, (err, rows) => {
-                if (err) return reject(err);
-                const n = rows && rows[0] ? rows[0].n : 0;
-                resolve(Number(n));
-            });
-        });
+        const set = await getMatchSet(where);
+        return set.count;
     }
 
     return { runSearch, runCount, runRandomOne, runRankedRandomOne, clearCache };
 }
 
-function buildRandomSql({ where, cursor, limit }) {
-    const baseWhere = where && where !== 'TRUE' ? `(${where})` : 'TRUE';
+function buildRandomPageSql({ table, cursor, limit }) {
     let pageFilter = '';
     if (cursor && typeof cursor === 'object' && Number.isFinite(cursor.rank)) {
         const dc = Number(cursor.dc) || 0;
         const rank = Number(cursor.rank);
         pageFilter = ` AND (r.display_count > ${dc} OR (r.display_count = ${dc} AND r.random_rank > ${rank}))`;
     }
+    // Narrow id pick first, then hydrate the full rows; the hydration joins
+    // don't preserve order, hence the outer re-ORDER.
     return `
-        SELECT p.*, pp.path, r.random_rank, r.display_count
-        FROM file_db.posts p
-        JOIN memory.random_ranks r ON p._id = r._id
-        LEFT JOIN file_db.posts_paths pp ON pp._id = p._id
-        WHERE ${baseWhere}${pageFilter} AND ${HAS_PATH}
-        ORDER BY r.display_count ASC, r.random_rank ASC
-        LIMIT ${limit};
+        WITH page AS (
+            SELECT m._id, r.random_rank, r.display_count
+            FROM ${table} m
+            JOIN memory.random_ranks r ON r._id = m._id
+            WHERE TRUE${pageFilter}
+            ORDER BY r.display_count ASC, r.random_rank ASC
+            LIMIT ${limit}
+        )
+        SELECT p.*, pp.path, page.random_rank, page.display_count
+        FROM page
+        JOIN file_db.posts p ON p._id = page._id
+        LEFT JOIN file_db.posts_paths pp ON pp._id = page._id
+        ORDER BY page.display_count ASC, page.random_rank ASC;
     `;
 }
 
-function buildDeterministicSql({ where, orderBy, cursor, limit }) {
-    const baseWhere = where && where !== 'TRUE' ? where : 'TRUE';
+function buildDeterministicPageSql({ table, orderBy, cursor, limit }) {
     const offset = (cursor && Number(cursor.offset)) || 0;
     return `
+        WITH page AS (
+            SELECT m._id
+            FROM ${table} m
+            JOIN file_db.posts p ON p._id = m._id
+            ORDER BY ${orderBy}
+            LIMIT ${limit} OFFSET ${offset}
+        )
         SELECT p.*, pp.path
-        FROM file_db.posts p
-        LEFT JOIN file_db.posts_paths pp ON pp._id = p._id
-        WHERE ${baseWhere} AND ${HAS_PATH}
-        ORDER BY ${orderBy}
-        LIMIT ${limit} OFFSET ${offset};
+        FROM page
+        JOIN file_db.posts p ON p._id = page._id
+        LEFT JOIN file_db.posts_paths pp ON pp._id = page._id
+        ORDER BY ${orderBy};
     `;
 }
 

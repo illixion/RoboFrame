@@ -598,6 +598,12 @@ let incrementDisplayCountRef = null;
 
 // Connect to DuckDB
 const DUCKDB_PATH = pickEnv('DUCKDB_PATH', srv.duckdbPath, 'posts.duckdb');
+// Cap DuckDB's intra-query parallelism. A match-set build is a full scan of
+// the posts table that DuckDB would otherwise fan out across every core,
+// starving sharp/djxl and the event loop; half the cores keeps the box
+// responsive while the scan runs. Non-positive / non-finite → DuckDB default
+// (all cores). Applied at instance creation, not hot-reloadable.
+const DUCKDB_THREADS = pickEnv('DUCKDB_THREADS', srv.duckdbThreads, 4, { type: 'number' });
 // How often the in-memory random_ranks table (random ordering + per-post
 // display_count) is rebuilt from scratch — reshuffling the deck and zeroing
 // view counts so the slideshow doesn't ossify around the same images.
@@ -681,8 +687,13 @@ async function refreshRandomRanks() {
 
 (async () => {
   try {
-    const instance = await DuckDBInstance.create(':memory:');
+    const threads = Number(DUCKDB_THREADS);
+    const instanceConfig = Number.isFinite(threads) && threads > 0
+      ? { threads: String(Math.floor(threads)) }
+      : undefined;
+    const instance = await DuckDBInstance.create(':memory:', instanceConfig);
     db = wrapConnection(await instance.connect());
+    if (instanceConfig) console.log(`DuckDB threads capped at ${instanceConfig.threads}`);
     await attachReadOnlyFileDb();
     await refreshRandomRanks();
 
@@ -704,13 +715,14 @@ async function refreshRandomRanks() {
         if (search?.clearCache) search.clearCache();
     };
 
+    // No cache interaction: match-set membership doesn't depend on view
+    // counts, and page queries read display_count live from random_ranks.
     const incrementDisplayCount = (id) => {
         const numeric = Number(id);
         if (!Number.isFinite(numeric)) return;
         db.run(`UPDATE random_ranks SET display_count = display_count + 1 WHERE _id = ${numeric};`, (err) => {
             if (err) console.warn(`[display_count] update failed for _id=${numeric}: ${err.message}`);
         });
-        if (search?.clearCache) search.clearCache();
     };
     incrementDisplayCountRef = incrementDisplayCount;
 

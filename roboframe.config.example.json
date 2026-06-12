@@ -17,6 +17,8 @@
     "imageMirrorPath": "/path/to/optional/mirror",
     "savePath": "/tmp",
     "duckdbPath": "./posts.duckdb",
+    "duckdbThreads": 4,
+    "_duckdbThreadsComment": "Max cores DuckDB may use per query. Match-set builds are full-table scans that would otherwise saturate every core; half the cores keeps image conversion and the event loop responsive. 0 or negative = DuckDB default (all cores). Applied at startup, NOT hot-reloaded. Env override: DUCKDB_THREADS.",
     "djxlPath": "djxl",
     "chunkSize": 0,
     "slideshow": {

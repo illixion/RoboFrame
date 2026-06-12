@@ -481,7 +481,6 @@ function createOrchestrator({
         channel.queue.length = 0;
         channel.cursor = null;
         channel.refillGen += 1;
-        if (search?.clearCache) search.clearCache();
         // Wait for any in-flight refill to drain so its (aborted) results
         // can't race ahead of ours. The gen bump above guarantees that
         // refill's results have been discarded.
@@ -996,7 +995,6 @@ function createOrchestrator({
         for (const channel of channels.values()) {
             const before = channel.queue.length;
             channel.queue = channel.queue.filter((entry) => !blockedIdSet.has(Number(entry.id)));
-            if (blockedTagSet.size > 0 && search?.clearCache) search.clearCache();
             if (isMergeActive() && channel !== mergeDriverChannel) continue;
             const dropped = channel.queue.length !== before;
             if (dropped) {
@@ -1014,7 +1012,6 @@ function createOrchestrator({
     // they rebuild from the live getter on reconnect. While merged only the
     // driver channel runs, so only it is requeried.
     function requeryAll() {
-        if (search?.clearCache) search.clearCache();
         for (const channel of channels.values()) {
             if (channel.parked) continue;
             if (isMergeActive() && channel !== mergeDriverChannel) continue;

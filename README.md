@@ -182,6 +182,7 @@ The merged Node server: image API + WebSocket broker + optional Home Assistant b
 | `IMAGE_MIRROR_PATH` | `server.imageMirrorPath` | `/Volumes/HDD/imagedb_mirror` | Fallback folder if a file is missing |
 | `SAVE_PATH` | `server.savePath` | `/tmp` | Where `/save` copies files to |
 | `DUCKDB_PATH` | `server.duckdbPath` | `posts.duckdb` | Path to the DuckDB file |
+| `DUCKDB_THREADS` | `server.duckdbThreads` | `4` | Max cores per DuckDB query (`0` = all cores). Applied at startup, not hot-reloaded. |
 | `DJXL_PATH` | `server.djxlPath` | `djxl` | Path to the JPEG-XL decoder |
 | `HA_URL` | `server.ha.url` | *(none)* | Home Assistant WebSocket URL — sensor forwarding auto-enables when set with token |
 | `HA_TOKEN` | `server.ha.token` | *(none)* | Home Assistant long-lived access token |
