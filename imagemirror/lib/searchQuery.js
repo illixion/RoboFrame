@@ -107,8 +107,10 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
             WHERE (${key}) AND ${HAS_PATH};`);
         const rows = await allAsync(`SELECT COUNT(*)::BIGINT AS n FROM ${table};`);
         const count = Number(rows[0] ? rows[0].n : 0);
-        const label = key.length > 160 ? `${key.slice(0, 160)}… (${key.length} chars)` : key;
-        console.log(`[search] built ${table} (${count} rows, ${Date.now() - t0}ms) for: ${label}`);
+        // The WHERE clause embeds the user's tag selection — keep it out of
+        // the default log. SEARCH_DEBUG=1 includes it for query debugging.
+        const label = process.env.SEARCH_DEBUG ? ` for: ${key}` : '';
+        console.log(`[search] built ${table} (${count} rows, ${Date.now() - t0}ms)${label}`);
         return count;
     }
 

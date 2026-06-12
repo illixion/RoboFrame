@@ -21,15 +21,17 @@
 //
 // The barrier is backed by a per-channel readiness timeout (getReadyTimeout(),
 // ms; 0 disables). If no expected session reports within the budget the
-// channel promotes anyway and logs which session keys it gave up on. This is
+// channel promotes anyway, logging the laggard session keys under
+// ORCHESTRATOR_DEBUG only — a display that's powered off without ever
+// reporting visibility:false rides this fallback on every frame, which is
+// routine recovery, not a fault worth flooding the log over. This is
 // the recovery path for a client that stays on the socket but stops reporting
 // — a frozen render loop a dead-socket check would never catch. The timeout is
 // per-channel, so it keys on deviceId: one wedged display (or one of the
 // distinct deviceIds Spatialstash multiplexes over a single connection) is
 // promoted independently without disturbing its co-tenants. The "all hidden →
-// promote immediately" short-circuit already covers the legitimate "no client
-// can display this" case, so the timeout only ever fires on a visible session
-// that should have reported and didn't.
+// promote immediately" short-circuit covers the case where a session
+// *reported* itself hidden; the timeout covers the ones that never report.
 //
 // Visibility for a deviceId pauses/resumes the dwell timer using a wall-clock
 // deadline (`dwellDeadline`). It never resets the deadline.
@@ -540,7 +542,10 @@ function createOrchestrator({
             channel.readyDeadline = null;
             if (channel.phase !== 'loading') return;
             const waiting = Array.from(channel.expectedReady).filter((k) => !channel.ready.has(k));
-            console.warn(`[orchestrator] readiness timeout (${channel.deviceId}): no imageReady for id=${channel.currentId} within ${ms}ms; promoting without {${waiting.join(',')}}`);
+            // dbg, not warn: a display that's powered off without reporting
+            // visibility:false hits this every frame, flooding the log with
+            // lines that describe normal recovery, not a fault.
+            dbg(`readiness timeout (${channel.deviceId}): no imageReady for id=${channel.currentId} within ${ms}ms; promoting without {${waiting.join(',')}}`);
             promoteToDisplaying(channel);
         }, ms);
     }
