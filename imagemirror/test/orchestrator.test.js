@@ -68,7 +68,7 @@ function withDefaultSession(orch) {
 // `pages` is consumed shared across all channels (the fake search returns
 // the next page on each call regardless of which channel asked). Tests that
 // need per-channel isolation provide explicit pages or override.
-function harness({ tagLists = [['cats']], pages, blockedIds = [], blockedTags = [], readyTimeout = 0 } = {}) {
+function harness({ tagLists = [['cats']], pages, blockedIds = [], blockedTags = [], readyTimeout = 0, expandBlockedTags } = {}) {
     const broadcasts = [];
     const broadcast = (msg) => broadcasts.push(msg);
     const search = makeFakeSearch(pages || [
@@ -85,6 +85,7 @@ function harness({ tagLists = [['cats']], pages, blockedIds = [], blockedTags = 
         getTagLists: () => tagLists,
         getBlockedIds: () => blockIds,
         getBlockedTags: () => blockTags,
+        ...(expandBlockedTags ? { expandBlockedTags } : {}),
         getReadyTimeout: () => readyTimeout,
     });
     const orch = withDefaultSession(rawOrch);
@@ -715,6 +716,34 @@ test('refill skips posts whose tags intersect the blockedTags set', async (t) =>
     const last = ws.sent.filter((m) => m.action === 'playback').pop();
     const ids = [last.payload.current, ...last.payload.upcoming].map((e) => e.id);
     assert.ok(!ids.includes(2));
+});
+
+test('blocked-tag matching goes through the injected expansion', async (t) => {
+    // Blocking 'felid' must drop a post tagged only 'cat' when the expander
+    // says cat resolves to felid — the unflattened-library case where the
+    // post's array never contains the blocked ancestor itself.
+    const { orch } = harness({
+        blockedTags: ['felid'],
+        expandBlockedTags: (tags) => new Set(tags.flatMap((tg) => (tg === 'felid' ? ['felid', 'cat'] : [tg]))),
+        pages: [{
+            results: [
+                { _id: 1, file_ext: 'jpg', tags: ['dog'] },
+                { _id: 2, file_ext: 'jpg', tags: ['cat'] },
+                { _id: 3, file_ext: 'jpg', tags: ['bird'] },
+                { _id: 4, file_ext: 'jpg', tags: ['fish'] },
+                { _id: 5, file_ext: 'jpg', tags: ['lizard'] },
+            ],
+            nextCursor: 0,
+        }],
+    });
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'kiosk1', interval: 5000 });
+    await tick(); await tick(); await tick();
+    const last = ws.sent.filter((m) => m.action === 'playback').pop();
+    const ids = [last.payload.current, ...last.payload.upcoming].map((e) => e.id);
+    assert.ok(!ids.includes(2), 'post tagged cat must be dropped when felid is blocked');
+    assert.ok(ids.includes(1));
 });
 
 test('setModTags clears queue and refills with the new query', async (t) => {
