@@ -523,6 +523,19 @@ motion is ignored and the panel is held off. Explicit `displayState`
 commands and effect actions (`playVideo`, `showText`, `playAudio`,
 `refresh`) still wake the panel — the switch only gates ambient wake.
 
+How a client honors `displayState: off` is platform-specific, but every
+slideshow client should report `visibility { deviceId, false }` while
+held off so the server parks the channel instead of riding the
+readiness-timeout fallback. The web kiosk blanks its render layer (the
+panel itself goes dark); Spatialstash keeps the current image rendered
+and decoded — there's no physical panel to power down — so the PIR/HA
+wake that follows (`displayState: on` → report `visibility true`)
+resumes the same frame with no pop-in. While held off, do not send
+`imageReady` — a hidden session is outside the readiness barrier and
+reporting would drive the channel forward for a display nobody sees.
+Ignore frames whose `state` field is missing entirely (treating a
+state-less frame as "on" would re-enable a panel PIR had turned off).
+
 ### `displayDisconnect`
 Broadcast when a WebSocket that previously claimed a `deviceId` (via
 `slideshowConfig`, `visibility`, `reportDisplay`, `reportSensor`, or
