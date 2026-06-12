@@ -293,6 +293,12 @@ By default `/random` walks the shared `random_ranks` deck least-seen-first and b
 
 The server-side blocklist (`data.json`'s `blockedIds`/`blockedTags`) is applied in SQL in both modes so a blocked post is never picked — additive to any `-tag` exclusions in `q`, matching how the orchestrator filters its queue.
 
+### Tag matching and the match-set cache
+
+Every query path (slideshow refills, `/search`, `/count`, `/random`) resolves through one materialized id set per distinct query: the expensive tag filter runs once, and pages/picks then work off the cached set (concurrent callers of the same query share a single build — relevant for `sharedTags` fleets). Sets live for the server's lifetime, LRU-capped; `reshuffle` drops them all.
+
+When the library ships a `posts_tags` inverted index (built by `roboframe-cli bootstrap`, or the archival ingest pipeline), tag terms probe it instead of scanning the `posts.tags` arrays, and — if `tag_aliases`/`tag_implications` tables are present — every tag term expands at query time: querying, excluding, or blocking a tag also covers its alias spellings and the full transitive closure of tags that imply it (querying `felid` matches posts tagged only `cat`). Libraries without `posts_tags` (flattened or folder-import) keep literal matching against the arrays.
+
 ### Server WebSocket `/rpc/ws`
 
 The full client protocol — every action, every payload shape, the

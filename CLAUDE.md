@@ -163,6 +163,21 @@ the deadline) is the canary for the wake-advance class of bug.
   goes through MQTT discovery.
 - **One DuckDB writer.** `packages/cli` is the only writer. The server
   opens read-only; future schema migrations ship as `packages/cli/sql/*.sql`.
+- **Tag queries run off materialized match sets.** One temp table of
+  matching ids per distinct WHERE (`imagemirror/lib/searchQuery.js`),
+  shared by concurrent callers, LRU-evicted. Don't add per-page caching
+  or `clearCache()` calls on routine state changes — set membership only
+  depends on the read-only file DB; ordering reads `random_ranks` live.
+- **Query-time tag expansion is gated on `posts_tags`.** When the library
+  ships the inverted index, tag terms expand through
+  `tag_aliases`/`tag_implications` (aliases + transitive implication
+  antecedents, `imagemirror/lib/tagExpansion.js`) — required for
+  unflattened libraries, and the index is what makes wide expansions
+  cheap. Without `posts_tags`, expansion stays identity and matching is
+  literal against the `posts.tags` arrays: on a flattened library the
+  closure is already baked into every row, and expanding there would
+  re-select the same posts through a pathologically wide array scan
+  (measured 40s vs 4s). Don't decouple the two signals.
 - **`/get` outputs JPEG, not WebP.** VideoCore on Pi-class hardware has
   hardware JPEG decode (via MMAL) but no WebP path — software-decoding
   WebP at 1080p saturates the ARM cores and freezes the kiosk. The
