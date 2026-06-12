@@ -1,7 +1,7 @@
 import { parseArgs } from 'node:util';
 import { readdir, stat } from 'node:fs/promises';
 import { join, extname, resolve } from 'node:path';
-import { open, ensureSchema, insertPosts, insertPaths } from '../db.mjs';
+import { open, ensureSchema, insertPosts, insertPaths, refreshPostsTags } from '../db.mjs';
 import { classify, probeStill, probeVideo, hasFfprobe } from '../metadata.mjs';
 import { tagsFromFolders, readSidecar, sanitizeTag } from '../tags.mjs';
 
@@ -174,6 +174,8 @@ export async function run(argv) {
     console.log(`Failed:   ${failed}`);
 
     if (handle) {
+        await refreshPostsTags(handle);
+        console.log('Rebuilt posts_tags inverted index');
         await handle.close();
         console.log(`Wrote ${dbPath}`);
         console.log('');

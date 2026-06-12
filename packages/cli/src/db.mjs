@@ -52,13 +52,28 @@ export async function open(path) {
     };
 }
 
+const MIGRATIONS = [
+    [1, '0001_initial.sql'],
+    [2, '0002_posts_tags.sql'],
+];
+
 export async function ensureSchema(handle) {
-    const sql = readFileSync(join(SCHEMA_DIR, '0001_initial.sql'), 'utf8');
-    await handle.exec(sql);
-    const rows = await handle.all('SELECT version FROM schema_migrations WHERE version = 1');
-    if (rows.length === 0) {
-        await handle.run('INSERT INTO schema_migrations (version) VALUES (1)');
+    for (const [version, file] of MIGRATIONS) {
+        const sql = readFileSync(join(SCHEMA_DIR, file), 'utf8');
+        await handle.exec(sql);
+        const rows = await handle.all(`SELECT version FROM schema_migrations WHERE version = ${version}`);
+        if (rows.length === 0) {
+            await handle.run(`INSERT INTO schema_migrations (version) VALUES (${version})`);
+        }
     }
+}
+
+// Rebuild the inverted tag index from posts. Clustered by tag so per-tag id
+// probes are zone-map pruned. Call after any write that touches posts.tags.
+export async function refreshPostsTags(handle) {
+    await handle.exec(
+        'CREATE OR REPLACE TABLE posts_tags AS SELECT unnest(tags) AS tag, _id FROM posts ORDER BY tag, _id;'
+    );
 }
 
 // SQL string-quote: doubles single-quotes (DuckDB / standard SQL).

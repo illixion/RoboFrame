@@ -54,6 +54,19 @@ export async function run(argv) {
         console.log(`posts_paths:  ${pathsCount}`);
         console.log(`orphans:      ${orphans} (posts with no path entry)`);
 
+        // posts_tags must mirror the exploded tags arrays exactly — a drifted
+        // index silently changes which posts a tag query matches.
+        if (have('posts_tags')) {
+            const tagRows = (await handle.all('SELECT COUNT(*) AS n FROM posts_tags'))[0].n;
+            const expanded = (await handle.all('SELECT COALESCE(SUM(len(tags)), 0)::BIGINT AS n FROM posts'))[0].n;
+            console.log(`posts_tags:   ${tagRows} (expect ${expanded})`);
+            if (tagRows !== expanded) {
+                console.warn('WARN: posts_tags is stale — rerun bootstrap (or the ingest pipeline) to rebuild it.');
+            }
+        } else {
+            console.warn('WARN: no posts_tags table — imagemirror falls back to slower array scans. Rerun bootstrap to create it.');
+        }
+
         const sample = await handle.all('SELECT _id, file_ext, image_width, image_height, duration, len(tags) AS tag_count FROM posts ORDER BY _id LIMIT 3');
         if (sample.length) {
             console.log('Sample rows:');
