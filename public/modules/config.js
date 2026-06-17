@@ -81,7 +81,10 @@ export function getRenderParams() {
 export function buildGetUrl(post) {
     if (!post || !post.id) return null;
     const { screenWidth, screenHeight, bright, convert, lowmem } = getRenderParams();
-    return api(`/get?id=${post.id}&convert=${convert}&bright=${bright}&width=${screenWidth}&height=${screenHeight}&lowmem=${lowmem}`);
+    // `deviceId` (the ?ws= channel id) tags the request so /history can group
+    // this display's images; omitted when the kiosk has no channel id.
+    const device = params.ws ? `&deviceId=${encodeURIComponent(params.ws)}` : '';
+    return api(`/get?id=${post.id}&convert=${convert}&bright=${bright}&width=${screenWidth}&height=${screenHeight}&lowmem=${lowmem}${device}`);
 }
 
 export function isVideoExt(ext) {

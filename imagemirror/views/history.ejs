@@ -23,6 +23,12 @@
       .container{padding:16px;box-sizing:border-box}
       h1{margin:0 0 12px}
 
+      .display{margin:0 0 28px}
+      .display h2{margin:0 0 10px;font-size:18px;display:flex;align-items:baseline;gap:8px}
+      .display h2 .count{font-size:13px;font-weight:400;color:var(--muted)}
+      .card.hidden{display:none}
+      .expand{margin-top:12px}
+
       .grid{
         display:grid;
         grid-template-columns:repeat(auto-fill,minmax(160px,1fr));
@@ -63,26 +69,34 @@
     <div class="container">
       <h1>Request History</h1>
 
-      <% if (!history || history.length === 0) { %>
+      <% if (!groups || groups.length === 0) { %>
         <p>No recent requests</p>
       <% } else { %>
-        <div class="grid">
-          <% history.forEach(function(post){ %>
-            <div class="card" data-id="<%= post.id %>">
-              <div class="thumb">
-                <div class="spinner">Loading…</div>
-                <img alt="Preview <%= post.id %>" loading="lazy" />
-              </div>
-              <div class="meta">
-                <div class="id">ID <%= post.id %></div>
-                <div>
-                  <button class="btn save">Save</button>
-                  <button class="btn secondary view">View</button>
+        <% groups.forEach(function(group){ %>
+          <section class="display">
+            <h2><%= group.deviceId %> <span class="count"><%= group.posts.length %> image<%= group.posts.length === 1 ? '' : 's' %></span></h2>
+            <div class="grid">
+              <% group.posts.forEach(function(post, i){ %>
+                <div class="card<%= i >= visible ? ' hidden' : '' %>" data-id="<%= post.id %>">
+                  <div class="thumb">
+                    <div class="spinner">Loading…</div>
+                    <img alt="Preview <%= post.id %>" />
+                  </div>
+                  <div class="meta">
+                    <div class="id">ID <%= post.id %></div>
+                    <div>
+                      <button class="btn save">Save</button>
+                      <button class="btn secondary view">View</button>
+                    </div>
+                  </div>
                 </div>
-              </div>
+              <% }) %>
             </div>
-          <% }) %>
-        </div>
+            <% if (group.posts.length > visible) { %>
+              <button class="btn secondary expand" data-expand>Show <%= group.posts.length - visible %> more</button>
+            <% } %>
+          </section>
+        <% }) %>
       <% } %>
     </div>
 
@@ -99,20 +113,30 @@
       const BASE = new URL('./', window.location.href);
       const endpoint = (name, query) => new URL(name + '?' + query, BASE).toString();
 
-      (function loadThumbnails() {
-        const cards = document.querySelectorAll('.card[data-id]');
-        cards.forEach((card) => {
-          const id = card.dataset.id;
-          const img = card.querySelector('.thumb img');
-          const spinner = card.querySelector('.thumb .spinner');
-          if (!img) return;
-          img.onload = () => { img.classList.add('loaded'); if (spinner) spinner.remove(); };
-          img.onerror = () => { if (spinner) spinner.textContent = 'Failed'; };
-          img.src = endpoint('get', 'id=' + encodeURIComponent(id) + '&convert=1&bright=0&width=640&height=480&lowmem=' + LOWMEM + tokenParam);
-        });
-      })();
+      // Fetch a card's thumbnail once. Hidden cards (beyond the per-display
+      // visible window) aren't loaded until their Expand button reveals them,
+      // so the initial page only fires HISTORY_VISIBLE fetches per display.
+      function loadCard(card) {
+        const img = card.querySelector('.thumb img');
+        if (!img || img.dataset.loaded) return;
+        img.dataset.loaded = '1';
+        const spinner = card.querySelector('.thumb .spinner');
+        img.onload = () => { img.classList.add('loaded'); if (spinner) spinner.remove(); };
+        img.onerror = () => { if (spinner) spinner.textContent = 'Failed'; };
+        img.src = endpoint('get', 'id=' + encodeURIComponent(card.dataset.id) + '&convert=1&bright=0&width=640&height=480&lowmem=' + LOWMEM + tokenParam);
+      }
+
+      document.querySelectorAll('.card[data-id]:not(.hidden)').forEach(loadCard);
 
       document.addEventListener('click', async (ev) => {
+        const expand = ev.target.closest('[data-expand]');
+        if (expand) {
+          const section = expand.closest('.display');
+          section.querySelectorAll('.card.hidden').forEach((c) => { c.classList.remove('hidden'); loadCard(c); });
+          expand.remove();
+          return;
+        }
+
         const btn = ev.target.closest('.btn');
         const cardFromBtn = btn ? btn.closest('.card') : null;
         const thumb = ev.target.closest('.thumb');

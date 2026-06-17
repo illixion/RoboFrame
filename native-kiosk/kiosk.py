@@ -270,6 +270,8 @@ class Fetcher:
             "width": str(w),
             "height": str(h),
             "token": self.cfg["access_token"],
+            # Tags the request so /history can group this display's images.
+            "deviceId": self.cfg["device_id"],
         }
         if self.cfg["lowmem"]:
             params["lowmem"] = "1"

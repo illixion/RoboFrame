@@ -469,7 +469,10 @@ with `sessionIds: ["win1", ..., "win10"]`).
   `GET /get?id=<id>&convert=&bright=&width=&height=&lowmem=`. Server
   returns JPEG (q95) on the `convert` path and APNG for animated PNG
   posts; `lowmem=1` re-encodes non-JXL sources to JPEG q85 for kiosks
-  without WebP hardware decode.
+  without WebP hardware decode. Clients SHOULD also pass
+  `&deviceId=<their deviceId>` so the server's `/history` page can group
+  the request under their display; omitting it files the request under
+  `others`.
 - `ext` can also be `mp4` or `webm` — those entries are videos. `/get`
   streams them straight from disk (no resize, no transcode; `convert`,
   `bright`, `lowmem`, `width`, `height` are ignored) with

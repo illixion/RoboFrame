@@ -1,7 +1,6 @@
-// Tests for the rolling request-history buffer that backs /get's cache,
-// /history (HTML), /history.json (JSON), and /addtohistory. Boots a minimal
-// express app with the same routes index.js registers, so /history.json
-// is exercised end-to-end.
+// Tests for the per-display request-history buffers that back /history (HTML)
+// and /history.json (JSON). Boots a minimal express app with the same route
+// index.js registers, so /history.json is exercised end-to-end.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -32,49 +31,74 @@ function get(port, path) {
     });
 }
 
-test('addEntry inserts newest-first and dedupes by id', () => {
+test('addEntry buckets by deviceId, newest-first, deduping within a display', () => {
     const h = createHistory({ maxSize: 5 });
-    h.addEntry({ id: 1, ext: 'jpg' });
-    h.addEntry({ id: 2, ext: 'png' });
-    h.addEntry({ id: 3, ext: 'gif' });
-    assert.deepEqual(h.entries.map((e) => e.id), [3, 2, 1]);
+    h.addEntry({ id: 1, ext: 'jpg', deviceId: 'a' });
+    h.addEntry({ id: 2, ext: 'png', deviceId: 'a' });
+    h.addEntry({ id: 3, ext: 'gif', deviceId: 'b' });
 
-    // Re-adding id=1 moves it back to the front, doesn't duplicate.
-    h.addEntry({ id: 1, ext: 'jpg' });
-    assert.deepEqual(h.entries.map((e) => e.id), [1, 3, 2]);
+    const groups = h.listGroups();
+    // Display b is most-recently-active, so it sorts first.
+    assert.deepEqual(groups.map((g) => g.deviceId), ['b', 'a']);
+    assert.deepEqual(groups.find((g) => g.deviceId === 'a').posts.map((p) => p.id), [2, 1]);
+
+    // Re-adding id=1 on display a moves it to that display's front only.
+    h.addEntry({ id: 1, ext: 'jpg', deviceId: 'a' });
+    assert.deepEqual(h.listGroups().find((g) => g.deviceId === 'a').posts.map((p) => p.id), [1, 2]);
 });
 
-test('addEntry caps at maxSize, dropping the oldest', () => {
-    const h = createHistory({ maxSize: 3 });
-    for (let i = 1; i <= 5; i += 1) h.addEntry({ id: i, ext: 'jpg' });
-    assert.deepEqual(h.entries.map((e) => e.id), [5, 4, 3]);
-});
-
-test('findCached returns the entry by id or undefined', () => {
+test('the same id on two displays lives in both buckets', () => {
     const h = createHistory();
-    h.addEntry({ id: 42, ext: 'webp', mime_type: 'image/webp', file_contents: Buffer.from('x') });
-    const hit = h.findCached(42);
-    assert.equal(hit?.ext, 'webp');
+    h.addEntry({ id: 9, ext: 'jpg', deviceId: 'a' });
+    h.addEntry({ id: 9, ext: 'jpg', deviceId: 'b' });
+    const groups = h.listGroups();
+    assert.equal(groups.find((g) => g.deviceId === 'a').posts.length, 1);
+    assert.equal(groups.find((g) => g.deviceId === 'b').posts.length, 1);
+});
+
+test('a missing deviceId buckets under others', () => {
+    const h = createHistory();
+    h.addEntry({ id: 1, ext: 'jpg' });
+    h.addEntry({ id: 2, ext: 'png', deviceId: '' });
+    const groups = h.listGroups();
+    assert.deepEqual(groups.map((g) => g.deviceId), ['others']);
+    assert.deepEqual(groups[0].posts.map((p) => p.id), [2, 1]);
+});
+
+test('addEntry caps each bucket independently, dropping that display oldest', () => {
+    const h = createHistory({ maxSize: 3 });
+    for (let i = 1; i <= 5; i += 1) h.addEntry({ id: i, ext: 'jpg', deviceId: 'a' });
+    for (let i = 10; i <= 11; i += 1) h.addEntry({ id: i, ext: 'jpg', deviceId: 'b' });
+    const groups = h.listGroups();
+    assert.deepEqual(groups.find((g) => g.deviceId === 'a').posts.map((p) => p.id), [5, 4, 3]);
+    assert.deepEqual(groups.find((g) => g.deviceId === 'b').posts.map((p) => p.id), [11, 10]);
+});
+
+test('listGroups exposes id only (keeps ext out of the HTML template)', () => {
+    const h = createHistory();
+    h.addEntry({ id: 7, ext: 'jpg', deviceId: 'a' });
+    assert.deepEqual(h.listGroups(), [{ deviceId: 'a', posts: [{ id: 7 }] }]);
+});
+
+test('findCached returns the entry by id across buckets, or undefined', () => {
+    const h = createHistory();
+    h.addEntry({ id: 42, ext: 'webp', deviceId: 'a' });
+    assert.equal(h.findCached(42)?.ext, 'webp');
     assert.equal(h.findCached(999), undefined);
 });
 
-test('listPreview exposes id only (matches the HTML template contract)', () => {
+test('listJson flattens buckets newest-first with id + ext, deduped by id', () => {
     const h = createHistory();
-    h.addEntry({ id: 7, ext: 'jpg', mime_type: 'image/jpeg', file_contents: Buffer.from('x') });
-    assert.deepEqual(h.listPreview(), [{ id: 7 }]);
-});
-
-test('listJson exposes id + ext (the /history.json contract)', () => {
-    const h = createHistory();
-    h.addEntry({ id: 7, ext: 'jpg' });
-    h.addEntry({ id: 8, ext: 'mp4' });
-    assert.deepEqual(h.listJson(), [{ id: 8, ext: 'mp4' }, { id: 7, ext: 'jpg' }]);
+    h.addEntry({ id: 7, ext: 'jpg', deviceId: 'a' });
+    h.addEntry({ id: 8, ext: 'mp4', deviceId: 'b' });
+    h.addEntry({ id: 7, ext: 'jpg', deviceId: 'b' });   // newest; dedupes the id=7 above
+    assert.deepEqual(h.listJson(), [{ id: 7, ext: 'jpg' }, { id: 8, ext: 'mp4' }]);
 });
 
 test('/history.json returns the JSON contract end-to-end', async () => {
     const h = createHistory();
-    h.addEntry({ id: 1, ext: 'jpg' });
-    h.addEntry({ id: 2, ext: 'png' });
+    h.addEntry({ id: 1, ext: 'jpg', deviceId: 'a' });
+    h.addEntry({ id: 2, ext: 'png', deviceId: 'a' });
     const { server, port } = await startApp(h);
     try {
         const res = await get(port, '/history.json');

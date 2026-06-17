@@ -655,12 +655,13 @@ async function processRequestV2(req, res) {
 
     const entry = await imageCache.getOrCompute(parts, () => computeVariant(parts));
     if (cancelled || res.headersSent) return;
-    // Record in /history's recent-request log (still id-based).
+    // Record in /history's per-display log. `deviceId` comes from the kiosk's
+    // /get query; requests without one (iOS Shortcuts via /random, etc.)
+    // bucket under `others`.
     history.addEntry({
       id: parts.id,
       ext: entry.ext,
-      mime_type: entry.mime,
-      file_contents: entry.buffer,
+      deviceId: req.query.deviceId ? String(req.query.deviceId) : '',
     });
     res.setHeader('Content-Type', entry.mime);
     res.setHeader('Content-Disposition', `inline; filename="${parts.id}.${entry.ext}"`);
@@ -894,13 +895,16 @@ app.get('/get', (req, res) => {
   });
 });
 
-// Recent request history endpoint — returns an HTML page that loads thumbnails
-// concurrently from /get on the client side.
+// Recent request history endpoint — returns an HTML page grouped by display,
+// loading thumbnails from /get on the client side. Each display shows its
+// HISTORY_VISIBLE most-recent posts up front; the rest stay behind an expand
+// button so the page doesn't fire every thumbnail fetch at once.
+const HISTORY_VISIBLE = 10;
 app.get('/history', (req, res) => {
-  const previewList = history.listPreview();
+  const groups = history.listGroups();
   const token = req.query.token || req.headers['x-roboframe-token'] || '';
   const lowmem = Number(req.query.lowmem) === 1 ? 1 : 0;
-  res.render('history', { history: previewList, token, lowmem });
+  res.render('history', { groups, visible: HISTORY_VISIBLE, token, lowmem });
 });
 
 // JSON variant of /history for non-browser clients (e.g. the Spatial Stash
@@ -938,8 +942,7 @@ app.get('/addtohistory', (req, res) => {
       history.addEntry({
         id: postId,
         ext: postExt,
-        mime_type: null,
-        file_contents: null
+        deviceId: req.query.deviceId ? String(req.query.deviceId) : '',
       });
 
       return res.status(200).send('Post added to history');

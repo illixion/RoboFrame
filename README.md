@@ -269,10 +269,10 @@ Returns the binary image. `convert=1` decodes JXL via `djxl` and re-encodes to J
 Copies the file to `SAVE_PATH`, resolving its location from the post's `posts_paths` entry (with the `IMAGE_MIRROR_PATH` fallback). The saved file keeps the source's real extension. **Local-only**: 404 if not on disk. No third-party fetches, ever.
 
 `GET /history?lowmem=`
-HTML page rendering the last 25 image requests. Thumbnails load via `/get` in parallel from the browser. `lowmem=1` propagates into the in-page `/get` URLs for Pi-class kiosks viewing their own history.
+HTML page rendering recent image requests **grouped by display**. Each display's most recent 10 images load up front; the rest sit behind a per-display *Show N more* button that fetches their thumbnails only when expanded, so the page doesn't fire every `/get` at once. A display is identified by the `deviceId` its kiosk attaches to `/get`; requests without one (iOS Shortcuts via `/random`, ad-hoc `/get`) group under `others`. Thumbnails load via `/get` from the browser; `lowmem=1` propagates into the in-page `/get` URLs for Pi-class kiosks viewing their own history.
 
-`GET /addtohistory?id=`
-Records a post ID in the rolling history without fetching its bytes.
+`GET /addtohistory?id=&deviceId=`
+Records a post ID in the rolling history without fetching its bytes. Optional `deviceId` files it under that display; omitted → `others`.
 
 `GET /post?id=` *(debug)*
 Returns the full DuckDB row for a post (joined with `posts_paths.path`) as JSON. Token-gated. Exposed on the web kiosk as `await getPost(id)` in devtools.
