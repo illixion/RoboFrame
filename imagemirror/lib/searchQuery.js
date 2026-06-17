@@ -42,6 +42,13 @@ const { identityExpander } = require('./tagExpansion');
 // orphans that 404 on /get and warn from the prefetcher.
 const HAS_PATH = 'EXISTS (SELECT 1 FROM file_db.posts_paths pp WHERE pp._id = p._id)';
 
+// Candidate-pool size for aspect-fit picks (/random with ratioOrder). The
+// pick draws this many posts — least-seen-first for the ranked deck, a fresh
+// RANDOM() sample for pure-random draws — then returns the best-fitting one.
+// Big enough that the fit choice has real variety to draw from, small enough
+// that the closest match in the pool is still a good fit for the canvas.
+const RATIO_FIT_CHUNK = 480;
+
 // `expander` resolves a query tag to every tag name that should match it
 // (aliases + transitive implication antecedents — see lib/tagExpansion.js).
 // `hasPostsTags` routes tag terms through the file_db.posts_tags inverted
@@ -224,39 +231,43 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
         `;
     }
 
-    // Soft aspect-fit ordering for the one-shot picks. When `target` is a
-    // finite positive aspect ratio (width/height), prefer posts whose own
-    // `ratio` column is closest to it. The distance is bucketed to two
-    // decimals so a whole band of equally-fitting posts (e.g. every true
-    // 9:16 image) still rotates by the deck's least-seen order instead of
-    // ossifying on the single nearest ratio. NULL ratios (videos) sort last.
-    // Returns the posts JOIN and the leading ORDER BY term (trailing ', ')
-    // to splice into a pick query, or empty strings when bias is off.
-    function ratioOrderClause(target) {
-        const t = Number(target);
-        if (!Number.isFinite(t) || t <= 0) return { join: '', order: '' };
-        return {
-            join: ' JOIN file_db.posts pr ON pr._id = m._id',
-            order: `ROUND(ABS(pr.ratio - ${t.toFixed(4)}), 2) ASC NULLS LAST, `,
-        };
+    // Validate an aspect-fit target. A finite positive number (width/height)
+    // turns the one-shot picks into "best-fitting from a random chunk" mode;
+    // anything else leaves the pick unbiased.
+    function ratioTarget(v) {
+        const t = Number(v);
+        return Number.isFinite(t) && t > 0 ? t : null;
     }
 
     // Pick one matching post by re-rolling DuckDB's RANDOM() on every call —
     // independent uniform draws, with replacement (a post can recur, and the
-    // selection ignores the slideshow's view counts). `ratioOrder` adds the
-    // soft aspect-fit preference ahead of the random roll.
+    // selection ignores the slideshow's view counts). With `ratioOrder`, draw
+    // a random RATIO_FIT_CHUNK-sized chunk and return its best-fitting post.
     async function runRandomOne({ q = '', blockedIds = [], blockedTags = [], ratioOrder = null } = {}) {
         const set = await getMatchSet(composeWhere(parseQuery(q)));
         if (set.count === 0) return null;
         const blocked = await blockedClause({ blockedIds, blockedTags });
-        const fit = ratioOrderClause(ratioOrder);
-        const rows = await allAsync(hydrateOneSql(`
-            SELECT m._id
-            FROM ${set.table} m${fit.join}
-            WHERE TRUE${blocked}
-            ORDER BY ${fit.order}RANDOM()
-            LIMIT 1
-        `));
+        const target = ratioTarget(ratioOrder);
+        const pageSql = target === null
+            ? `
+                SELECT m._id
+                FROM ${set.table} m
+                WHERE TRUE${blocked}
+                ORDER BY RANDOM()
+                LIMIT 1`
+            : `
+                SELECT chunk._id
+                FROM (
+                    SELECT m._id, pr.ratio AS _ratio
+                    FROM ${set.table} m
+                    JOIN file_db.posts pr ON pr._id = m._id
+                    WHERE TRUE${blocked}
+                    ORDER BY RANDOM()
+                    LIMIT ${RATIO_FIT_CHUNK}
+                ) chunk
+                ORDER BY ABS(chunk._ratio - ${target.toFixed(4)}) ASC NULLS LAST
+                LIMIT 1`;
+        const rows = await allAsync(hydrateOneSql(pageSql));
         return rows.length ? rows[0] : null;
     }
 
@@ -268,19 +279,41 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
     // scheduled wallpaper across the whole library far better than independent
     // RANDOM() draws. Shares the deck with the slideshow, so a pick here also
     // deprioritises that post on the frame until the next reshuffle.
+    //
+    // With `ratioOrder`, take the RATIO_FIT_CHUNK least-seen posts (so the
+    // chunk's lowest view-tier is the library's) and return the best-fitting
+    // one, keeping display_count ahead of fit in the final pick so a viewed
+    // post is never chosen while a less-seen one is in the chunk. The chunk —
+    // not the single global nearest ratio — is the candidate pool, so the
+    // pick spreads across hundreds of posts instead of looping the handful at
+    // the exact closest ratio.
     async function runRankedRandomOne({ q = '', blockedIds = [], blockedTags = [], ratioOrder = null } = {}) {
         const set = await getMatchSet(composeWhere(parseQuery(q)));
         if (set.count === 0) return null;
         const blocked = await blockedClause({ blockedIds, blockedTags });
-        const fit = ratioOrderClause(ratioOrder);
-        const rows = await allAsync(hydrateOneSql(`
-            SELECT m._id, r.random_rank, r.display_count
-            FROM ${set.table} m
-            JOIN memory.random_ranks r ON r._id = m._id${fit.join}
-            WHERE TRUE${blocked}
-            ORDER BY ${fit.order}r.display_count ASC, r.random_rank ASC
-            LIMIT 1
-        `, ', page.random_rank, page.display_count'));
+        const target = ratioTarget(ratioOrder);
+        const pageSql = target === null
+            ? `
+                SELECT m._id, r.random_rank, r.display_count
+                FROM ${set.table} m
+                JOIN memory.random_ranks r ON r._id = m._id
+                WHERE TRUE${blocked}
+                ORDER BY r.display_count ASC, r.random_rank ASC
+                LIMIT 1`
+            : `
+                SELECT chunk._id, chunk.random_rank, chunk.display_count
+                FROM (
+                    SELECT m._id, r.random_rank, r.display_count, pr.ratio AS _ratio
+                    FROM ${set.table} m
+                    JOIN memory.random_ranks r ON r._id = m._id
+                    JOIN file_db.posts pr ON pr._id = m._id
+                    WHERE TRUE${blocked}
+                    ORDER BY r.display_count ASC, r.random_rank ASC
+                    LIMIT ${RATIO_FIT_CHUNK}
+                ) chunk
+                ORDER BY chunk.display_count ASC, ABS(chunk._ratio - ${target.toFixed(4)}) ASC NULLS LAST
+                LIMIT 1`;
+        const rows = await allAsync(hydrateOneSql(pageSql, ', page.random_rank, page.display_count'));
         return rows.length ? rows[0] : null;
     }
 

@@ -157,25 +157,28 @@ test('runRankedRandomOne walks the deck least-seen-first off random_ranks', asyn
     assert.doesNotMatch(page, /ORDER BY RANDOM\(\)/);
 });
 
-test('ratioOrder soft-biases the pick toward the target aspect, bucketed', async () => {
+test('ratioOrder picks best fit from a least-seen chunk, view-tier first', async () => {
     const db = stubDb({ rows: [{ _id: 3n, display_count: 0n, random_rank: 0.1 }] });
     const search = createSearch({ db });
     await search.runRankedRandomOne({ q: 'cats', ratioOrder: 1179 / 2556 });
 
     const page = db.pages()[0];
-    // Joins posts for the ratio column and orders by bucketed distance first,
-    // then the deck so equally-fitting posts still rotate least-seen-first.
+    // Inner chunk: the 480 least-seen posts off the deck, joined to posts for
+    // the ratio column. Outer: lowest view-tier first, then closest ratio, so
+    // a viewed post never wins while a less-seen one is in the chunk.
     assert.match(page, /JOIN file_db\.posts pr ON pr\._id = m\._id/);
-    assert.match(page, /ORDER BY ROUND\(ABS\(pr\.ratio - 0\.4613\), 2\) ASC NULLS LAST, r\.display_count ASC, r\.random_rank ASC/);
+    assert.match(page, /ORDER BY r\.display_count ASC, r\.random_rank ASC\s+LIMIT 480/);
+    assert.match(page, /ORDER BY chunk\.display_count ASC, ABS\(chunk\._ratio - 0\.4613\) ASC NULLS LAST\s+LIMIT 1/);
 });
 
-test('ratioOrder biases pure-random draws ahead of RANDOM()', async () => {
+test('ratioOrder picks best fit from a random chunk for pure-random draws', async () => {
     const db = stubDb({ rows: [{ _id: 7n }] });
     const search = createSearch({ db });
     await search.runRandomOne({ q: 'cats', ratioOrder: 1.6 });
 
     const page = db.pages()[0];
-    assert.match(page, /ORDER BY ROUND\(ABS\(pr\.ratio - 1\.6000\), 2\) ASC NULLS LAST, RANDOM\(\)/);
+    assert.match(page, /ORDER BY RANDOM\(\)\s+LIMIT 480/);
+    assert.match(page, /ORDER BY ABS\(chunk\._ratio - 1\.6000\) ASC NULLS LAST\s+LIMIT 1/);
 });
 
 test('ratioOrder absent or invalid leaves the pick query unbiased', async () => {

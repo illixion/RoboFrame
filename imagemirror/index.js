@@ -962,9 +962,11 @@ app.get('/search', async (req, res) => {
 //   list=N join the server-side tag list at index N (combined with q)
 //   ratio= bare aspect ratio (width/height); expanded by the same ±window
 //          the kiosks use into a `ratio:lo..hi` clause. Special case:
-//          `wallpaper=1&ratio=1` instead soft-orders the pick by closeness
-//          to the canvas aspect (width/height) — no hard window, ignores
-//          ratioWindow — so a 9:16 library favours the best-fitting posts.
+//          `wallpaper=1&ratio=1` instead returns the best-fitting post (by
+//          closeness to the canvas aspect width/height) out of a random
+//          least-seen chunk — no hard window, ignores ratioWindow — so a
+//          9:16 library favours its best fits while still rotating through
+//          the whole set least-seen-first.
 //   order= `random` for independent uniform draws (with replacement);
 //          anything else (default) walks the shared random_ranks deck
 //          least-seen-first and bumps the view count, so repeated calls
