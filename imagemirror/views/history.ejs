@@ -123,7 +123,7 @@
         const spinner = card.querySelector('.thumb .spinner');
         img.onload = () => { img.classList.add('loaded'); if (spinner) spinner.remove(); };
         img.onerror = () => { if (spinner) spinner.textContent = 'Failed'; };
-        img.src = endpoint('get', 'id=' + encodeURIComponent(card.dataset.id) + '&convert=1&bright=0&width=640&height=480&lowmem=' + LOWMEM + tokenParam);
+        img.src = endpoint('get', 'id=' + encodeURIComponent(card.dataset.id) + '&convert=1&bright=0&width=640&height=480&record=0&lowmem=' + LOWMEM + tokenParam);
       }
 
       document.querySelectorAll('.card[data-id]:not(.hidden)').forEach(loadCard);

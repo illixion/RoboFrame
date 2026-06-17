@@ -657,12 +657,16 @@ async function processRequestV2(req, res) {
     if (cancelled || res.headersSent) return;
     // Record in /history's per-display log. `deviceId` comes from the kiosk's
     // /get query; requests without one (iOS Shortcuts via /random, etc.)
-    // bucket under `others`.
-    history.addEntry({
-      id: parts.id,
-      ext: entry.ext,
-      deviceId: req.query.deviceId ? String(req.query.deviceId) : '',
-    });
+    // bucket under `others`. `record=0` opts out entirely — used by the
+    // /history page's own thumbnail fetches (and clients that record via
+    // /addtohistory) so viewing history doesn't re-record into `others`.
+    if (req.query.record !== '0') {
+      history.addEntry({
+        id: parts.id,
+        ext: entry.ext,
+        deviceId: req.query.deviceId ? String(req.query.deviceId) : '',
+      });
+    }
     res.setHeader('Content-Type', entry.mime);
     res.setHeader('Content-Disposition', `inline; filename="${parts.id}.${entry.ext}"`);
     res.send(entry.buffer);
