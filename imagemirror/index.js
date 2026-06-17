@@ -850,11 +850,17 @@ async function refreshRandomRanks() {
 
     // No cache interaction: match-set membership doesn't depend on view
     // counts, and page queries read display_count live from random_ranks.
+    // Returns a promise that resolves once the UPDATE has committed so a
+    // caller can order it before its next deck read — /random awaits it so
+    // back-to-back picks never re-draw a post whose bump is still in flight.
     const incrementDisplayCount = (id) => {
         const numeric = Number(id);
-        if (!Number.isFinite(numeric)) return;
-        db.run(`UPDATE random_ranks SET display_count = display_count + 1 WHERE _id = ${numeric};`, (err) => {
-            if (err) console.warn(`[display_count] update failed for _id=${numeric}: ${err.message}`);
+        if (!Number.isFinite(numeric)) return Promise.resolve();
+        return new Promise((resolve) => {
+            db.run(`UPDATE random_ranks SET display_count = display_count + 1 WHERE _id = ${numeric};`, (err) => {
+                if (err) console.warn(`[display_count] update failed for _id=${numeric}: ${err.message}`);
+                resolve();
+            });
         });
     };
     incrementDisplayCountRef = incrementDisplayCount;
@@ -1040,8 +1046,11 @@ app.get('/random', async (req, res) => {
     const id = Number(row._id);
 
     // Advance the shared deck so the next ranked call picks a different post.
+    // Awaited (not fire-and-forget) so the bump commits before this response
+    // returns — otherwise a client firing the next pick the moment it gets
+    // the image can re-draw this post off a deck that hasn't recorded it yet.
     // Skipped for pure-random draws, which intentionally ignore view counts.
-    if (!pureRandom && incrementDisplayCountRef) incrementDisplayCountRef(id);
+    if (!pureRandom && incrementDisplayCountRef) await incrementDisplayCountRef(id);
 
     if (Number(req.query.json) === 1) {
       const ext = path.extname(row.path || '').slice(1).toLowerCase();
