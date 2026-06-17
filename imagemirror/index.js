@@ -68,7 +68,6 @@ const mirrorFilesPath = pickEnv('IMAGE_MIRROR_PATH', srv.imageMirrorPath, '/Volu
 const SAVE_PATH = pickEnv('SAVE_PATH', srv.savePath, '/tmp');
 const DJXL_PATH = pickEnv('DJXL_PATH', srv.djxlPath, 'djxl');
 const JXLINFO_PATH = pickEnv('JXLINFO_PATH', srv.jxlinfoPath, 'jxlinfo');
-const FFMPEG_PATH = pickEnv('FFMPEG_PATH', srv.ffmpegPath, 'ffmpeg');
 
 // Set the default user agent for all Axios requests
 axios.defaults.headers.common['User-Agent'] = 'roboframe/1.0';
@@ -170,9 +169,11 @@ function splitApngFrames(buf) {
 /**
  * Convert an animated JXL to animated WebP. djxl emits APNG (its only
  * animated output format); we split that into standalone PNG frames in
- * memory and pipe them into ffmpeg via image2pipe (no temp file, no
- * seekable-input requirement). Frame delays are assumed uniform — true
- * for video-sourced APNGs/GIFs in this library.
+ * memory and let sharp join them into an animated WebP. Encoding rides on
+ * sharp's bundled libvips/libwebp — the same stack already rebuilt by
+ * scripts/fix-sharp-libvips.sh — so there's no separate ffmpeg/libwebp
+ * binary to keep in step with it. libvips' PNG loader doesn't decode APNG
+ * animation itself, hence the explicit per-frame split.
  * @param {Buffer} imageData - Raw JXL bytes.
  * @returns {Promise<Buffer>}
  */
@@ -193,44 +194,12 @@ async function convertToAnimatedWebP(imageData) {
   });
 
   const frames = splitApngFrames(apngBuf);
-  // APNG delay_den == 0 is spec shorthand for /100.
-  const first = frames[0];
-  const num = first.delayNum || 1;
-  const den = first.delayDen || 100;
-  // image2pipe wants -framerate as N/D where N=ticks/sec; ffmpeg accepts "den/num".
-  const framerate = `${den}/${num}`;
-
-  return await new Promise((resolve, reject) => {
-    const ffmpeg = spawn(FFMPEG_PATH, [
-      '-loglevel', 'error',
-      '-f', 'image2pipe',
-      '-framerate', framerate,
-      '-i', 'pipe:0',
-      '-loop', '0',
-      '-c:v', 'libwebp_anim',
-      '-quality', '90',
-      '-f', 'webp',
-      'pipe:1',
-    ]);
-    const out = [];
-    let err = '';
-    ffmpeg.stdout.on('data', (c) => out.push(c));
-    ffmpeg.stderr.on('data', (c) => { err += c.toString(); });
-    ffmpeg.on('error', (e) => reject(new Error(`ffmpeg spawn failed: ${e.message}`)));
-    ffmpeg.on('close', (code) => {
-      if (code !== 0) return reject(new Error(`ffmpeg exit ${code}: ${err.trim()}`));
-      resolve(Buffer.concat(out));
-    });
-    ffmpeg.stdin.on('error', () => {});
-    (async () => {
-      for (const f of frames) {
-        if (!ffmpeg.stdin.write(f.png)) {
-          await new Promise((r) => ffmpeg.stdin.once('drain', r));
-        }
-      }
-      ffmpeg.stdin.end();
-    })().catch(() => {});
-  });
+  // APNG per-frame delay is delayNum/delayDen seconds (delayDen == 0 is spec
+  // shorthand for /100); WebP wants it in milliseconds, per frame.
+  const delay = frames.map((f) => Math.round(((f.delayNum || 1) / (f.delayDen || 100)) * 1000));
+  return sharp(frames.map((f) => f.png), { join: { animated: true } })
+    .webp({ quality: 90, effort: 4, loop: 0, delay })
+    .toBuffer();
 }
 
 /**
