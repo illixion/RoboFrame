@@ -224,18 +224,37 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
         `;
     }
 
+    // Soft aspect-fit ordering for the one-shot picks. When `target` is a
+    // finite positive aspect ratio (width/height), prefer posts whose own
+    // `ratio` column is closest to it. The distance is bucketed to two
+    // decimals so a whole band of equally-fitting posts (e.g. every true
+    // 9:16 image) still rotates by the deck's least-seen order instead of
+    // ossifying on the single nearest ratio. NULL ratios (videos) sort last.
+    // Returns the posts JOIN and the leading ORDER BY term (trailing ', ')
+    // to splice into a pick query, or empty strings when bias is off.
+    function ratioOrderClause(target) {
+        const t = Number(target);
+        if (!Number.isFinite(t) || t <= 0) return { join: '', order: '' };
+        return {
+            join: ' JOIN file_db.posts pr ON pr._id = m._id',
+            order: `ROUND(ABS(pr.ratio - ${t.toFixed(4)}), 2) ASC NULLS LAST, `,
+        };
+    }
+
     // Pick one matching post by re-rolling DuckDB's RANDOM() on every call —
     // independent uniform draws, with replacement (a post can recur, and the
-    // selection ignores the slideshow's view counts).
-    async function runRandomOne({ q = '', blockedIds = [], blockedTags = [] } = {}) {
+    // selection ignores the slideshow's view counts). `ratioOrder` adds the
+    // soft aspect-fit preference ahead of the random roll.
+    async function runRandomOne({ q = '', blockedIds = [], blockedTags = [], ratioOrder = null } = {}) {
         const set = await getMatchSet(composeWhere(parseQuery(q)));
         if (set.count === 0) return null;
         const blocked = await blockedClause({ blockedIds, blockedTags });
+        const fit = ratioOrderClause(ratioOrder);
         const rows = await allAsync(hydrateOneSql(`
             SELECT m._id
-            FROM ${set.table} m
+            FROM ${set.table} m${fit.join}
             WHERE TRUE${blocked}
-            ORDER BY RANDOM()
+            ORDER BY ${fit.order}RANDOM()
             LIMIT 1
         `));
         return rows.length ? rows[0] : null;
@@ -249,16 +268,17 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
     // scheduled wallpaper across the whole library far better than independent
     // RANDOM() draws. Shares the deck with the slideshow, so a pick here also
     // deprioritises that post on the frame until the next reshuffle.
-    async function runRankedRandomOne({ q = '', blockedIds = [], blockedTags = [] } = {}) {
+    async function runRankedRandomOne({ q = '', blockedIds = [], blockedTags = [], ratioOrder = null } = {}) {
         const set = await getMatchSet(composeWhere(parseQuery(q)));
         if (set.count === 0) return null;
         const blocked = await blockedClause({ blockedIds, blockedTags });
+        const fit = ratioOrderClause(ratioOrder);
         const rows = await allAsync(hydrateOneSql(`
             SELECT m._id, r.random_rank, r.display_count
             FROM ${set.table} m
-            JOIN memory.random_ranks r ON r._id = m._id
+            JOIN memory.random_ranks r ON r._id = m._id${fit.join}
             WHERE TRUE${blocked}
-            ORDER BY r.display_count ASC, r.random_rank ASC
+            ORDER BY ${fit.order}r.display_count ASC, r.random_rank ASC
             LIMIT 1
         `, ', page.random_rank, page.display_count'));
         return rows.length ? rows[0] : null;

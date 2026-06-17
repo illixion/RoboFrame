@@ -157,6 +157,39 @@ test('runRankedRandomOne walks the deck least-seen-first off random_ranks', asyn
     assert.doesNotMatch(page, /ORDER BY RANDOM\(\)/);
 });
 
+test('ratioOrder soft-biases the pick toward the target aspect, bucketed', async () => {
+    const db = stubDb({ rows: [{ _id: 3n, display_count: 0n, random_rank: 0.1 }] });
+    const search = createSearch({ db });
+    await search.runRankedRandomOne({ q: 'cats', ratioOrder: 1179 / 2556 });
+
+    const page = db.pages()[0];
+    // Joins posts for the ratio column and orders by bucketed distance first,
+    // then the deck so equally-fitting posts still rotate least-seen-first.
+    assert.match(page, /JOIN file_db\.posts pr ON pr\._id = m\._id/);
+    assert.match(page, /ORDER BY ROUND\(ABS\(pr\.ratio - 0\.4613\), 2\) ASC NULLS LAST, r\.display_count ASC, r\.random_rank ASC/);
+});
+
+test('ratioOrder biases pure-random draws ahead of RANDOM()', async () => {
+    const db = stubDb({ rows: [{ _id: 7n }] });
+    const search = createSearch({ db });
+    await search.runRandomOne({ q: 'cats', ratioOrder: 1.6 });
+
+    const page = db.pages()[0];
+    assert.match(page, /ORDER BY ROUND\(ABS\(pr\.ratio - 1\.6000\), 2\) ASC NULLS LAST, RANDOM\(\)/);
+});
+
+test('ratioOrder absent or invalid leaves the pick query unbiased', async () => {
+    const db = stubDb({ rows: [{ _id: 3n, display_count: 0n, random_rank: 0.1 }] });
+    const search = createSearch({ db });
+    await search.runRankedRandomOne({ q: 'cats' });
+    await search.runRankedRandomOne({ q: 'cats', ratioOrder: 0 });
+
+    for (const page of db.pages()) {
+        assert.doesNotMatch(page, /pr\.ratio/);
+        assert.match(page, /ORDER BY r\.display_count ASC, r\.random_rank ASC/);
+    }
+});
+
 test('runCount answers from the build-time count without a page query', async () => {
     const db = stubDb({ count: 42 });
     const search = createSearch({ db });

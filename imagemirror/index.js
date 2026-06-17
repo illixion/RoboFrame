@@ -979,7 +979,10 @@ app.get('/search', async (req, res) => {
 //   q=     raw query (same syntax as /search)
 //   list=N join the server-side tag list at index N (combined with q)
 //   ratio= bare aspect ratio (width/height); expanded by the same ±window
-//          the kiosks use into a `ratio:lo..hi` clause
+//          the kiosks use into a `ratio:lo..hi` clause. Special case:
+//          `wallpaper=1&ratio=1` instead soft-orders the pick by closeness
+//          to the canvas aspect (width/height) — no hard window, ignores
+//          ratioWindow — so a 9:16 library favours the best-fitting posts.
 //   order= `random` for independent uniform draws (with replacement);
 //          anything else (default) walks the shared random_ranks deck
 //          least-seen-first and bumps the view count, so repeated calls
@@ -1001,7 +1004,19 @@ app.get('/random', async (req, res) => {
   if (req.query.q) parts.push(String(req.query.q));
 
   const ratio = Number(req.query.ratio);
-  if (Number.isFinite(ratio) && ratio > 0) {
+  const wantWallpaper = Number(req.query.wallpaper) === 1;
+  const canvasW = Number(req.query.width) || 0;
+  const canvasH = Number(req.query.height) || 0;
+
+  // `wallpaper=1&ratio=1` is the fit-bias toggle: soft-prefer posts whose
+  // aspect is closest to the wallpaper canvas (width/height), with no hard
+  // `ratio:` window and ignoring the configured ratioWindow. A bare `ratio=1`
+  // (no wallpaper) keeps its literal meaning — a square (1.0) target with the
+  // usual ±window, for a photo frame.
+  let ratioOrder = null;
+  if (wantWallpaper && ratio === 1 && canvasW > 0 && canvasH > 0) {
+    ratioOrder = canvasW / canvasH;
+  } else if (Number.isFinite(ratio) && ratio > 0) {
     const rawW = brokerRef ? Number(brokerRef.getRatioWindow()) : 0.15;
     const w = Number.isFinite(rawW) && rawW > 0 && rawW < 1 ? rawW : 0.15;
     parts.push(`ratio:${(ratio * (1 - w)).toFixed(2)}..${(ratio * (1 + w)).toFixed(2)}`);
@@ -1019,8 +1034,8 @@ app.get('/random', async (req, res) => {
 
   try {
     const row = pureRandom
-      ? await searchRef.runRandomOne({ q, blockedIds, blockedTags })
-      : await searchRef.runRankedRandomOne({ q, blockedIds, blockedTags });
+      ? await searchRef.runRandomOne({ q, blockedIds, blockedTags, ratioOrder })
+      : await searchRef.runRankedRandomOne({ q, blockedIds, blockedTags, ratioOrder });
     if (!row) return res.status(404).send('No matching post');
     const id = Number(row._id);
 
