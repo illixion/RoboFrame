@@ -20,8 +20,10 @@ test('keyOf is variant-aware', () => {
     const k1 = keyOf(base);
     const k2 = keyOf({ ...base, lowmem: true });
     const k3 = keyOf({ ...base, width: 3840 });
+    const k4 = keyOf({ ...base, wallpaper: true });
     assert.notEqual(k1, k2);
     assert.notEqual(k1, k3);
+    assert.notEqual(k1, k4);
 });
 
 test('LRU eviction respects maxBytes', async () => {

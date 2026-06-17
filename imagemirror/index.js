@@ -331,10 +331,44 @@ async function applyDimAndConvertToJpeg(imageBuffer, dim, width, height) {
         .toBuffer();
 }
 /**
+ * Decode a JPEG-XL image to a PNG buffer via djxl. The PNG is the common
+ * input to every downstream sharp path (resize, dim, wallpaper compose) —
+ * sharp has no native JXL decoder.
+ *
+ * @param {Buffer} imageData - Raw JXL bytes.
+ * @returns {Promise<Buffer>} - PNG bytes.
+ */
+async function decodeJxlToPng(imageData) {
+  return new Promise((resolve, reject) => {
+    const outputChunks = [];
+    const djxl = spawn(DJXL_PATH, ['-', '-', '--output_format', 'png']);
+    djxl.stdin.write(imageData);
+    djxl.stdin.end();
+    djxl.stdout.on('data', (chunk) => outputChunks.push(chunk));
+    djxl.on('close', (code) => {
+      if (code !== 0) return reject(new Error(`djxl failed with exit code ${code}`));
+      resolve(Buffer.concat(outputChunks));
+    });
+    djxl.on('error', (err) => reject(new Error(`Failed to start djxl: ${err.message}`)));
+  });
+}
+
+/**
+ * Pick the ambient dim factor for `bright` mode. Already-bright photos use a
+ * stronger multiplier so they don't stay glaring at the same level that keeps
+ * dark photos readable. Bumped from 0.30/0.15 once the prior contrast-bump
+ * (which clipped highlights on bright images) was dropped.
+ *
+ * @param {Buffer} pngBuffer
+ * @returns {Promise<number>}
+ */
+async function pickAmbientDim(pngBuffer) {
+  return (await isImageDark(pngBuffer)) ? 0.32 : 0.20;
+}
+
+/**
  * Decode a JPEG-XL image and emit JPEG (q95, black-flattened). When
- * `bright` is set, also dim the image for ambient/night-light viewing —
- * the dim factor is chosen by image brightness so already-bright photos
- * don't go invisible at the same multiplier as dark ones.
+ * `bright` is set, also dim the image for ambient/night-light viewing.
  *
  * @param {Buffer} imageData - Raw JXL bytes.
  * @param {number} width
@@ -343,31 +377,15 @@ async function applyDimAndConvertToJpeg(imageBuffer, dim, width, height) {
  * @returns {Promise<Buffer>}
  */
 async function convertFromJxl(imageData, width, height, bright = false) {
-  return new Promise((resolve, reject) => {
-    const outputChunks = [];
-    const djxl = spawn(DJXL_PATH, ['-', '-', '--output_format', 'png']);
-    djxl.stdin.write(imageData);
-    djxl.stdin.end();
-    djxl.stdout.on('data', (chunk) => outputChunks.push(chunk));
-    djxl.on('close', async (code) => {
-      if (code !== 0) return reject(new Error(`djxl failed with exit code ${code}`));
-      try {
-        const pngBuffer = Buffer.concat(outputChunks);
-        if (bright) {
-          // Bumped from 0.30/0.15 since the prior contrast-bump (which is
-          // gone now — it was clipping highlights on already-bright
-          // images) made the perceived dim feel stronger.
-          const dim = (await isImageDark(pngBuffer)) ? 0.32 : 0.20;
-          resolve(await applyDimAndConvertToJpeg(pngBuffer, dim, width, height));
-        } else {
-          resolve(await convertBufferToJpeg(pngBuffer, width, height, 95));
-        }
-      } catch (e) {
-        reject(new Error(`Sharp processing failed: ${e.message}`));
-      }
-    });
-    djxl.on('error', (err) => reject(new Error(`Failed to start djxl: ${err.message}`)));
-  });
+  const pngBuffer = await decodeJxlToPng(imageData);
+  try {
+    if (bright) {
+      return await applyDimAndConvertToJpeg(pngBuffer, await pickAmbientDim(pngBuffer), width, height);
+    }
+    return await convertBufferToJpeg(pngBuffer, width, height, 95);
+  } catch (e) {
+    throw new Error(`Sharp processing failed: ${e.message}`);
+  }
 }
 
 // Pi-class kiosks can't sustain WebP software decode at 1080p — JPEG
@@ -381,6 +399,68 @@ async function convertBufferToJpeg(imageBuffer, width, height, quality = 95) {
     .flatten({ background: '#000000' })
     .jpeg({ quality, mozjpeg: true })
     .toBuffer();
+}
+
+// Gaussian blur applied to the backdrop copy in wallpaper mode. Tuned for
+// 1080-class canvases — large enough that the under-image fill reads as a
+// soft wash of colour rather than a recognizable second copy of the photo.
+const WALLPAPER_BLUR_SIGMA = 24;
+
+/**
+ * Compose an image onto a virtual canvas of exactly `width`×`height` for use
+ * as a device wallpaper / lock-screen background. Two cases, decided per
+ * image by comparing aspect ratios:
+ *
+ *  - Image is taller (in aspect) than the canvas → cover-crop the outer
+ *    borders, centered, so the canvas fills with no empty space.
+ *  - Image is less tall than the canvas → letterbox it over a blurred,
+ *    canvas-filling copy of itself (so no hard bars show). On a portrait
+ *    canvas (a phone) the image is biased downward into the notification
+ *    region, keeping the clock area up top calm; on a landscape canvas it's
+ *    centered.
+ *
+ * `bright` applies the same ambient dim as the rest of the pipeline.
+ *
+ * @param {Buffer} imageBuffer - Decoded image bytes (PNG/JPEG/etc; JXL must
+ *   already be decoded via decodeJxlToPng).
+ * @param {number} width
+ * @param {number} height
+ * @param {{ bright?: boolean, quality?: number }} [opts]
+ * @returns {Promise<Buffer>}
+ */
+async function composeWallpaper(imageBuffer, width, height, { bright = false, quality = 95 } = {}) {
+  if (imageBuffer instanceof ArrayBuffer) imageBuffer = Buffer.from(imageBuffer);
+
+  const meta = await sharp(imageBuffer).metadata();
+  const imgAspect = meta.width / meta.height;
+  const canvasAspect = width / height;
+
+  let canvas;
+  if (imgAspect <= canvasAspect) {
+    // Taller than the canvas: fill it, cropping the outer borders.
+    canvas = sharp(imageBuffer).resize(width, height, { fit: 'cover', position: 'centre' });
+  } else {
+    // Less tall than the canvas: the image fills the width and leaves vertical
+    // slack. Scale it to fit, then place it over a blurred backdrop.
+    const fg = await sharp(imageBuffer)
+      .resize(width, height, { fit: 'inside' })
+      .toBuffer({ resolveWithObject: true });
+    const left = Math.round((width - fg.info.width) / 2);
+    // Portrait canvas (phone) → bias the image's center to ~60% down so it
+    // sits in the notification area; landscape → true vertical center.
+    const centerFrac = height > width ? 0.60 : 0.50;
+    const idealTop = Math.round(height * centerFrac - fg.info.height / 2);
+    const top = Math.max(0, Math.min(height - fg.info.height, idealTop));
+
+    const backdrop = await sharp(imageBuffer)
+      .resize(width, height, { fit: 'cover', position: 'centre' })
+      .blur(WALLPAPER_BLUR_SIGMA)
+      .toBuffer();
+    canvas = sharp(backdrop).composite([{ input: fg.data, top, left }]);
+  }
+
+  if (bright) canvas = canvas.linear(await pickAmbientDim(imageBuffer), 0);
+  return canvas.flatten({ background: '#000000' }).jpeg({ quality, mozjpeg: true }).toBuffer();
 }
 
 const EXT_MIME = {
@@ -413,7 +493,7 @@ function lookupPostPath(postId) {
 
 // Encode the variant requested by /get (or the prefetcher). Pure async —
 // no req/res. Returns { buffer, mime, ext } or throws.
-async function computeVariant({ id, convert, bright, width, height, lowmem }) {
+async function computeVariant({ id, convert, bright, width, height, lowmem, wallpaper }) {
   const row = await lookupPostPath(id);
   if (!row) {
     const err = new Error('Post not found');
@@ -447,6 +527,12 @@ async function computeVariant({ id, convert, bright, width, height, lowmem }) {
   if (animatedMode) {
     finalBuffer = await convertToAnimatedWebP(data);
     finalMimeType = 'image/webp';
+  } else if (wallpaper) {
+    // Compose onto the requested canvas. JXL sources are decoded first since
+    // sharp can't read them; everything else sharp handles directly.
+    const src = isJxl ? await decodeJxlToPng(data) : data;
+    finalBuffer = await composeWallpaper(src, width, height, { bright, quality: lowmem ? 85 : 95 });
+    finalMimeType = 'image/jpeg';
   } else if (convert) {
     finalBuffer = await convertFromJxl(data, width, height, bright);
     finalMimeType = 'image/jpeg';
@@ -470,6 +556,7 @@ function variantKeyParts(query) {
     width: Number(query.width) || 3840,
     height: Number(query.height) || 2160,
     lowmem: Boolean(Number(query.lowmem) || 0),
+    wallpaper: Boolean(Number(query.wallpaper) || 0),
   };
 }
 
@@ -899,6 +986,8 @@ app.get('/search', async (req, res) => {
 //          shuffle through the library without replacement — better spread
 //          for a scheduled wallpaper.
 //   convert/bright/width/height/lowmem  passthrough to the variant pipeline
+//   wallpaper=1 compose onto a width×height canvas (see /get) — for setting a
+//          device wallpaper / lock screen of a fixed resolution
 //   json=1 return { id, ext } instead of the image bytes
 app.get('/random', async (req, res) => {
   if (!searchRef) return res.status(503).send('Search not ready');

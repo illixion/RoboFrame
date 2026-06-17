@@ -3,9 +3,9 @@
 // Variant-aware in-memory image cache for the /get response pipeline.
 //
 // Cache key fingerprints the full set of inputs that change the encoded
-// bytes — id, convert, bright, width, height, lowmem, animated. Animated
-// WebP output is variant-independent (no resize, no quality variants), so
-// the animated path collapses to `{id, animated:true}`.
+// bytes — id, convert, bright, width, height, lowmem, wallpaper, animated.
+// Animated WebP output is variant-independent (no resize, no quality
+// variants), so the animated path collapses to `{id, animated:true}`.
 //
 // Behaviour:
 //   - Strict LRU by lastUsedAt with a byte cap (maxBytes). Eviction runs
@@ -24,9 +24,10 @@ function keyOf(parts) {
     const convert = parts.convert ? 1 : 0;
     const bright = parts.bright ? 1 : 0;
     const lowmem = parts.lowmem ? 1 : 0;
+    const wallpaper = parts.wallpaper ? 1 : 0;
     const width = Number(parts.width) || 0;
     const height = Number(parts.height) || 0;
-    return `${id}|c${convert}|b${bright}|l${lowmem}|w${width}|h${height}`;
+    return `${id}|c${convert}|b${bright}|l${lowmem}|wp${wallpaper}|w${width}|h${height}`;
 }
 
 function createImageCache({ maxBytes = 256 * 1024 * 1024 } = {}) {
