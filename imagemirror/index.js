@@ -959,7 +959,9 @@ app.get('/search', async (req, res) => {
 // scheduled clients (e.g. an iOS Shortcut that sets a wallpaper).
 //
 //   q=     raw query (same syntax as /search)
-//   list=N join the server-side tag list at index N (combined with q)
+//   list=N join the server-side tag list at index N (combined with q). When
+//          omitted, defaults to the active global list index in shared-tag
+//          mode, or list 0 otherwise.
 //   ratio= bare aspect ratio (width/height); expanded by the same ±window
 //          the kiosks use into a `ratio:lo..hi` clause. Special case:
 //          `wallpaper=1&ratio=1` instead returns the best-fitting post (by
@@ -980,7 +982,22 @@ app.get('/random', async (req, res) => {
   if (!searchRef) return res.status(503).send('Search not ready');
 
   const parts = [];
-  const listIdx = Number(req.query.list);
+  // `list=` joins the server-side tag list at that index. When omitted, fall
+  // back to what the displays are currently showing: in shared-tag mode that's
+  // the active global list index; otherwise list 0. This way a bare /random
+  // (e.g. an iOS Shortcut with no list param) tracks the slideshow's selection
+  // instead of failing on an empty/NaN index.
+  const listParam = req.query.list;
+  const listOmitted = listParam === undefined || listParam === '';
+  let listIdx;
+  if (listOmitted) {
+    const sharedOn = brokerRef && brokerRef.getSharedTags && brokerRef.getSharedTags();
+    listIdx = sharedOn && brokerRef.orchestrator
+      ? Number(brokerRef.orchestrator.getActiveTagsList())
+      : 0;
+  } else {
+    listIdx = Number(listParam);
+  }
   if (Number.isInteger(listIdx) && listIdx >= 0 && brokerRef) {
     const lists = brokerRef.getTagLists() || [];
     if (Array.isArray(lists[listIdx])) parts.push(...lists[listIdx]);

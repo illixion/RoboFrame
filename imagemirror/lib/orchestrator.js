@@ -1160,6 +1160,10 @@ function createOrchestrator({
         setTagList,
         requestAdvance,
         requestReshuffle,
+        // The active tag-list index in shared-tag mode — the single global
+        // selection every channel runs. Lets HTTP routes (e.g. /random)
+        // default to whatever the displays are currently showing.
+        getActiveTagsList: () => sharedTagsList,
         notifyImageReady,
         notifyVisibility,
         notifyBlockedChange,

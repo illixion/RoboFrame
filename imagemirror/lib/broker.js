@@ -835,6 +835,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         broadcast, close, orchestrator, mqtt,
         getTagLists, getRatioWindow: () => ratioWindow,
         getBlockedPosts, getBlockedTags,
+        getSharedTags: () => sharedTags,
     };
 }
 
