@@ -374,19 +374,73 @@ async function convertBufferToJpeg(imageBuffer, width, height, quality = 95) {
 // 1080-class canvases — large enough that the under-image fill reads as a
 // soft wash of colour rather than a recognizable second copy of the photo.
 const WALLPAPER_BLUR_SIGMA = 24;
+// How close an image's aspect must be to the canvas to crop-fill rather than
+// letterbox: crop only when covering would discard no more than this fraction
+// of the image's longer side. Beyond it the mismatch is large enough that
+// cropping would lose real content, so we fit-inside and fill the gap. Tuned
+// to keep a 9:16 image on a 19.5:9 phone (≈18% loss) on the fill side while
+// near-fits (16:10 on 16:9, slightly-too-tall on a phone) still crop clean.
+const WALLPAPER_MAX_CROP = 0.15;
+// Edge-fill detection: sample this many rows/columns at an image's edge and
+// treat it as a solid colour when no channel varies by more than the tolerance
+// across them. Such images (illustrations, screenshots with flat letterbox
+// bars) get that exact colour extended into the gap on that side instead of a
+// blurred copy of the photo, so the subject doesn't ghost through. A few
+// rows/columns ride out JPEG noise without reaching into the subject.
+const WALLPAPER_EDGE_STRIP = 3;
+const WALLPAPER_EDGE_TOLERANCE = 8;
+
+// Inspect a strip at one edge (top/bottom/left/right) of a raw RGB buffer and
+// return the mean {r,g,b} when the edge is a near-uniform colour, else null.
+// `data` is tightly packed 3-channel RGB (alpha already flattened out).
+function detectSolidEdge(data, width, height, edge) {
+  const strip = WALLPAPER_EDGE_STRIP;
+  let x0 = 0, x1 = width, y0 = 0, y1 = height;
+  if (edge === 'top') y1 = Math.min(strip, height);
+  else if (edge === 'bottom') y0 = Math.max(0, height - strip);
+  else if (edge === 'left') x1 = Math.min(strip, width);
+  else x0 = Math.max(0, width - strip); // right
+  let minR = 255, minG = 255, minB = 255, maxR = 0, maxG = 0, maxB = 0;
+  let sumR = 0, sumG = 0, sumB = 0, n = 0;
+  for (let y = y0; y < y1; y += 1) {
+    for (let x = x0; x < x1; x += 1) {
+      const i = (y * width + x) * 3;
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      if (r < minR) minR = r; if (r > maxR) maxR = r;
+      if (g < minG) minG = g; if (g > maxG) maxG = g;
+      if (b < minB) minB = b; if (b > maxB) maxB = b;
+      sumR += r; sumG += g; sumB += b; n += 1;
+    }
+  }
+  const spread = Math.max(maxR - minR, maxG - minG, maxB - minB);
+  if (spread > WALLPAPER_EDGE_TOLERANCE) return null;
+  return { r: Math.round(sumR / n), g: Math.round(sumG / n), b: Math.round(sumB / n) };
+}
+
+// A tightly-packed raw RGB rectangle of one solid colour, for compositing into
+// a wallpaper gap. Cheaper than round-tripping a generated image through sharp.
+function solidRgbRect(width, height, { r, g, b }) {
+  const buf = Buffer.allocUnsafe(width * height * 3);
+  for (let i = 0; i < buf.length; i += 3) { buf[i] = r; buf[i + 1] = g; buf[i + 2] = b; }
+  return buf;
+}
 
 /**
  * Compose an image onto a virtual canvas of exactly `width`×`height` for use
- * as a device wallpaper / lock-screen background. Two cases, decided per
- * image by comparing aspect ratios:
+ * as a device wallpaper / lock-screen background. The aspect mismatch between
+ * image and canvas decides the treatment:
  *
- *  - Image is taller (in aspect) than the canvas → cover-crop the outer
- *    borders, centered, so the canvas fills with no empty space.
- *  - Image is less tall than the canvas → letterbox it over a blurred,
- *    canvas-filling copy of itself (so no hard bars show). On a portrait
- *    canvas (a phone) the image is biased downward into the notification
- *    region, keeping the clock area up top calm; on a landscape canvas it's
- *    centered.
+ *  - Mismatch small enough that covering discards ≤ WALLPAPER_MAX_CROP of the
+ *    longer side → cover-crop, centered, so the canvas fills edge to edge with
+ *    no bars. Avoids letterboxing images that nearly fit the display.
+ *  - Larger mismatch → fit the whole image inside and fill the gap, which
+ *    falls on one axis: top/bottom for an image wider than the canvas,
+ *    left/right for one taller. A solid-coloured image edge extends its colour
+ *    across the gap on that side (so flat bars / backgrounds continue
+ *    seamlessly instead of ghosting through a blur); any remaining gap is
+ *    filled by a blurred cover-copy. A wider-than-canvas image on a portrait
+ *    phone is biased downward into the notification region (clock area stays
+ *    calm); otherwise it's centered.
  *
  * `bright` applies the same ambient dim as the rest of the pipeline.
  *
@@ -403,29 +457,71 @@ async function composeWallpaper(imageBuffer, width, height, { bright = false, qu
   const meta = await sharp(imageBuffer).metadata();
   const imgAspect = meta.width / meta.height;
   const canvasAspect = width / height;
+  // Fraction of the image's longer side a cover-crop would discard.
+  const cropLoss = 1 - Math.min(imgAspect / canvasAspect, canvasAspect / imgAspect);
 
   let canvas;
-  if (imgAspect <= canvasAspect) {
-    // Taller than the canvas: fill it, cropping the outer borders.
+  if (cropLoss <= WALLPAPER_MAX_CROP) {
+    // Near-fit: fill the canvas, cropping the small overflow.
     canvas = sharp(imageBuffer).resize(width, height, { fit: 'cover', position: 'centre' });
   } else {
-    // Less tall than the canvas: the image fills the width and leaves vertical
-    // slack. Scale it to fit, then place it over a blurred backdrop.
+    // Far from the canvas aspect: fit the whole image and fill the gap. fit
+    // 'inside' makes exactly one axis short — vertical gap if the image is
+    // wider than the canvas, horizontal gap if it's taller.
     const fg = await sharp(imageBuffer)
       .resize(width, height, { fit: 'inside' })
       .toBuffer({ resolveWithObject: true });
-    const left = Math.round((width - fg.info.width) / 2);
-    // Portrait canvas (phone) → bias the image's center to ~60% down so it
-    // sits in the notification area; landscape → true vertical center.
-    const centerFrac = height > width ? 0.60 : 0.50;
-    const idealTop = Math.round(height * centerFrac - fg.info.height / 2);
-    const top = Math.max(0, Math.min(height - fg.info.height, idealTop));
+    const fgW = fg.info.width;
+    const fgH = fg.info.height;
+    const verticalGap = imgAspect > canvasAspect;
 
-    const backdrop = await sharp(imageBuffer)
-      .resize(width, height, { fit: 'cover', position: 'centre' })
-      .blur(WALLPAPER_BLUR_SIGMA)
-      .toBuffer();
-    canvas = sharp(backdrop).composite([{ input: fg.data, top, left }]);
+    let left;
+    let top;
+    if (verticalGap) {
+      left = Math.round((width - fgW) / 2);
+      // Portrait canvas (phone) → bias the image's center to ~60% down so it
+      // sits in the notification area; landscape → true vertical center.
+      const centerFrac = height > width ? 0.60 : 0.50;
+      top = Math.max(0, Math.min(height - fgH, Math.round(height * centerFrac - fgH / 2)));
+    } else {
+      left = Math.round((width - fgW) / 2);
+      top = Math.round((height - fgH) / 2);
+    }
+    const gaps = verticalGap
+      ? [
+          { edge: 'top', size: top, rect: { w: width, h: top, x: 0, y: 0 } },
+          { edge: 'bottom', size: height - top - fgH, rect: { w: width, h: height - top - fgH, x: 0, y: top + fgH } },
+        ]
+      : [
+          { edge: 'left', size: left, rect: { w: left, h: height, x: 0, y: 0 } },
+          { edge: 'right', size: width - left - fgW, rect: { w: width - left - fgW, h: height, x: left + fgW, y: 0 } },
+        ];
+
+    // Read the resized image once as flat RGB so each gap side can check
+    // whether its edge is a solid colour worth extending into the gap.
+    const flatRgb = await sharp(fg.data)
+      .flatten({ background: '#000000' })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const fills = [];
+    let needBlur = false;
+    for (const gap of gaps) {
+      if (gap.size <= 0) continue;
+      const color = detectSolidEdge(flatRgb.data, fgW, fgH, gap.edge);
+      if (color) {
+        fills.push({ input: solidRgbRect(gap.rect.w, gap.rect.h, color), raw: { width: gap.rect.w, height: gap.rect.h, channels: 3 }, top: gap.rect.y, left: gap.rect.x });
+      } else {
+        needBlur = true;
+      }
+    }
+
+    // Blur a cover-copy as the base only when a gap still needs it; otherwise a
+    // black base suffices (the solid fills + image cover the whole canvas).
+    const backdrop = needBlur
+      ? await sharp(imageBuffer).resize(width, height, { fit: 'cover', position: 'centre' }).blur(WALLPAPER_BLUR_SIGMA).toBuffer()
+      : await sharp({ create: { width, height, channels: 3, background: '#000000' } }).png().toBuffer();
+    canvas = sharp(backdrop).composite([...fills, { input: fg.data, top, left }]);
   }
 
   if (bright) canvas = canvas.linear(await pickAmbientDim(imageBuffer), 0);
