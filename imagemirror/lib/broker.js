@@ -239,6 +239,22 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         lastBroadcastSnapshot.blockedIds = JSON.stringify(updated);
     }
 
+    // Add an id to the server-only blocklist. Persists it, evicts any cached
+    // variant, and kicks the orchestrator to drop it from every channel's
+    // queue. Shared by the WS `block` action and the HTTP /block route.
+    // Returns true if the id was newly blocked, false if already present.
+    function blockPostId(id) {
+        if (!id) return false;
+        const blocked = getBlockedPosts();
+        if (blocked.includes(id)) return false;
+        blocked.push(id);
+        saveBlockedIds(blocked);
+        console.log(`Blocked post ID: ${id}`);
+        if (imageCache) imageCache.evictPost(id);
+        if (orchestrator) orchestrator.notifyBlockedChange();
+        return true;
+    }
+
     // ----- File watcher: detect external edits, broadcast diffs ------------
     let dataReloadTimer = null;
     let dataWatcher = null;
@@ -503,14 +519,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 // let the orchestrator drop it from every channel's queue;
                 // clients see the effect via the resulting `playback`
                 // advance, not via a `blocked` frame.
-                const blocked = getBlockedPosts();
-                if (payload?.id && !blocked.includes(payload.id)) {
-                    blocked.push(payload.id);
-                    saveBlockedIds(blocked);
-                    console.log(`Blocked post ID: ${payload.id}`);
-                    if (imageCache) imageCache.evictPost(payload.id);
-                    if (orchestrator) orchestrator.notifyBlockedChange();
-                }
+                blockPostId(payload?.id);
 
             } else if (action === 'getDisplayState' && payload?.target) {
                 // Echo only the cached panel `displayState` (it carries
@@ -706,6 +715,20 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     // ----- HTTP routes (mounted on the host's Express app) ------------------
     app.get('/rpc/tags.json', (req, res) => {
         res.json(getTagLists());
+    });
+
+    // Block a post from HTTP — the kiosk-tier counterpart to the WS `block`
+    // action, used by the /history page's Block button. Accepts either token
+    // tier (same as the WS action, which is allowed on the access tier).
+    app.get('/block', (req, res) => {
+        const token = req.query.token || req.headers['x-roboframe-token'] || '';
+        if (token !== accessToken && token !== rpcToken) {
+            return res.status(401).send('Unauthorized: invalid or missing token');
+        }
+        const id = Number(req.query.id) || 0;
+        if (!id) return res.status(400).send('Missing post ID');
+        blockPostId(id);
+        return res.status(200).send('Post blocked');
     });
 
     app.get('/rpc/send', async (req, res) => {

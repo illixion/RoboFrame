@@ -53,6 +53,8 @@
       .btn:not(:disabled):hover{background:var(--save-hover)}
       .btn.secondary{background:var(--view);color:var(--view-text);border-color:#b9c0c9}
       .btn.secondary:not(:disabled):hover{background:var(--view-hover)}
+      .btn.block{background:transparent;color:var(--muted);border-color:var(--border)}
+      .btn.block:not(:disabled):hover{background:#2a1010;color:#ff8383;border-color:#ff8383}
       .btn:disabled{opacity:0.75;cursor:not-allowed}
       .btn:focus-visible{outline:2px solid #ffffff;outline-offset:2px}
 
@@ -87,6 +89,7 @@
                     <div>
                       <button class="btn save">Save</button>
                       <button class="btn secondary view">View</button>
+                      <button class="btn block">Block</button>
                     </div>
                   </div>
                 </div>
@@ -154,6 +157,24 @@
             if (!resp.ok) throw new Error('Save failed');
             btn.textContent = 'Saved';
             setTimeout(() => { btn.textContent = originalText; btn.disabled = false; }, 1500);
+          } catch (err) {
+            console.error(err);
+            btn.textContent = 'Error';
+            setTimeout(() => { btn.textContent = originalText; btn.disabled = false; }, 1500);
+          }
+          return;
+        }
+
+        if (btn && btn.classList.contains('block')) {
+          btn.disabled = true;
+          const originalText = btn.textContent;
+          btn.textContent = 'Blocking...';
+          try {
+            const resp = await fetch(endpoint('block', 'id=' + encodeURIComponent(id) + tokenParam), { method: 'GET' });
+            if (!resp.ok) throw new Error('Block failed');
+            // Drop every card for this id across all displays — the post is
+            // now server-side blocked and won't be served again.
+            document.querySelectorAll('.card[data-id="' + CSS.escape(id) + '"]').forEach((c) => c.remove());
           } catch (err) {
             console.error(err);
             btn.textContent = 'Error';

@@ -161,6 +161,51 @@ test('HTTP /rpc/tags.json returns the same tagLists as the WebSocket push', asyn
     assert.deepEqual(body, [['cats'], ['dogs', 'happy']]);
 });
 
+test('HTTP /block persists the id to the blocklist (access tier)', async (t) => {
+    await startServer();
+    t.after(stopServer);
+
+    const status = await new Promise((resolve, reject) => {
+        http.get(`http://127.0.0.1:${port}/block?id=555&token=${encodeURIComponent(ACCESS_TOKEN)}`, (res) => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode));
+        }).on('error', reject);
+    });
+    assert.equal(status, 200);
+
+    const onDisk = JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
+    assert.deepEqual(onDisk.blockedIds, [555]);
+});
+
+test('HTTP /block rejects a missing or invalid token', async (t) => {
+    await startServer();
+    t.after(stopServer);
+
+    const status = await new Promise((resolve, reject) => {
+        http.get(`http://127.0.0.1:${port}/block?id=555&token=wrong`, (res) => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode));
+        }).on('error', reject);
+    });
+    assert.equal(status, 401);
+
+    const onDisk = JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
+    assert.deepEqual(onDisk.blockedIds, []);
+});
+
+test('HTTP /block requires a post id', async (t) => {
+    await startServer();
+    t.after(stopServer);
+
+    const status = await new Promise((resolve, reject) => {
+        http.get(`http://127.0.0.1:${port}/block?token=${encodeURIComponent(ACCESS_TOKEN)}`, (res) => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode));
+        }).on('error', reject);
+    });
+    assert.equal(status, 400);
+});
+
 test('Editing data.json rebroadcasts tagLists to live clients', async (t) => {
     await startServer({ tagLists: [['initial']] });
     t.after(stopServer);
