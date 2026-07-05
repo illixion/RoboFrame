@@ -2,3 +2,8 @@ pygame>=2.5
 Pillow>=10.0
 requests>=2.31
 websocket-client>=1.7
+
+# System dependency (not pip-installable): mpv on PATH is required for video
+# and audio playback — slideshow videos (mp4/webm posts) and the playVideo /
+# playAudio effect frames all shell out to it. `apt install mpv`. Without it,
+# video posts report ready (so the channel keeps advancing) but show black.

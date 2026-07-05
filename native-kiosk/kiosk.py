@@ -13,15 +13,29 @@ Protocol summary as implemented here:
   - On open: slideshowConfig { deviceId, interval, width, height, ratio,
     convert, bright }, then visibility { deviceId, visible: true }, then
     getDisplayState { target: deviceId }.
-  - On every `playback` frame: fetch current via HTTP /get (server-resized,
-    lowmem JPEG), blit fullscreen, then send imageReady { id }.
-  - Prefetch first `upcoming` post in the background (bounded to 1 to keep
-    decoded-blob RAM low on Pi 3).
+  - On every `playback` frame whose `current` is an image: fetch via HTTP
+    /get (server-resized, lowmem JPEG), blit fullscreen, then send
+    imageReady { id }.
+  - On every `playback` frame whose `current.ext` is a video (mp4/webm):
+    stream it straight from /get into a fullscreen mpv process (no decode
+    in-process, no blob cache), then send imageReady { id, durationMs } so
+    the server sizes the dwell to the clip. A clip that fits the interval
+    loops; a longer one plays once and holds its last frame until the
+    server advances (mirrors the web kiosk's <video> loop rule).
+  - Prefetch first `upcoming` image in the background (bounded to 1 to keep
+    decoded-blob RAM low on Pi 3). Videos are never prefetched.
   - On `displayState { state: off, target: <us> }`: blank to black, pause
-    fetching. On `on`: resume by re-applying the last playback frame.
+    fetching, tear down any playing video. On `on`: resume by re-applying
+    the last playback frame.
   - On `refresh`: re-exec self (matches kiosk page-reload semantics).
-  - Effect frames (playVideo/showText/playAudio/etc.) are out of scope for
-    the MVP and logged-only; node-display passes through what it can drive.
+  - Effect frames render out-of-band, on top of the slideshow: playVideo /
+    playAudio spawn mpv, showText paints a pygame overlay, and the matching
+    stop/dismiss frames tear them down. A screen-covering effect (playVideo,
+    showText) pauses the slideshow video, which resumes when the effect
+    clears.
+
+Runtime dependency: mpv on PATH for any video/audio playback. Without it,
+video posts report ready (so the channel isn't wedged) but show black.
 
 What this client deliberately does NOT do:
   - Run its own dwell timer (server owns cadence).
@@ -36,10 +50,12 @@ import json
 import logging
 import os
 import queue
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -383,8 +399,18 @@ class Kiosk:
         self.audio_proc = None
         self.text_overlay = None         # dict {bg, image_surf, text_surf} or None
         self.effect_lock = threading.Lock()
+        self._mpv_ok = None              # shutil.which("mpv"), resolved once
+
+        # Slideshow video: a `playback.current` whose ext is mp4/webm plays
+        # in its own fullscreen mpv (base layer, same tier as a photo — not
+        # an effect). `slideshow_video` is {proc, id, ipc_path, gen} or None;
+        # `gen` fences the async duration/imageReady worker against a newer
+        # clip that superseded it.
+        self.slideshow_video = None
+        self._slideshow_gen = 0
 
         self.last_playback = None        # last full playback payload
+        self.interval = cfg["interval"]  # dwell (ms); tracks playback.interval
         self.current_id = None           # what's actually on screen
         # `save_id` is what the SPACE key acts on. It lags `current_id` by
         # 1.5s so a user pressing save just as an image switches still
@@ -433,11 +459,16 @@ class Kiosk:
             "payload": {"deviceId": self.cfg["device_id"], "visible": visible},
         })
 
-    def _send_image_ready(self, pid):
+    def _send_image_ready(self, pid, duration_ms=None):
+        payload = {"id": pid}
+        # durationMs is video-only; the server dwells for max(interval,
+        # durationMs) so a clip longer than the interval plays through.
+        if duration_ms and duration_ms > 0:
+            payload["durationMs"] = int(duration_ms)
         self.conn.send({
             "sessionId": KIOSK_SESSION_ID,
             "action": "imageReady",
-            "payload": {"id": pid},
+            "payload": payload,
         })
 
     # -- main-thread frame dispatch -----------------------------------------
@@ -504,23 +535,41 @@ class Kiosk:
         if not payload:
             return
         self.last_playback = payload
+        iv = payload.get("interval")
+        if isinstance(iv, (int, float)) and iv > 0:
+            self.interval = iv
         cur = payload.get("current") or {}
         upcoming = payload.get("upcoming") or ([payload["next"]] if payload.get("next") else [])
+        up0 = upcoming[0] if upcoming else None
 
-        # Bounded keep set: current + 1 upcoming.
+        cur_video = self._is_video(cur)
+
+        # Bounded keep set for the image fetcher: images only. Videos stream
+        # from /get straight into mpv and are never decoded into the cache.
         keep = set()
-        if cur.get("id"):
+        if cur.get("id") and not cur_video:
             keep.add(cur["id"])
-        if upcoming:
-            keep.add(upcoming[0]["id"])
+        if up0 and up0.get("id") and not self._is_video(up0):
+            keep.add(up0["id"])
         self.fetcher.keep_only(keep)
 
         if self._is_off():
+            self._stop_slideshow_video()
             return  # don't pull binaries while the panel is dark
-        if cur.get("id"):
-            self.fetcher.request(cur)
-        if upcoming:
-            self.fetcher.request(upcoming[0])
+
+        if cur_video:
+            self._play_slideshow_video(cur)
+        else:
+            # A photo (or nothing) is current — tear down any playing video
+            # so mpv stops covering the framebuffer, then fetch the image.
+            self._stop_slideshow_video()
+            if cur.get("id"):
+                self.fetcher.request(cur)
+
+        # Prefetch the next image only; videos aren't prefetched (a ~100MB
+        # clip pulled just to be cut off mid-loop is pure waste).
+        if up0 and up0.get("id") and not self._is_video(up0):
+            self.fetcher.request(up0)
 
     # -- toasts -------------------------------------------------------------
 
@@ -692,6 +741,221 @@ class Kiosk:
         """
         return self.video_proc is not None or self.text_overlay is not None
 
+    def _video_on_screen(self):
+        """True iff a live mpv window (effect or slideshow) owns the
+        framebuffer, so the pygame compositor must not fight it for the
+        screen. A slideshow entry with `proc is None` (mpv missing) doesn't
+        cover anything, so the compositor still paints black + clock.
+        """
+        if self.video_proc is not None:
+            return True
+        sv = self.slideshow_video
+        return bool(sv and sv.get("proc") is not None)
+
+    def _have_mpv(self):
+        if self._mpv_ok is None:
+            self._mpv_ok = shutil.which("mpv") is not None
+        return self._mpv_ok
+
+    @staticmethod
+    def _is_video(post):
+        return bool(post) and str(post.get("ext") or "").lower() in ("mp4", "webm")
+
+    # -- slideshow video (a `playback.current` that's mp4/webm) -------------
+
+    def _build_video_url(self, post):
+        # /get streams videos straight from disk with Range support; convert/
+        # width/height/lowmem are ignored server-side for video, so omit them.
+        params = {
+            "id": str(post["id"]),
+            "token": self.cfg["access_token"],
+            "deviceId": self.cfg["device_id"],
+        }
+        return f"{self.cfg['http_base']}/get?{urllib.parse.urlencode(params)}"
+
+    def _spawn_mpv_slideshow(self, url, ipc_path):
+        # Muted (like the web kiosk's <video muted>), no OSC/input, terminal-
+        # quiet. --loop-file=inf loops from the start so a short clip repeats
+        # with no gap; the worker flips it to `no` once it learns the clip is
+        # longer than the dwell. --keep-open=yes holds the last frame instead
+        # of exiting so a played-once clip stays on screen until we advance.
+        # --input-ipc-server exposes a socket for the duration query.
+        cmd = [
+            "mpv", "--fs", "--no-osc", "--no-input-default-bindings",
+            "--no-input-terminal", "--no-terminal", "--really-quiet",
+            "--no-audio", "--keep-open=yes", "--loop-file=inf",
+            f"--input-ipc-server={ipc_path}", url,
+        ]
+        return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+
+    def _play_slideshow_video(self, post):
+        pid = post.get("id")
+        if not pid:
+            return
+        if self.slideshow_video and self.slideshow_video.get("id") == pid:
+            return  # already showing this clip
+        if self._effect_active():
+            # An effect owns the screen; don't spawn mpv behind/over it.
+            # _maybe_restore_video_base re-applies from last_playback once
+            # the effect clears.
+            return
+        self._stop_slideshow_video()
+        self._slideshow_gen += 1
+        gen = self._slideshow_gen
+        self.current_id = pid
+        self.base_surface = None
+        self._roll_save_id(pid)
+
+        if not self._have_mpv():
+            log.warning("mpv not installed — slideshow video %s can't play", pid)
+            # Record it so _maybe_restore_video_base doesn't respawn every
+            # tick, and report ready so the channel advances instead of
+            # riding the readiness timeout on a frame we can't render.
+            self.slideshow_video = {"proc": None, "id": pid,
+                                    "ipc_path": None, "gen": gen}
+            if self.connected:
+                self._send_image_ready(pid)
+            return
+
+        url = self._build_video_url(post)
+        ipc_path = os.path.join(tempfile.gettempdir(),
+                                f"roboframe-mpv-{os.getpid()}-{gen}.sock")
+        try:
+            os.unlink(ipc_path)
+        except OSError:
+            pass
+        proc = self._spawn_mpv_slideshow(url, ipc_path)
+        self.slideshow_video = {"proc": proc, "id": pid,
+                                "ipc_path": ipc_path, "gen": gen}
+        log.info("slideshow video %s", pid)
+        threading.Thread(target=self._slideshow_video_worker,
+                         args=(proc, ipc_path, pid, gen), daemon=True).start()
+
+    def _stop_slideshow_video(self):
+        sv = self.slideshow_video
+        self.slideshow_video = None
+        if not sv:
+            return
+        proc = sv.get("proc")
+        if proc is not None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            except Exception:
+                pass
+        if sv.get("ipc_path"):
+            try:
+                os.unlink(sv["ipc_path"])
+            except OSError:
+                pass
+        if self.current_id == sv.get("id"):
+            self.current_id = None
+
+    def _slideshow_video_worker(self, proc, ipc_path, pid, gen):
+        """Off-thread: learn the clip length over mpv's IPC socket, set the
+        loop policy, then report imageReady{id, durationMs}. Fenced on `gen`
+        so a superseded clip's late report can't fire.
+        """
+        duration_ms = 0
+        try:
+            sock = self._mpv_connect(ipc_path, proc, timeout=5)
+            if sock is not None:
+                try:
+                    dur = self._mpv_get_duration(sock, timeout=5)
+                    if dur and dur > 0:
+                        duration_ms = int(round(dur * 1000))
+                    # Play a clip longer than the dwell exactly once (then
+                    # hold its last frame via keep-open); shorter clips keep
+                    # looping. Looping a long clip would flash its opening
+                    # frame just before the advance.
+                    if duration_ms and duration_ms > self.interval:
+                        self._mpv_command(sock, ["set_property", "loop-file", "no"])
+                finally:
+                    sock.close()
+        except Exception as e:
+            log.warning("mpv ipc failed for %s: %s", pid, e)
+        # Only report if this clip is still the current one.
+        sv = self.slideshow_video
+        if sv and sv.get("gen") == gen and self.connected and not self._is_off():
+            self._send_image_ready(pid, duration_ms)
+
+    # -- mpv JSON IPC (unix socket) -----------------------------------------
+
+    @staticmethod
+    def _mpv_connect(ipc_path, proc, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return None  # mpv exited before the socket came up
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(2)
+                s.connect(ipc_path)
+                return s
+            except (FileNotFoundError, ConnectionRefusedError, OSError):
+                time.sleep(0.1)
+        return None
+
+    @staticmethod
+    def _mpv_command(sock, command):
+        """Send one command and return its reply dict (the line carrying an
+        `error` field), skipping the async `event` lines mpv interleaves.
+        """
+        sock.sendall((json.dumps({"command": command}) + "\n").encode())
+        buf = b""
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if "error" in obj:  # command reply (events lack `error`)
+                    return obj
+        return None
+
+    def _mpv_get_duration(self, sock, timeout):
+        # `duration` is unknown until mpv has demuxed the file, so poll.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            reply = self._mpv_command(sock, ["get_property", "duration"])
+            if reply and reply.get("error") == "success":
+                d = reply.get("data")
+                if isinstance(d, (int, float)) and d > 0:
+                    return float(d)
+            time.sleep(0.2)
+        return 0
+
+    def _maybe_restore_video_base(self):
+        """Re-spawn the slideshow video when a screen-covering effect that
+        pre-empted it clears. Idempotent and cheap — runs each main-loop
+        tick. No-op unless the current playback frame is a video that isn't
+        already playing.
+        """
+        if self._effect_active() or self._is_off():
+            return
+        cur = (self.last_playback or {}).get("current") or {}
+        if not self._is_video(cur):
+            return
+        if self.slideshow_video and self.slideshow_video.get("id") == cur.get("id"):
+            return
+        self._play_slideshow_video(cur)
+
     def _spawn_mpv_video(self, url):
         # mpv flags chosen for kiosk use: fullscreen, no on-screen controls,
         # no input handling (we don't want spurious key presses to crash
@@ -736,6 +1000,10 @@ class Kiosk:
     def _play_video(self, url):
         log.info("playVideo %s", url)
         self._stop_video()
+        # An effect video pre-empts a slideshow video (both are fullscreen
+        # mpv — running two 1080p decoders would OOM a Pi 3). It's re-applied
+        # from last_playback once the effect clears.
+        self._stop_slideshow_video()
         try:
             with self.effect_lock:
                 self.video_proc = self._spawn_mpv_video(url)
@@ -791,6 +1059,10 @@ class Kiosk:
 
     def _show_text(self, text, bg_hex, image_url):
         log.info("showText %r bg=%s img=%s", text[:40], bg_hex, bool(image_url))
+        # The text overlay is painted with pygame, which sits *behind* a
+        # fullscreen mpv window — so a playing slideshow video would hide it.
+        # Tear it down; it resumes when the text is dismissed.
+        self._stop_slideshow_video()
         bg = self._parse_hex(bg_hex)
         sw, sh = self.size
 
@@ -912,9 +1184,10 @@ class Kiosk:
 
         # 0. Effect overlay takes precedence over the photo. Video is
         # drawn by mpv directly (we leave the framebuffer untouched and
-        # let mpv's fullscreen window cover us); text/image overlay we
+        # let mpv's fullscreen window cover us) — this covers both the
+        # playVideo effect and a slideshow video; text/image overlay we
         # paint here.
-        if self.video_proc is not None:
+        if self._video_on_screen():
             # Don't fight mpv for the framebuffer.
             return False
         if self.text_overlay is not None:
@@ -998,6 +1271,7 @@ class Kiosk:
         if is_off == was_off:
             return
         if is_off:
+            self._stop_slideshow_video()
             self.base_surface = None
             self.current_id = None
             # Repaint immediately so the transition is visually instant.
@@ -1041,12 +1315,18 @@ class Kiosk:
         log.info("rendered %s", pid)
         if self.connected:
             self._send_image_ready(pid)
-        # Roll save_id forward only after the grace window — until then,
-        # SPACE still targets the previously-shown post.
+        self._roll_save_id(pid)
+
+    def _roll_save_id(self, pid):
+        """Advance the SPACE-key save target to `pid` after a grace window —
+        until then SPACE still targets the previously-shown post (so a save
+        pressed just as the post switches hits the one being looked at).
+        Called for both images (on render) and videos (on playback start).
+        """
         if self._save_id_timer is not None:
             self._save_id_timer.cancel()
         if self.save_id is None:
-            # First render of the session: no preceding image to protect.
+            # First post of the session: no preceding one to protect.
             self.save_id = pid
         else:
             t = threading.Timer(self.SAVE_ID_LAG, self._promote_save_id, args=(pid,))
@@ -1152,6 +1432,8 @@ class Kiosk:
             except queue.Empty:
                 pass
             self._drain_fetch_ready()
+            # Resume a slideshow video that a now-cleared effect pre-empted.
+            self._maybe_restore_video_base()
 
             # Decide whether to recomposite this tick:
             #   - toasts active → every frame (fade animation)
@@ -1163,6 +1445,9 @@ class Kiosk:
                 last_clock_tick = now
                 self._overlay_dirty = bool(self._composite_overlay())
             clock.tick(30)
+        self._stop_slideshow_video()
+        self._stop_video()
+        self._stop_audio()
         self.conn.stop()
         pygame.quit()
 
