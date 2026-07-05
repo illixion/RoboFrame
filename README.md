@@ -218,6 +218,62 @@ POST /pir/clear     -> display off + reports state to HA via MQTT
 
 Body is optional; if present and JSON, an explicit `{"state":"motion"|"clear"}` overrides the URL-derived state. Listener is bound to localhost only.
 
+## Webcam / camera streaming (Linux / Raspberry Pi)
+
+`node-display` can expose the frame's camera as an MJPEG stream for an
+NVR / Scrypted / HomeKit Secure Video / VLC / browser to consume. The
+kiosks themselves never display it — this turns the device into a camera
+source, toggleable from Home Assistant. It is **off by default and needs
+setup**; it is not plug-and-play.
+
+**Prerequisites (not installed by `npm install`):**
+
+- `sudo apt install v4l-utils` — capture shells out to `v4l2-ctl`. Without
+  it the stream fails to start (ENOENT).
+- `sudo apt install alsa-utils` — only if you enable audio; the mic path
+  shells out to `arecord`.
+- **Linux only.** Guarded by the platform check, so the macOS daemon build
+  ignores webcam config entirely.
+- **A USB UVC webcam that outputs MJPG.** Capture requests the V4L2 `MJPG`
+  pixelformat directly (no transcode). A Raspberry Pi CSI camera module
+  (libcamera) does not present an MJPG V4L2 node the same way and is not a
+  drop-in — use a USB webcam, or bridge the CSI camera to a V4L2 MJPG node
+  yourself. Run `v4l2-ctl -d /dev/video0 --list-formats` to confirm your
+  device offers `MJPG`.
+
+**Enable it** in `display.webcam` (see `roboframe.config.example.json`):
+
+| Env var | Config key | Default | Description |
+|---|---|---|---|
+| — | `display.webcam.enabled` | `false` | Start the listener at boot. Leave `false` to keep it dark until the HA switch turns it on. |
+| `WEBCAM_DEVICE` | `display.webcam.device` | `/dev/video0` | V4L2 device. Setting it (even to the default) instantiates the stream server so the HA switch works with `enabled: false`. |
+| `WEBCAM_WIDTH` / `WEBCAM_HEIGHT` | `display.webcam.width` / `.height` | `1280` / `720` | Capture resolution (must be an MJPG mode the camera supports). |
+| `WEBCAM_FRAMERATE` | `display.webcam.framerate` | `30` | Capture framerate. |
+| `WEBCAM_PORT` | `display.webcam.port` | `8082` | HTTP listen port, bound `0.0.0.0`. |
+| — | `display.webcam.tokens` | `[]` | Config-only. When non-empty, every media endpoint requires a matching `?token=` or `Authorization: Bearer`. `/health` stays open. |
+| — | `display.webcam.controls` | `{}` | Config-only. `v4l2-ctl --set-ctrl` pairs reapplied on each capture (re)start, in listed order (put dependent controls last). Common UVC fixes: `power_line_frequency=1` (50 Hz) / `2` (60 Hz) anti-flicker, `exposure_dynamic_framerate=0` to stop fps dropping in dim light. `v4l2-ctl -d <device> --list-ctrls` shows what your camera supports. |
+| — | `display.webcam.audio.enabled` | `false` | Enable the `/audio.pcm` mic feed (needs `alsa-utils`). While off, `/audio.pcm` returns 404. |
+| `WEBCAM_AUDIO_DEVICE` | `display.webcam.audio.device` | `hw:1,0` | ALSA capture device. Use the stable by-id form from `arecord -L` (e.g. `hw:CARD=U0x46d0x825,DEV=0`), **not** a numeric `hw:N,0` — card indices shift across reboots as USB/HDMI probe order changes. |
+| `WEBCAM_AUDIO_RATE` / `WEBCAM_AUDIO_CHANNELS` | `display.webcam.audio.rate` / `.channels` | `16000` / `1` | Mic PCM format (`S16_LE`). |
+
+**Endpoints** (on `http://<pi>:<port>/`):
+
+```
+GET /stream.mjpg    multipart/x-mixed-replace MJPEG (Scrypted, HKSV, VLC, browsers)
+GET /snapshot.jpg   one frame, then close
+GET /audio.pcm      raw S16_LE PCM from the mic (if configured); mux A/V in the consumer
+GET /pir/state      {"motion":bool} snapshot of PIR presence (if PIR is wired)
+GET /pir/events     text/event-stream of motion/clear — mirror PIR onto an NVR motion sensor
+GET /health         liveness, always unauthenticated
+```
+
+Capture is reference-counted: the `v4l2-ctl` / `arecord` processes only run
+while a client is attached, so an idle stream burns no CPU or USB bandwidth.
+Home Assistant gets an auto-discovered switch
+(`roboframe/switch/<deviceId>/webcam/set`) that starts/stops the listener at
+runtime. For off-LAN access, front the port with tailscale-serve (or similar)
+and set `tokens` so the exposed endpoint isn't open.
+
 ## Local data store
 
 The broker keeps three pieces of per-install state in a single JSON file at `imagemirror/data.json` (override via `DATA_PATH` env / `server.dataPath` config):
