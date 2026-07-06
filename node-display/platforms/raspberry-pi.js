@@ -8,16 +8,24 @@
 // no retry. Stage 2 ("off") escalates to a full HDMI cut after
 // DIM_TO_OFF_DELAY_MS of continued inactivity.
 //
-// Under X11 we use `xrandr --output <CONN> --off`, not `xset dpms`.
-// On Pi KMS the DPMS state register is software-only — the HDMI clock
-// keeps scanning out the framebuffer, so monitors that don't honour
-// DPMS (e.g. AOC consumer panels) see a live signal and stay backlit.
-// xrandr disables the CRTC so the HDMI link drops and the panel really
-// goes to standby. The historical objection to xrandr (framebuffer
-// collapse to minimum size on the only output, causing the Chromium
-// kiosk to resize twice per cycle) is sidestepped by pinning the
-// framebuffer with `xrandr --fb` at startup. Wake is `--output --auto`,
-// which reconnects to the pinned framebuffer with no resize event.
+// Under X11 we cut power with `xrandr --output <CONN> --off`, not
+// `xset dpms force off`. On Pi vc4 KMS the DPMS register is software-only:
+// `xset dpms force off` flips X's internal flag to "off" but the CRTC keeps
+// scanning out the framebuffer — a client still presenting frames (the SDL
+// kiosk) re-arms the CRTC — so the HDMI link stays live and the panel stays
+// backlit showing black. `xrandr --output --off` disables the CRTC outright,
+// the HDMI link drops, and the panel really goes to standby.
+//
+// Wake sets an explicit mode: `xrandr --output <CONN> --mode <WxH>`.
+// `--auto` does NOT re-enable the CRTC on this Pi+panel combo — it leaves the
+// output "connected" with no active mode and the panel dark. The framebuffer
+// collapse objection to xrandr (root screen shrinking to 320x200 while the
+// sole output is off, making the kiosk resize twice per cycle) is sidestepped
+// by pinning the framebuffer with `xrandr --fb <WxH>` at startup and on wake,
+// so the screen size never changes and no resize event reaches the kiosk.
+//
+// If the connector name can't be discovered we fall back to `xset dpms force`,
+// which is correct for the (rare) panels that honour hardware DPMS.
 //
 // Under Wayland the equivalent is `wlopm --off '*'` (wlr-output-
 // power-management-v1), which behaves like DPMS but is honoured at
@@ -120,43 +128,69 @@ function detectSession() {
 function create() {
     const SESSION = detectSession();
     const XRANDR_DISPLAY = ':0';
-    // X11 path: discover the connector name (e.g. HDMI-1) once and pin
-    // the framebuffer to its current resolution so `--output --off`
-    // doesn't shrink the X screen. If discovery fails we fall back to
-    // xset DPMS, which works on monitors that honour DPMS even though
-    // many Pi-attached panels don't.
-    const X11_OUTPUT = SESSION === 'wayland' ? null : discoverX11Output();
-    if (X11_OUTPUT) {
-        pinX11Framebuffer(X11_OUTPUT);
-        // Recover if a previous run left the output mode disabled (e.g.
-        // killed mid-off). Idempotent when the mode is already active.
-        try {
-            execSync(`xrandr --display ${XRANDR_DISPLAY} --fb ${X11_OUTPUT.width}x${X11_OUTPUT.height} --output ${X11_OUTPUT.name} --auto`, { timeout: 3000, stdio: 'ignore' });
-        } catch (_) { /* best-effort */ }
-        // Disable X server's auto-blank / DPMS idle timeouts. We own the
-        // on/off state via xset dpms force; without this, X would re-blank
-        // the panel 10 minutes after the last input event (kiosk has no
-        // keyboard/mouse, so the idle counter ticks down even when we
-        // just woke it). DPMS itself stays enabled so force commands work.
-        try {
-            execSync(`xset -display ${XRANDR_DISPLAY} s off s noblank dpms 0 0 0`, { timeout: 3000, stdio: 'ignore' });
-        } catch (_) { /* best-effort */ }
+    // X11 path: discover the connector name (e.g. HDMI-1) and pin the
+    // framebuffer to its current resolution so `--output --off` doesn't shrink
+    // the X screen. Discovery is lazy and re-attempted until it succeeds:
+    // node-display's unit waits only for the X socket, not for the kiosk's
+    // `xhost +si:localuser:<us>` grant, so on a cold boot the first
+    // `xrandr --query` can run before we're authorized and come back empty.
+    // A one-shot probe at startup would then latch X11_OUTPUT=null and fall
+    // back to xset (which can't power down a vc4 CRTC) for the whole process
+    // lifetime. Retrying at each power operation means the first real
+    // off/on — which happens well after the session is up — picks up xrandr.
+    let X11_OUTPUT = null;
+    let X11_MODE = null;
+    let _x11SetupDone = false;
+
+    // Resolve (and cache) the connector, doing the one-time framebuffer pin +
+    // DPMS-idle disable the first time it succeeds. Returns X11_OUTPUT or null.
+    function ensureX11Output() {
+        if (SESSION === 'wayland' || X11_OUTPUT) return X11_OUTPUT;
+        const out = discoverX11Output();
+        if (!out) { console.log('[display] xrandr output discovery failed; using xset DPMS fallback'); return null; }
+        X11_OUTPUT = out;
+        X11_MODE = `${out.width}x${out.height}`;
+        console.log(`[display] xrandr power control on ${out.name} @ ${X11_MODE}`);
+        if (!_x11SetupDone) {
+            _x11SetupDone = true;
+            pinX11Framebuffer(out);
+            // Recover if a previous run left the output mode disabled (e.g.
+            // killed mid-off). Set the mode explicitly — `--auto` does not
+            // re-enable the CRTC on this hardware. Idempotent when active.
+            try {
+                execSync(`xrandr --display ${XRANDR_DISPLAY} --fb ${X11_MODE} --output ${out.name} --mode ${X11_MODE}`, { timeout: 3000, stdio: 'ignore' });
+            } catch (_) { /* best-effort */ }
+            // Disable X's auto-blank / DPMS idle timeouts. We own the on/off
+            // state via xrandr; without this, X would re-blank the panel 10
+            // minutes after the last input event (the kiosk has no keyboard/
+            // mouse, so the idle counter ticks down even after we just woke it).
+            try {
+                execSync(`xset -display ${XRANDR_DISPLAY} s off s noblank dpms 0 0 0`, { timeout: 3000, stdio: 'ignore' });
+            } catch (_) { /* best-effort */ }
+        }
+        return X11_OUTPUT;
     }
-    // Use xset dpms for both on and off rather than xrandr --output --off:
-    //   * xrandr --auto does NOT wake DPMS on this Pi+panel combo — the
-    //     monitor stays in DPMS-off even after the mode is re-set, so a
-    //     wake that only ran xrandr left the panel dark.
-    //   * xrandr --output --off works but collapses the root framebuffer
-    //     to 320x200 if the process exits before the next --auto, which
-    //     leaves subsequent runs stuck without a mode.
-    // xset dpms force preserves mode + framebuffer and reliably drives
-    // power state on this hardware.
-    const DPMS_OFF_CMD = SESSION === 'wayland'
-        ? `wlopm --off '*'`
-        : `xset -display ${XRANDR_DISPLAY} dpms force off`;
-    const DPMS_ON_CMD = SESSION === 'wayland'
-        ? `wlopm --on '*'`
-        : `xset -display ${XRANDR_DISPLAY} dpms force on`;
+    ensureX11Output(); // best-effort at startup; re-attempted lazily on use
+
+    // Off cuts the CRTC via xrandr (see top-of-file note); on re-sets the mode
+    // explicitly (--auto doesn't wake this panel) and re-pins the framebuffer
+    // in case a prior off collapsed it, then clears any stale software DPMS-off
+    // state with `dpms force on`. Without a discovered output we fall back to
+    // xset dpms force for panels that honour hardware DPMS.
+    function offCmd() {
+        if (SESSION === 'wayland') return `wlopm --off '*'`;
+        const out = ensureX11Output();
+        return out
+            ? `xrandr --display ${XRANDR_DISPLAY} --output ${out.name} --off`
+            : `xset -display ${XRANDR_DISPLAY} dpms force off`;
+    }
+    function onCmd() {
+        if (SESSION === 'wayland') return `wlopm --on '*'`;
+        const out = ensureX11Output();
+        return out
+            ? `xrandr --display ${XRANDR_DISPLAY} --fb ${X11_MODE} --output ${out.name} --mode ${X11_MODE}; xset -display ${XRANDR_DISPLAY} dpms force on`
+            : `xset -display ${XRANDR_DISPLAY} dpms force on`;
+    }
     const DDC_BUS = discoverDdcBus();
     // When the panel doesn't speak DDC/CI (or `ddcutil` is missing) we
     // drop brightness control entirely and use DPMS-only on/off. The
@@ -252,8 +286,8 @@ function create() {
         // upstream and only log brightness errors, so a flaky DDC channel
         // doesn't leave Display.js's `displayOn` flag stuck at false and
         // turn every subsequent turnDisplayOff into a no-op.
-        exec(DPMS_ON_CMD, (err) => {
-            if (err) return cb(err);
+        exec(onCmd(), (err, so, se) => {
+            if (err) { console.error(`[display] wake failed: ${err.message} :: ${se}`); return cb(err); }
             _powerStage = 'on';
             currentState = true;
             _applyBrightnessWithRetry(lastOnBrightness, 4, (brightErr) => {
@@ -264,7 +298,8 @@ function create() {
     }
 
     function _dpmsOff(cb) {
-        exec(DPMS_OFF_CMD, (err) => {
+        exec(offCmd(), (err, so, se) => {
+            if (err) console.error(`[display] off failed: ${err.message} :: ${se}`);
             _powerStage = 'off';
             currentState = false;
             cb(err || null);
@@ -296,7 +331,7 @@ function create() {
                     _dimToOffTimer = null;
                     _stateQueue = _stateQueue.then(() => new Promise((resolve) => {
                         if (_powerStage !== 'dim') return resolve();
-                        exec(DPMS_OFF_CMD, () => {
+                        exec(offCmd(), () => {
                             _powerStage = 'off';
                             resolve();
                         });
@@ -329,39 +364,41 @@ function create() {
 
     // Ground-truth probe for the controller's periodic reconciler. Returns
     // (null, null) when we genuinely can't tell — the controller treats
-    // null as "skip this tick" rather than assuming on. Prefer `xset -q`
-    // under X11 because it reads true DPMS power state regardless of
-    // whether we turned off via `xrandr --output --off` or `xset dpms
-    // force off` — the mode-presence heuristic in initializeState only
-    // works for the former.
+    // null as "skip this tick" rather than assuming on.
+    //
+    // Under xrandr control the authoritative signal is whether the CRTC has an
+    // active mode, NOT `xset -q`: `xset dpms force off` never runs, and after
+    // `xrandr --output --off` the software DPMS flag stays "on" while the CRTC
+    // is dead — and conversely a panel can be lit with the DPMS flag reading
+    // "off". Probe the connector's mode presence when we have a discovered
+    // output; fall back to `xset -q` DPMS state only when we don't (panels
+    // driven by dpms force).
     function getActualPowerState(callback) {
         if (SESSION === 'wayland') return callback(null, null);
+        const out = ensureX11Output();
+        if (out) {
+            exec(`xrandr --display ${XRANDR_DISPLAY} --query`, (e, xout) => {
+                if (e) return callback(null, null);
+                const re = new RegExp(`^${out.name}\\s+connected\\b[^\\n]*?\\s\\d+x\\d+\\+\\d+\\+\\d+`, 'm');
+                callback(null, re.test(xout));
+            });
+            return;
+        }
         exec(`xset -display ${XRANDR_DISPLAY} -q`, (err, stdout) => {
             if (!err) {
                 const m = stdout.match(/Monitor is\s+(\S+)/i);
-                if (m) {
-                    const word = m[1].toLowerCase();
-                    return callback(null, word === 'on');
-                }
+                if (m) return callback(null, m[1].toLowerCase() === 'on');
             }
-            // xset unavailable or unparseable. Fall back to xrandr mode
-            // probe if we have a discovered output; otherwise give up.
-            if (!X11_OUTPUT) return callback(null, null);
-            exec(`xrandr --display ${XRANDR_DISPLAY} --query`, (e2, out2) => {
-                if (e2) return callback(null, null);
-                const re = new RegExp(`^${X11_OUTPUT.name}\\s+connected\\b[^\\n]*?\\s\\d+x\\d+\\+\\d+\\+\\d+`, 'm');
-                callback(null, re.test(out2));
-            });
+            callback(null, null);
         });
     }
 
     function initializeState(callback) {
         // Determine the current monitor power state and cached brightness.
-        // Under X11 we read DPMS state via `xset -q`. The old xrandr
-        // mode-presence heuristic doesn't apply anymore since we use
-        // xset dpms force off for power-down (which preserves the mode).
-        // Under Wayland we don't probe — wlopm has no query mode, and
-        // assuming "on" at startup is safe.
+        // Reuse getActualPowerState so the power signal matches the control
+        // path — connector mode presence under xrandr, xset -q otherwise.
+        // A null probe (Wayland, or an unreadable X server) is treated as
+        // "on", which is the safe startup assumption.
         const probeBrightness = (isOn) => {
             currentState = isOn;
             _powerStage = isOn ? 'on' : 'off';
@@ -375,18 +412,7 @@ function create() {
                 callback(null, true);
             });
         };
-        if (SESSION === 'wayland') {
-            probeBrightness(true);
-            return;
-        }
-        exec(`xset -display ${XRANDR_DISPLAY} -q`, (err, stdout) => {
-            let isOn = true;
-            if (!err) {
-                const m = stdout.match(/Monitor is\s+(\S+)/i);
-                if (m) isOn = m[1].toLowerCase() === 'on';
-            }
-            probeBrightness(isOn);
-        });
+        getActualPowerState((_err, isOn) => probeBrightness(isOn !== false));
     }
 
     // user [0..255] → DDC percent [0..100]; 0 maps to 0 (= power off).
