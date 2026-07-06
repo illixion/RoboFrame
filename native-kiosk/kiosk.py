@@ -61,6 +61,13 @@ import time
 import urllib.parse
 from pathlib import Path
 
+# mpv's fullscreen window takes focus whenever a video plays; SDL's default
+# for focus-lost FULLSCREEN windows is to iconify, and nothing ever restores
+# an iconified kiosk window — every photo after the first video would paint
+# into an unmapped window (physical screen: black). Must be set before
+# pygame.display.init().
+os.environ.setdefault("SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS", "0")
+
 import pygame
 import requests
 import websocket
@@ -745,12 +752,15 @@ class Kiosk:
         """True iff a live mpv window (effect or slideshow) owns the
         framebuffer, so the pygame compositor must not fight it for the
         screen. A slideshow entry with `proc is None` (mpv missing) doesn't
-        cover anything, so the compositor still paints black + clock.
+        cover anything, so the compositor still paints black + clock. A
+        Popen handle outlives its process, so poll() — a crashed mpv must
+        not park the compositor on a frozen frame until the next playback.
         """
         if self.video_proc is not None:
             return True
         sv = self.slideshow_video
-        return bool(sv and sv.get("proc") is not None)
+        proc = sv.get("proc") if sv else None
+        return proc is not None and proc.poll() is None
 
     def _have_mpv(self):
         if self._mpv_ok is None:
