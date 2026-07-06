@@ -720,40 +720,52 @@ class Kiosk:
 
     # -- compositor ---------------------------------------------------------
 
-    def _draw_box(self, lines, anchor):
-        """Render lines into a translucent black rounded box and blit at the
-        given screen anchor. `anchor` is one of bl, br, tr, tl with a margin.
+    @staticmethod
+    def _box_surface(lines, right_align=False):
+        """Render lines into a translucent black box surface. Standalone so
+        the same box can be blitted by the pygame compositor or shipped to a
+        playing mpv as an overlay-add bitmap.
         """
         if not lines:
             return None
-        pad_x, pad_y, gap, margin = 14, 10, 4, 30
+        pad_x, pad_y, gap = 14, 10, 4
         widths = [s.get_width() for s in lines]
         heights = [s.get_height() for s in lines]
         box_w = max(widths) + 2 * pad_x
         box_h = sum(heights) + (len(lines) - 1) * gap + 2 * pad_y
-        bg = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+        box = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
         # roughly matches rgba(0,0,0,0.7) from the web kiosk
-        bg.fill((0, 0, 0, 178))
-        sw, sh = self.size
-        if anchor == "bl":
-            x, y = margin, sh - box_h - margin
-        elif anchor == "br":
-            x, y = sw - box_w - margin, sh - box_h - margin
-        elif anchor == "tr":
-            x, y = sw - box_w - margin, margin
-        else:  # tl
-            x, y = margin, margin
-        self.screen.blit(bg, (x, y))
-        cy = y + pad_y
+        box.fill((0, 0, 0, 178))
+        cy = pad_y
         for surf, w in zip(lines, widths):
-            # right-align inside the box for tr anchor (matches sensors CSS)
-            if anchor == "tr":
-                cx = x + box_w - pad_x - w
-            else:
-                cx = x + pad_x
-            self.screen.blit(surf, (cx, cy))
+            # right-align inside the box (matches sensors CSS)
+            cx = box_w - pad_x - w if right_align else pad_x
+            box.blit(surf, (cx, cy))
             cy += surf.get_height() + gap
-        return (x, y, box_w, box_h)
+        return box
+
+    def _box_pos(self, size, anchor, margin=30):
+        """Screen position for a box of `size` at anchor bl/br/tr/tl."""
+        sw, sh = self.size
+        w, h = size
+        if anchor == "bl":
+            return margin, sh - h - margin
+        if anchor == "br":
+            return sw - w - margin, sh - h - margin
+        if anchor == "tr":
+            return sw - w - margin, margin
+        return margin, margin  # tl
+
+    def _draw_box(self, lines, anchor):
+        """Render lines into a translucent black box and blit at the given
+        screen anchor. `anchor` is one of bl, br, tr, tl with a margin.
+        """
+        box = self._box_surface(lines, right_align=(anchor == "tr"))
+        if box is None:
+            return None
+        x, y = self._box_pos(box.get_size(), anchor)
+        self.screen.blit(box, (x, y))
+        return (x, y, *box.get_size())
 
     # -- effects: video / audio / text --------------------------------------
 
@@ -875,6 +887,11 @@ class Kiosk:
         self.slideshow_video = None
         if not sv:
             return
+        if sv.get("sock") is not None:
+            try:
+                sv["sock"].close()
+            except OSError:
+                pass
         proc = sv.get("proc")
         if proc is not None:
             try:
@@ -890,34 +907,50 @@ class Kiosk:
                 os.unlink(sv["ipc_path"])
             except OSError:
                 pass
+        self._cleanup_overlay_files()
         if self.current_id == sv.get("id"):
             self.current_id = None
 
     def _slideshow_video_worker(self, proc, ipc_path, pid, gen):
         """Off-thread: learn the clip length over mpv's IPC socket, set the
         loop policy, then report imageReady{id, durationMs}. Fenced on `gen`
-        so a superseded clip's late report can't fire.
+        so a superseded clip's late report can't fire. The socket is then
+        handed to the main loop, which uses it to ship the clock/sensors
+        overlay layer into mpv (overlay-add) for as long as the clip plays.
         """
         duration_ms = 0
+        sock = None
         try:
             sock = self._mpv_connect(ipc_path, proc, timeout=5)
             if sock is not None:
-                try:
-                    dur = self._mpv_get_duration(sock, timeout=5)
-                    if dur and dur > 0:
-                        duration_ms = int(round(dur * 1000))
-                    # Play a clip longer than the dwell exactly once (then
-                    # hold its last frame via keep-open); shorter clips keep
-                    # looping. Looping a long clip would flash its opening
-                    # frame just before the advance.
-                    if duration_ms and duration_ms > self.interval:
-                        self._mpv_command(sock, ["set_property", "loop-file", "no"])
-                finally:
-                    sock.close()
+                dur = self._mpv_get_duration(sock, timeout=5)
+                if dur and dur > 0:
+                    duration_ms = int(round(dur * 1000))
+                # Play a clip longer than the dwell exactly once (then
+                # hold its last frame via keep-open); shorter clips keep
+                # looping. Looping a long clip would flash its opening
+                # frame just before the advance.
+                if duration_ms and duration_ms > self.interval:
+                    self._mpv_command(sock, ["set_property", "loop-file", "no"])
         except Exception as e:
             log.warning("mpv ipc failed for %s: %s", pid, e)
-        # Only report if this clip is still the current one.
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                sock = None
+        # Hand the socket to the overlay pusher iff this clip is still
+        # current; the worker never touches it again after this point.
         sv = self.slideshow_video
+        if sock is not None:
+            if sv and sv.get("gen") == gen:
+                sock.settimeout(0.5)
+                sv["sock"] = sock
+                self._overlay_dirty = True  # push overlays on the next tick
+            else:
+                sock.close()
+        # Only report if this clip is still the current one.
         if sv and sv.get("gen") == gen and self.connected and not self._is_off():
             self._send_image_ready(pid, duration_ms)
 
@@ -977,6 +1010,155 @@ class Kiosk:
                     return float(d)
             time.sleep(0.2)
         return 0
+
+    # -- mpv OSD overlays (clock/sensors/toasts over a slideshow video) -----
+    # A slideshow video is base-layer content, so the overlay boxes must stay
+    # visible on top of it — but mpv owns the screen while it plays. Instead
+    # of fighting it with pygame flips, the same box surfaces are shipped
+    # into mpv as premultiplied-BGRA OSD bitmaps over the clip's IPC socket
+    # (`overlay-add`); mpv composites them on the GPU. Bitmaps travel via
+    # files in /dev/shm; one overlay id per box, re-sent only when its
+    # content changes (the clock box once a second, the rest on change).
+    # Effect videos (playVideo) deliberately get no overlays — an effect
+    # covers the whole screen, matching the web kiosk's stacking.
+
+    MPV_OV_CLOCK, MPV_OV_DATE, MPV_OV_SENSORS, MPV_OV_TOASTS = 0, 1, 2, 3
+    MPV_OV_SLOTS = (0, 1, 2, 3)
+
+    @staticmethod
+    def _overlay_path(slot):
+        base = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+        return os.path.join(base, f"roboframe-ov-{os.getpid()}-{slot}.bgra")
+
+    def _cleanup_overlay_files(self):
+        for slot in self.MPV_OV_SLOTS:
+            try:
+                os.unlink(self._overlay_path(slot))
+            except OSError:
+                pass
+
+    @staticmethod
+    def _mpv_send(sock, command):
+        """Fire-and-forget IPC command; replies are drained separately so
+        the main loop never blocks on mpv.
+        """
+        sock.sendall((json.dumps({"command": command}) + "\n").encode())
+
+    @staticmethod
+    def _mpv_drain(sock):
+        try:
+            sock.setblocking(False)
+            while sock.recv(4096):
+                pass
+        except (BlockingIOError, InterruptedError):
+            pass
+        finally:
+            sock.settimeout(0.5)
+
+    def _toast_stack_surface(self, active_toasts):
+        """Render the toast stack into one surface, boxes right-aligned,
+        mirroring the pygame compositor's top-right stagger.
+        """
+        gap, pad_x, pad_y = 6, 10, 6
+        boxes = []
+        for surf, _ in active_toasts:
+            w, h = surf.get_size()
+            box = pygame.Surface((w + 2 * pad_x, h + 2 * pad_y), pygame.SRCALPHA)
+            box.fill((51, 51, 51, 230))
+            box.blit(surf, (pad_x, pad_y))
+            boxes.append(box)
+        if not boxes:
+            return None
+        stack_w = max(b.get_width() for b in boxes)
+        stack_h = sum(b.get_height() for b in boxes) + gap * (len(boxes) - 1)
+        stack = pygame.Surface((stack_w, stack_h), pygame.SRCALPHA)
+        y = 0
+        for b in boxes:
+            stack.blit(b, (stack_w - b.get_width(), y))
+            y += b.get_height() + gap
+        return stack
+
+    def _push_video_overlays(self, active_toasts):
+        """Sync the overlay layer into the playing slideshow mpv. Runs on
+        the main loop at the compositor cadence; each slot is re-uploaded
+        only when its content key changes. Any socket error drops the
+        socket — the video keeps playing, just without overlays.
+        """
+        sv = self.slideshow_video
+        sock = sv.get("sock") if sv else None
+        if sock is None:
+            return
+        state = sv.setdefault("ov_state", {})
+
+        local = time.localtime()
+        clock_str = time.strftime("%H:%M:%S", local)
+        date_str = time.strftime("%a, %b %-d", local)
+        with self.sensors_lock:
+            entries = sorted(self.sensors.values(),
+                             key=lambda e: ''.join(c for c in e["sort"] if 32 <= ord(c) < 127))
+        sensors_key = tuple((e["name"], e["value"], e["stale"]) for e in entries)
+
+        def clock_box():
+            box = self._box_surface([self.clock_font.render(clock_str, True, (222, 222, 222))])
+            return box, self._box_pos(box.get_size(), "bl")
+
+        def date_box():
+            box = self._box_surface([self.clock_font.render(date_str, True, (222, 222, 222))])
+            return box, self._box_pos(box.get_size(), "br")
+
+        def sensors_box():
+            lines = []
+            for e in entries:
+                prefix = "❗ " if e["stale"] else ""
+                lines.append(self._render_mixed(f"{prefix}{e['name']}: {e['value']}",
+                                                self.sensor_font, (222, 222, 222)))
+            box = self._box_surface(lines, right_align=True)
+            if box is None:
+                return None, None
+            return box, self._box_pos(box.get_size(), "tr")
+
+        def toasts_box():
+            stack = self._toast_stack_surface(active_toasts)
+            if stack is None:
+                return None, None
+            return stack, (self.size[0] - stack.get_width() - 20, 20)
+
+        slots = (
+            (self.MPV_OV_CLOCK, clock_str, clock_box),
+            (self.MPV_OV_DATE, date_str, date_box),
+            (self.MPV_OV_SENSORS, sensors_key, sensors_box),
+            (self.MPV_OV_TOASTS, tuple(id(s) for s, _ in active_toasts), toasts_box),
+        )
+        try:
+            for slot, key, build in slots:
+                if state.get(slot, ("\0missing",))[0] == key:
+                    continue
+                surf, pos = build()
+                if surf is None:
+                    if state.get(slot, (None, False))[1]:
+                        self._mpv_send(sock, ["overlay-remove", slot])
+                    state[slot] = (key, False)
+                    continue
+                # mpv wants premultiplied BGRA; premul_alpha() needs
+                # pygame 2.1.3+, and straight alpha only slightly brightens
+                # antialiased edges, so fall back silently.
+                out = surf.premul_alpha() if hasattr(surf, "premul_alpha") else surf
+                data = pygame.image.tobytes(out, "BGRA")
+                path = self._overlay_path(slot)
+                with open(path, "wb") as f:
+                    f.write(data)
+                w, h = surf.get_size()
+                self._mpv_send(sock, ["overlay-add", slot, int(pos[0]), int(pos[1]),
+                                      path, 0, "bgra", w, h, w * 4])
+                state[slot] = (key, True)
+            self._mpv_drain(sock)
+        except OSError as e:
+            log.warning("mpv overlay ipc lost: %s", e)
+            try:
+                sock.close()
+            except OSError:
+                pass
+            sv["sock"] = None
 
     def _maybe_restore_video_base(self):
         """Re-spawn the slideshow video when a screen-covering effect that
@@ -1224,10 +1406,12 @@ class Kiosk:
         # drawn by mpv directly (we leave the framebuffer untouched and
         # let mpv's fullscreen window cover us) — this covers both the
         # playVideo effect and a slideshow video; text/image overlay we
-        # paint here.
+        # paint here. A slideshow video still carries the overlay layer:
+        # the boxes are shipped into its mpv as OSD bitmaps instead of
+        # being blitted (see _push_video_overlays).
         if self._video_on_screen():
-            # Don't fight mpv for the framebuffer.
-            return False
+            self._push_video_overlays(active_toasts)
+            return bool(active_toasts)
         if self.text_overlay is not None:
             self._draw_text_overlay()
             pygame.display.flip()
