@@ -11,7 +11,7 @@ import { state } from './state.js';
 import { tags } from './tags.js';
 import { applyPlayback } from './slideshow.js';
 import { disable } from './visibility.js';
-import { playVideo, stopVideo, showText, dismissText, playAudio, stopAudio } from './effects.js';
+import { playVideo, stopVideo, showText, dismissText, playAudio, stopAudio, playScene, stopScene } from './effects.js';
 import { hassioUpdate } from './sensors.js';
 
 const minReconnectDelay = 500;
@@ -203,6 +203,14 @@ export function connectWebSocket() {
                 break;
             case 'stopAudio':
                 stopAudio();
+                break;
+            case 'playScene':
+                // Live WebRTC scene; this client consumes the WHEP URL,
+                // native-kiosk consumes `rtsp` from the same payload.
+                if (message.payload?.whep) playScene(message.payload.whep);
+                break;
+            case 'stopScene':
+                stopScene();
                 break;
             case 'update':
                 hassioUpdate(message.payload);

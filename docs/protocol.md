@@ -359,8 +359,8 @@ wakes after an HA-driven `displayState: off`.
 `reportSuppress` mirrors the local wake-suppressor switch into a HA
 `switch.roboframe_<deviceId>_suppress` entity. While engaged, PIR motion
 won't wake the panel and the panel is held off; explicit `displayState`
-commands and effect actions (`playVideo`, `showText`, `playAudio`,
-`refresh`) still bypass it. The complementary inbound action is
+commands and effect actions (`playVideo`, `playScene`, `showText`,
+`playAudio`, `refresh`) still bypass it. The complementary inbound action is
 `setSuppress { target, state }` — sent by the broker when HA writes the
 switch's command topic.
 
@@ -523,8 +523,9 @@ Driven by inbound HA MQTT writes (or `rpcsend`). `target` is the kiosk's
 
 `setSuppress` engages the kiosk's local wake-suppressor. While on, PIR
 motion is ignored and the panel is held off. Explicit `displayState`
-commands and effect actions (`playVideo`, `showText`, `playAudio`,
-`refresh`) still wake the panel — the switch only gates ambient wake.
+commands and effect actions (`playVideo`, `playScene`, `showText`,
+`playAudio`, `refresh`) still wake the panel — the switch only gates
+ambient wake.
 
 How a client honors `displayState: off` is platform-specific, but every
 slideshow client should report `visibility { deviceId, false }` while
@@ -587,6 +588,8 @@ fits. Payload field names are stable.
 |--------------|-------------------------------------------------|
 | `playVideo`  | `url`                                           |
 | `stopVideo`  | —                                               |
+| `playScene`  | `streamId`, `rtsp`, `whep`                      |
+| `stopScene`  | —                                               |
 | `showText`   | `text`, `bgColorHex`, `imageUrl`                |
 | `dismissText`| —                                               |
 | `playAudio`  | `url`                                           |
@@ -595,6 +598,28 @@ fits. Payload field names are stable.
 | `mjpgstreaming` | (kiosk-internal; ignore on third-party clients) |
 | `refresh`    | — (kiosk reloads the page)                      |
 | `pong`       | reply to `ping`                                 |
+
+`playScene` shows a **live** stream — a server-rendered animation page
+published into mediamtx (see the scenes section in the README). The
+payload carries one URL per transport and each client picks what it can
+consume: the native kiosk plays `rtsp` in mpv (hardware H.264 decode),
+the web kiosk subscribes to `whep` over WebRTC. Any credentials travel
+as query parameters inside those URLs; `streamId` is informational.
+Clients without a matching transport — or that don't implement the
+action at all (Spatialstash may ignore it) — drop the frame silently.
+A scene occupies the same screen tier as `playVideo`: starting either
+tears the other down, and both pre-empt a playing slideshow video,
+which resumes when the effect clears. The stream ending on its own
+(producer stopped) is equivalent to `stopScene`. A `stopScene` never
+tears down a `playVideo`.
+
+```json
+{ "action": "playScene", "payload": {
+  "streamId": "aquarium",
+  "rtsp": "rtsp://kiosk:secret@server:8554/aquarium",
+  "whep": "http://server:8889/aquarium/whep?user=kiosk&pass=secret"
+}}
+```
 
 ## Critical flows
 

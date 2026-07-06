@@ -418,6 +418,7 @@ class Kiosk:
         # the effect's. mpv is spawned out-of-process for video/audio because
         # software-decoding 1080p on Pi 3 in-process would never make it.
         self.video_proc = None
+        self.video_kind = None           # "video" | "scene" while video_proc lives
         self.audio_proc = None
         self.text_overlay = None         # dict {bg, image_surf, text_surf} or None
         self.effect_lock = threading.Lock()
@@ -535,6 +536,12 @@ class Kiosk:
                 self._play_video(url)
         elif action == "stopVideo":
             self._stop_video()
+        elif action == "playScene":
+            rtsp = (msg.get("payload") or {}).get("rtsp")
+            if rtsp:
+                self._play_scene(rtsp)
+        elif action == "stopScene":
+            self._stop_scene()
         elif action == "playAudio":
             url = (msg.get("payload") or {}).get("url")
             if url:
@@ -1190,6 +1197,22 @@ class Kiosk:
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
 
+    def _spawn_mpv_scene(self, url):
+        # Live RTSP consumer for playScene. low-latency profile + TCP keep
+        # a LAN stream glass-to-glass under ~0.5s; mpv exits when the
+        # producer stops publishing, which _watch_proc turns into the
+        # normal effect-cleared path.
+        cmd = [
+            "mpv", "--fs", "--no-osc", "--no-input-default-bindings",
+            "--no-input-terminal", "--no-terminal", "--really-quiet",
+            "--no-audio", "--profile=low-latency", "--rtsp-transport=tcp",
+            "--keep-open=no", "--loop-file=no",
+            *self._mpv_hwdec_args(), url,
+        ]
+        return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+
     def _spawn_mpv_audio(self, url):
         # 30s cap mirrors public/modules/effects.js (visionOS SystemSound
         # parity). --no-video keeps mpv off the screen.
@@ -1214,11 +1237,23 @@ class Kiosk:
         with self.effect_lock:
             if getattr(self, attr_name) is proc:
                 setattr(self, attr_name, None)
+                if attr_name == "video_proc":
+                    self.video_kind = None
         self._overlay_dirty = True
         log.info("%s ended", attr_name)
 
     def _play_video(self, url):
         log.info("playVideo %s", url)
+        self._start_effect_video(self._spawn_mpv_video, url, "video")
+
+    def _play_scene(self, rtsp_url):
+        # A live server-rendered scene (mediamtx RTSP). Same screen tier as
+        # the playVideo effect — the two pre-empt each other; the web kiosk
+        # consumes the same payload's `whep` URL instead.
+        log.info("playScene %s", rtsp_url)
+        self._start_effect_video(self._spawn_mpv_scene, rtsp_url, "scene")
+
+    def _start_effect_video(self, spawn, url, kind):
         self._stop_video()
         # An effect video pre-empts a slideshow video (both are fullscreen
         # mpv — running two 1080p decoders would OOM a Pi 3). It's re-applied
@@ -1226,9 +1261,10 @@ class Kiosk:
         self._stop_slideshow_video()
         try:
             with self.effect_lock:
-                self.video_proc = self._spawn_mpv_video(url)
+                self.video_proc = spawn(url)
+                self.video_kind = kind
         except FileNotFoundError:
-            log.warning("mpv not installed — playVideo dropped")
+            log.warning("mpv not installed — %s dropped", kind)
             return
         threading.Thread(target=self._watch_proc,
                          args=("video_proc",), daemon=True).start()
@@ -1238,6 +1274,7 @@ class Kiosk:
         with self.effect_lock:
             p = self.video_proc
             self.video_proc = None
+            self.video_kind = None
         if p is not None:
             log.info("stopVideo")
             try:
@@ -1249,6 +1286,14 @@ class Kiosk:
             except Exception:
                 pass
         self._overlay_dirty = True
+
+    def _stop_scene(self):
+        # Only tears down a scene — a stopScene broadcast must not kill an
+        # unrelated playVideo that happens to hold the effect slot.
+        with self.effect_lock:
+            if self.video_kind != "scene":
+                return
+        self._stop_video()
 
     def _play_audio(self, url):
         log.info("playAudio %s", url)

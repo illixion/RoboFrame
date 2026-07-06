@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>RoboFrame scene producer</title>
+<!--
+  Renders an animation-heavy page on a machine with a real GPU and publishes
+  it as WebRTC H.264 into mediamtx (WHIP). Kiosks consume it via the
+  `playScene` effect action: the native kiosk reads mediamtx's RTSP output
+  (hardware H.264 decode on Pi-class boards), the web kiosk subscribes WHEP.
+
+  Query params:
+    effect=<url>    page to render (same-origin for capture=canvas)
+    whip=<url>      mediamtx WHIP publish endpoint, e.g.
+                    http://host:8889/scene/whip (creds as ?user=&pass=)
+    fps=60          capture frame rate
+    kbps=20000      encoder max bitrate (LAN: 15-20 Mbps for noisy content)
+    capture=canvas  "canvas": captureStream on the effect's <canvas> —
+                    lowest overhead, needs a canvas-rendered effect.
+                    "tab": getDisplayMedia of this tab — works for any DOM
+                    page; launch Chrome with --auto-accept-this-tab-capture
+                    (or --use-fake-ui-for-media-stream) to skip the picker.
+
+  Launch flags that matter (measured, see spike/webrtc/README.md):
+    --force-device-scale-factor=1   render 1080p, not Retina 4K — the #1 fix
+    (leave hardware video encode enabled; VideoToolbox keeps encode ~free)
+-->
+<style>
+  html,body{margin:0;background:#111;color:#0f0;font:13px monospace;}
+  #log{position:fixed;top:0;left:0;padding:6px;white-space:pre;z-index:10;text-shadow:0 0 3px #000;}
+  iframe{position:fixed;top:0;left:0;border:0;width:1920px;height:1080px;
+         transform-origin:top left;transform:scale(0.35);}
+</style>
+</head>
+<body>
+<div id="log">producer starting…</div>
+<iframe id="fx" allow="autoplay"></iframe>
+<script>
+const qs = new URLSearchParams(location.search);
+const EFFECT  = qs.get('effect') || '';
+const WHIP    = qs.get('whip') || '';
+const FPS     = Number(qs.get('fps') || 60);
+const KBPS    = Number(qs.get('kbps') || 20000);
+const CAPTURE = qs.get('capture') || 'canvas';
+const logEl = document.getElementById('log');
+const log = (...a) => { console.log(...a); logEl.textContent = a.join(' '); };
+
+let pc = null;
+let session = null;      // WHIP resource URL for DELETE
+let stream = null;
+
+async function getStream() {
+    if (CAPTURE === 'tab') {
+        // Captures this tab (effect iframe fills it). The picker is
+        // auto-accepted by the launch flags; there is no user at a kiosk
+        // producer to click it.
+        return navigator.mediaDevices.getDisplayMedia({
+            video: { frameRate: FPS, displaySurface: 'browser' },
+            audio: false,
+            preferCurrentTab: true,
+        });
+    }
+    const canvas = document.getElementById('fx').contentDocument.querySelector('canvas');
+    if (!canvas) throw new Error('no <canvas> in effect page (use capture=tab for DOM pages)');
+    return canvas.captureStream(FPS);
+}
+
+async function publish() {
+    pc = new RTCPeerConnection({ iceServers: [] });   // LAN-only
+    for (const track of stream.getVideoTracks()) {
+        // contentHint=detail → encoder favors spatial fidelity over
+        // framerate when constrained (text/scanlines smear without it).
+        track.contentHint = 'detail';
+        pc.addTrack(track, stream);
+    }
+    // Force H.264: engages the platform hardware encoder (VideoToolbox on
+    // macOS) and it's the only codec Pi-class consumers decode in hardware.
+    const h264 = RTCRtpSender.getCapabilities('video').codecs
+        .filter(c => /h264/i.test(c.mimeType));
+    for (const tr of pc.getTransceivers()) {
+        if (h264.length) { try { tr.setCodecPreferences(h264); } catch { /* older UA */ } }
+        tr.direction = 'sendonly';
+    }
+    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+    if (sender) {
+        const p = sender.getParameters();
+        if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+        p.encodings[0].maxBitrate = KBPS * 1000;     // default ~2.5Mbps is far too low
+        p.encodings[0].maxFramerate = FPS;
+        p.degradationPreference = 'maintain-resolution';
+        try { await sender.setParameters(p); } catch (e) { log('setParameters failed', e.message); }
+    }
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await new Promise((resolve) => {
+        if (pc.iceGatheringState === 'complete') return resolve();
+        pc.addEventListener('icegatheringstatechange', () => {
+            if (pc.iceGatheringState === 'complete') resolve();
+        });
+        setTimeout(resolve, 2000);
+    });
+    const resp = await fetch(WHIP, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/sdp' },
+        body: pc.localDescription.sdp,
+    });
+    if (!resp.ok) throw new Error(`WHIP publish failed: HTTP ${resp.status}`);
+    const loc = resp.headers.get('Location');
+    session = loc ? new URL(loc, WHIP).href : null;
+    await pc.setRemoteDescription({ type: 'answer', sdp: await resp.text() });
+    log('publishing to', WHIP);
+
+    pc.onconnectionstatechange = () => {
+        log('pc state:', pc.connectionState);
+        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+            teardown();
+            setTimeout(start, 2000);   // mediamtx restart → republish
+        }
+    };
+}
+
+function teardown() {
+    if (session) { fetch(session, { method: 'DELETE' }).catch(() => {}); session = null; }
+    if (pc) { pc.close(); pc = null; }
+}
+addEventListener('pagehide', teardown);
+
+async function start() {
+    try {
+        if (!EFFECT || !WHIP) { log('ERROR: effect= and whip= are required'); return; }
+        if (!stream) stream = await getStream();
+        await publish();
+    } catch (err) {
+        log('ERROR:', err.message, '— retrying in 3s');
+        teardown();
+        setTimeout(start, 3000);
+    }
+}
+
+// Encoder telemetry: with VideoToolbox, encoderImplementation is often
+// blank — qualityLimitationReason 'none' + low CPU is the real tell.
+let last = { ts: 0, frames: 0, bytes: 0 };
+async function pollStats() {
+    if (pc) {
+        const stats = await pc.getStats().catch(() => null);
+        if (stats) stats.forEach((r) => {
+            if (r.type === 'outbound-rtp' && r.kind === 'video') {
+                const dts = (r.timestamp - last.ts) / 1000;
+                const fps = last.ts ? ((r.framesEncoded - last.frames) / dts) : 0;
+                const kbps = last.ts ? ((r.bytesSent - last.bytes) * 8 / dts / 1000) : 0;
+                last = { ts: r.timestamp, frames: r.framesEncoded, bytes: r.bytesSent };
+                logEl.textContent =
+                    `whip:   ${WHIP}\n` +
+                    `state:  ${pc.connectionState}\n` +
+                    `encoder:${r.encoderImplementation || '(platform)'}\n` +
+                    `res:    ${r.frameWidth || '?'}x${r.frameHeight || '?'}\n` +
+                    `fps:    ${fps.toFixed(1)}\n` +
+                    `kbps:   ${kbps.toFixed(0)}\n` +
+                    `qlimit: ${r.qualityLimitationReason || '—'}`;
+            }
+        });
+    }
+    setTimeout(pollStats, 1000);
+}
+pollStats();
+
+const iframe = document.getElementById('fx');
+if (EFFECT) {
+    iframe.src = EFFECT;
+    iframe.onload = () => setTimeout(start, 500);   // let the effect size its canvas
+} else {
+    start();
+}
+</script>
+</body>
+</html>

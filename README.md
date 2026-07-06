@@ -274,6 +274,79 @@ Home Assistant gets an auto-discovered switch
 runtime. For off-LAN access, front the port with tailscale-serve (or similar)
 and set `tokens` so the exposed endpoint isn't open.
 
+## Live scenes (server-rendered pages)
+
+Animation-heavy pages (shader effects, canvas demos, busy custom pages) that
+a Pi-class kiosk can't render at full framerate can instead be rendered **on
+the server** — which has a real GPU and hardware H.264 encode — and streamed
+to every kiosk as video, which Pi-class boards decode in hardware. The
+pipeline is:
+
+```
+Chromium (producer.html renders the effect, captures it, encodes H.264)
+   └─ WebRTC WHIP publish →  mediamtx  ─ RTSP  → native kiosk (mpv, HW decode)
+                                       └ WHEP  → web kiosk (<video>, WebRTC)
+```
+
+**mediamtx** terminates the WebRTC publish and fans out to both consumer
+protocols; deploy it as its own service next to imagemirror. Minimal
+`mediamtx.yml`:
+
+```yaml
+rtsp: yes
+rtspAddress: :8554
+webrtc: yes
+webrtcAddress: :8889
+paths:
+  all_others:
+authInternalUsers:
+  - user: any
+    ips: ['127.0.0.1', '::1']   # localhost producer publishes without auth
+    permissions: [{ action: publish }, { action: read }]
+  - user: kiosk
+    pass: <secret>
+    permissions: [{ action: read }]
+```
+
+The producer side is `/scenes/producer.html` (served by imagemirror): it
+loads the effect page in an iframe, captures it (`capture=canvas` uses
+`captureStream` on the effect's `<canvas>` — cheapest; `capture=tab`
+screen-captures the tab and works for any DOM page), forces H.264 with a
+high bitrate cap, and publishes WHIP. It can be launched by hand for
+experiments, or supervised by imagemirror via `server.scenes`
+(**disabled by default** — enabling it spawns Chromium processes on the
+server):
+
+| Env | Config | Default | Meaning |
+|---|---|---|---|
+| `SCENES_ENABLED` | `server.scenes.enabled` | `false` | Master switch for the producer supervisor. |
+| `SCENES_CHROMIUM_PATH` | `server.scenes.chromiumPath` | *(none)* | Chromium/Chrome binary to spawn (absolute path). Required when enabled. |
+| `SCENES_WHIP_BASE` | `server.scenes.whipBase` | `http://127.0.0.1:8889` | mediamtx WebRTC address; stream `id` becomes `<base>/<id>/whip`. |
+| `SCENES_PRODUCER_BASE` | `server.scenes.producerBase` | `http://127.0.0.1:<port>` | Where producer.html is fetched from (this server). |
+| — | `server.scenes.streams` | `[]` | `[{ id, effect, fps, kbps, capture }]` — one supervised Chromium each, respawned with backoff on exit. |
+
+The producer Chromium is launched with `--force-device-scale-factor=1`
+(render 1080p, not Retina 4K — 4× the pixels pushes the platform encoder
+into software) and the tab-capture auto-accept flags; hardware video encode
+stays enabled. Encoder telemetry renders as a HUD in the producer page.
+
+Kiosks are told to show a scene with the `playScene` effect action (any
+rpc-tier sender — HA automation, `/rpc/send`, MQTT RPC):
+
+```json
+{ "action": "playScene", "payload": {
+  "streamId": "aquarium",
+  "rtsp": "rtsp://kiosk:<secret>@<server>:8554/aquarium",
+  "whep": "http://<server>:8889/aquarium/whep?user=kiosk&pass=<secret>"
+}}
+```
+
+Each client picks the transport it can consume (native kiosk → `rtsp` in
+mpv with the low-latency profile; web kiosk → `whep` over WebRTC) and
+`stopScene` (or the producer stopping) tears it down. A scene occupies the
+same screen tier as the `playVideo` effect. See
+[docs/protocol.md](docs/protocol.md) for exact semantics.
+
 ## Local data store
 
 The broker keeps three pieces of per-install state in a single JSON file at `imagemirror/data.json` (override via `DATA_PATH` env / `server.dataPath` config):

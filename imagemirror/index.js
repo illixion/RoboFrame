@@ -19,6 +19,7 @@ const { createHistory } = require('./lib/history');
 const { createImageCache } = require('./lib/imageCache');
 const { createPrefetcher } = require('./lib/prefetcher');
 const { createVideoTranscoder } = require('./lib/videoTranscode');
+const { createSceneProducer } = require('./lib/sceneProducer');
 
 const config = loadConfig();
 const srv = config.server;
@@ -79,6 +80,17 @@ const videoTranscoder = createVideoTranscoder({
   ffmpegPath: pickEnv('FFMPEG_PATH', srv.video?.ffmpegPath, 'ffmpeg'),
   maxConcurrent: pickEnv('VIDEO_TRANSCODE_CONCURRENCY', srv.video?.transcodeConcurrency, 2, { type: 'number' }),
 });
+
+// Live scene producers (see lib/sceneProducer.js). Kiosks receive scenes
+// via the `playScene` effect action; this only supervises the render side.
+const sceneProducer = createSceneProducer({
+  enabled: pickEnv('SCENES_ENABLED', srv.scenes?.enabled, false, { type: 'boolean' }),
+  chromiumPath: pickEnv('SCENES_CHROMIUM_PATH', srv.scenes?.chromiumPath, ''),
+  whipBase: pickEnv('SCENES_WHIP_BASE', srv.scenes?.whipBase, 'http://127.0.0.1:8889'),
+  producerBase: pickEnv('SCENES_PRODUCER_BASE', srv.scenes?.producerBase, `http://127.0.0.1:${PORT}`),
+  streams: srv.scenes?.streams || [],
+});
+process.on('exit', () => sceneProducer.close());
 
 // Set the default user agent for all Axios requests
 axios.defaults.headers.common['User-Agent'] = 'roboframe/1.0';
@@ -978,6 +990,10 @@ async function refreshRandomRanks() {
     });
     server.listen(PORT, HOST, () => {
       console.log(`Server running on http://${HOST}:${PORT}`);
+      // Scene producers (server.scenes, off by default): one supervised
+      // Chromium per configured stream, publishing WHIP into mediamtx.
+      // Started after listen so /scenes/producer.html is reachable.
+      sceneProducer.start();
     });
   } catch (err) {
     console.error("Initialization error:", err);
