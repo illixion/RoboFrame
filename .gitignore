@@ -40,6 +40,9 @@ imagemirror/telemetry.jsonl.1
 # Per-install, never committed.
 imagemirror/custom_pages/
 
+# On-demand H.264 transcodes served by /get?vcodec=h264. Per-install cache.
+imagemirror/video_cache/
+
 # Build artifacts
 dist/
 build/

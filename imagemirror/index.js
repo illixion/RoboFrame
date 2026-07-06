@@ -18,6 +18,7 @@ const { createTagExpander, identityExpander } = require('./lib/tagExpansion');
 const { createHistory } = require('./lib/history');
 const { createImageCache } = require('./lib/imageCache');
 const { createPrefetcher } = require('./lib/prefetcher');
+const { createVideoTranscoder } = require('./lib/videoTranscode');
 
 const config = loadConfig();
 const srv = config.server;
@@ -68,6 +69,16 @@ const mirrorFilesPath = pickEnv('IMAGE_MIRROR_PATH', srv.imageMirrorPath, '/Volu
 const SAVE_PATH = pickEnv('SAVE_PATH', srv.savePath, '/tmp');
 const DJXL_PATH = pickEnv('DJXL_PATH', srv.djxlPath, 'djxl');
 const JXLINFO_PATH = pickEnv('JXLINFO_PATH', srv.jxlinfoPath, 'jxlinfo');
+
+// `/get?vcodec=h264` for video posts — Pi-class kiosks only hardware-decode
+// H.264, so the server re-encodes other codecs on demand (see
+// lib/videoTranscode.js). Degrades to raw streaming when ffmpeg is absent.
+const videoTranscoder = createVideoTranscoder({
+  cachePath: pickEnv('VIDEO_CACHE_PATH', srv.video?.cachePath, path.join(__dirname, 'video_cache')),
+  maxCacheBytes: pickEnv('VIDEO_CACHE_MAX_BYTES', srv.video?.cacheMaxBytes, 2 * 1024 * 1024 * 1024, { type: 'number' }),
+  ffmpegPath: pickEnv('FFMPEG_PATH', srv.video?.ffmpegPath, 'ffmpeg'),
+  maxConcurrent: pickEnv('VIDEO_TRANSCODE_CONCURRENCY', srv.video?.transcodeConcurrency, 2, { type: 'number' }),
+});
 
 // Set the default user agent for all Axios requests
 axios.defaults.headers.common['User-Agent'] = 'roboframe/1.0';
@@ -714,6 +725,24 @@ async function processRequestV2(req, res) {
         res.status(500).send('An error occurred while sending the file.');
         return;
       }
+      // vcodec=h264: serve/build the hardware-decodable variant. Cache hits
+      // stream like any file (Range-capable); a miss pipes ffmpeg's output
+      // live. Sources already in H.264 <=1080p, a missing ffmpeg, or a
+      // saturated transcoder all fall through to the raw file.
+      if (req.query.vcodec === 'h264' && await videoTranscoder.available()) {
+        const cached = videoTranscoder.cachedFile(parts.id);
+        if (cached) {
+          streamVideo(req, res, cached, 'video/mp4', parts.id, 'mp4');
+          return;
+        }
+        if (await videoTranscoder.sourceNeedsTranscode(parts.id, filePath)
+            && videoTranscoder.hasFreeSlot()) {
+          if (cancelled || res.headersSent) return;
+          await videoTranscoder.stream(req, res, parts.id, filePath);
+          return;
+        }
+      }
+      if (cancelled || res.headersSent) return;
       streamVideo(req, res, filePath, EXT_MIME[srcExt], parts.id, srcExt);
       return;
     }
