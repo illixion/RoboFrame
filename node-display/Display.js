@@ -15,12 +15,11 @@ let timer = null;
 
 function turnDisplayOff(callback) {
     if (timer) clearTimeout(timer);
-    if (!displayOn) {
-        return Display.getBrightness((err, brightness) => {
-            if (callback) callback(err, brightness);
-        });
-    }
-
+    // Always delegate to the backend rather than short-circuiting on the local
+    // `displayOn` flag. The backend dedups idempotently (the Pi backend on its
+    // `_powerStage`), and this is what lets the controller's reconciler recover:
+    // a re-drive after drift must actually reach the hardware. A local guard
+    // here would swallow it whenever `displayOn` had desynced from the panel.
     let completed = 0;
     let lastBrightness = null;
     let error = null;
@@ -59,12 +58,9 @@ function turnDisplayOff(callback) {
 }
 
 function turnDisplayOn(callback) {
-    if (displayOn) {
-        return Display.getBrightness((err, brightness) => {
-            if (callback) callback(err, brightness);
-        });
-    }
-
+    // See turnDisplayOff: delegate unconditionally so a reconcile re-drive
+    // always reaches the idempotent backend instead of being swallowed by a
+    // stale `displayOn`.
     let completed = 0;
     let lastBrightness = null;
     let error = null;
