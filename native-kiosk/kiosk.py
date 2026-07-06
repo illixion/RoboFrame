@@ -21,7 +21,11 @@ Protocol summary as implemented here:
     in-process, no blob cache), then send imageReady { id, durationMs } so
     the server sizes the dwell to the clip. A clip that fits the interval
     loops; a longer one plays once and holds its last frame until the
-    server advances (mirrors the web kiosk's <video> loop rule).
+    server advances (mirrors the web kiosk's <video> loop rule). The
+    `vcodec` config asks /get for an H.264 <=1080p transcode and `hwdec`
+    hands decode to the SoC (Pi VideoCore does H.264 only) — on a
+    cache-miss the transcode streams live, so durationMs may come back 0
+    and the dwell falls back to the interval for that first play.
   - Prefetch first `upcoming` image in the background (bounded to 1 to keep
     decoded-blob RAM low on Pi 3). Videos are never prefetched.
   - On `displayState { state: off, target: <us> }`: blank to black, pause
@@ -124,6 +128,15 @@ def load_config():
     interval = int(pick("INTERVAL", kiosk.get("interval"), 15000))
     bright = str(pick("BRIGHT", kiosk.get("bright"), "0")).lower() in ("1", "true", "yes", "on")
     lowmem = str(pick("LOWMEM", kiosk.get("lowmem"), "1")).lower() in ("1", "true", "yes", "on")
+    # Video delivery/decode tuning. `vcodec` asks /get for a hardware-
+    # decodable transcode ("h264"; empty string = raw file, the server also
+    # falls back to raw when it has no ffmpeg). `hwdec` is passed to mpv
+    # --hwdec; on a Pi under X11 "v4l2m2m-copy" is the reliable choice
+    # ("no" = software decode).
+    vcodec = pick("VCODEC", kiosk.get("vcodec"), "h264") or ""
+    if vcodec.lower() in ("0", "no", "none", "off"):
+        vcodec = ""
+    hwdec = pick("HWDEC", kiosk.get("hwdec"), "no")
     mod_tags = kiosk.get("modTags") or []
     if env_tags := os.environ.get("MOD_TAGS"):
         mod_tags = [t.strip() for t in env_tags.split(",") if t.strip()]
@@ -145,6 +158,8 @@ def load_config():
         "interval": interval,
         "bright": bright,
         "lowmem": lowmem,
+        "vcodec": vcodec,
+        "hwdec": hwdec,
         "mod_tags": mod_tags,
     }
 
@@ -776,11 +791,15 @@ class Kiosk:
     def _build_video_url(self, post):
         # /get streams videos straight from disk with Range support; convert/
         # width/height/lowmem are ignored server-side for video, so omit them.
+        # `vcodec` asks for the hardware-decodable H.264 variant (the server
+        # transcodes on demand and falls back to raw when it can't).
         params = {
             "id": str(post["id"]),
             "token": self.cfg["access_token"],
             "deviceId": self.cfg["device_id"],
         }
+        if self.cfg["vcodec"]:
+            params["vcodec"] = self.cfg["vcodec"]
         return f"{self.cfg['http_base']}/get?{urllib.parse.urlencode(params)}"
 
     def _spawn_mpv_slideshow(self, url, ipc_path):
@@ -794,11 +813,19 @@ class Kiosk:
             "mpv", "--fs", "--no-osc", "--no-input-default-bindings",
             "--no-input-terminal", "--no-terminal", "--really-quiet",
             "--no-audio", "--keep-open=yes", "--loop-file=inf",
+            *self._mpv_hwdec_args(),
             f"--input-ipc-server={ipc_path}", url,
         ]
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
+
+    def _mpv_hwdec_args(self):
+        # mpv falls back to software decode on its own if the requested
+        # hwdec fails to initialize, so passing a wrong value degrades
+        # gracefully rather than breaking playback.
+        hw = (self.cfg.get("hwdec") or "").strip()
+        return [f"--hwdec={hw}"] if hw and hw.lower() != "no" else []
 
     def _play_slideshow_video(self, post):
         pid = post.get("id")
@@ -974,7 +1001,8 @@ class Kiosk:
         cmd = [
             "mpv", "--fs", "--no-osc", "--no-input-default-bindings",
             "--no-input-terminal", "--no-terminal", "--really-quiet",
-            "--keep-open=no", "--loop-file=no", url,
+            "--keep-open=no", "--loop-file=no",
+            *self._mpv_hwdec_args(), url,
         ]
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
