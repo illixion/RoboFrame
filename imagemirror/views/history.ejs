@@ -42,9 +42,15 @@
       .thumb{
         width:100%;height:0;padding-bottom:100%;position:relative;overflow:hidden;border-radius:6px;background:#0a0a0a;
       }
-      .thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;cursor:pointer;opacity:0;transition:opacity .3s}
-      .thumb img.loaded{opacity:1}
+      .thumb img,.thumb video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;cursor:pointer;opacity:0;transition:opacity .3s}
+      .thumb img.loaded,.thumb video.loaded{opacity:1}
       .thumb .spinner{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:13px}
+      /* Play badge over a video's first-frame preview. pointer-events:none so
+         clicks fall through to the thumb (opens the fullscreen player). */
+      .thumb .play{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;opacity:0;transition:opacity .3s}
+      .thumb .play.loaded{opacity:1}
+      .thumb .play::before{content:"";width:44px;height:44px;border-radius:50%;background:rgba(0,0,0,0.55);box-shadow:0 0 0 1px rgba(255,255,255,0.25)}
+      .thumb .play::after{content:"";position:absolute;border-style:solid;border-width:9px 0 9px 15px;border-color:transparent transparent transparent #fff;margin-left:4px}
 
       .meta{width:100%;display:flex;justify-content:space-between;flex-flow: column;align-items:center;font-size:13px;color:var(--muted)}
       .meta .id{font-weight:600;color:var(--text)}
@@ -60,7 +66,8 @@
 
       .viewer{position:fixed;inset:0;background:rgba(0,0,0,0.95);display:none;align-items:center;justify-content:center;z-index:9999}
       .viewer.visible{display:flex}
-      .viewer img{max-width:100%;max-height:100%;height:100%;object-fit:contain}
+      .viewer img,.viewer video{max-width:100%;max-height:100%;height:100%;object-fit:contain}
+      .viewer img[hidden],.viewer video[hidden]{display:none}
 
       @media (max-width:640px){
         .grid{grid-template-columns:repeat(auto-fill,minmax(120px,1fr))}
@@ -76,13 +83,19 @@
       <% } else { %>
         <% groups.forEach(function(group){ %>
           <section class="display">
-            <h2><%= group.deviceId %> <span class="count"><%= group.posts.length %> image<%= group.posts.length === 1 ? '' : 's' %></span></h2>
+            <h2><%= group.deviceId %> <span class="count"><%= group.posts.length %> item<%= group.posts.length === 1 ? '' : 's' %></span></h2>
             <div class="grid">
               <% group.posts.forEach(function(post, i){ %>
-                <div class="card<%= i >= visible ? ' hidden' : '' %>" data-id="<%= post.id %>">
+                <% var isVideo = /^(webm|mp4)$/i.test(post.ext || ''); %>
+                <div class="card<%= i >= visible ? ' hidden' : '' %>" data-id="<%= post.id %>"<%= isVideo ? ' data-video="1"' : '' %>>
                   <div class="thumb">
                     <div class="spinner">Loading…</div>
-                    <img alt="Preview <%= post.id %>" />
+                    <% if (isVideo) { %>
+                      <video alt="Preview <%= post.id %>" muted playsinline preload="metadata"></video>
+                      <div class="play" aria-hidden="true"></div>
+                    <% } else { %>
+                      <img alt="Preview <%= post.id %>" />
+                    <% } %>
                   </div>
                   <div class="meta">
                     <div class="id">ID <%= post.id %></div>
@@ -105,6 +118,7 @@
 
     <div class="viewer" id="viewer" aria-hidden="true">
       <img id="viewerImg" src="" alt="Full size preview" />
+      <video id="viewerVideo" playsinline controls loop hidden></video>
     </div>
 
     <script>
@@ -116,14 +130,43 @@
       const BASE = new URL('./', window.location.href);
       const endpoint = (name, query) => new URL(name + '?' + query, BASE).toString();
 
-      // Fetch a card's thumbnail once. Hidden cards (beyond the per-display
+      // Streaming URL for a video post. Videos bypass the sharp pipeline —
+      // /get streams the raw file with Range support, so convert/width/lowmem
+      // are ignored; record=0 keeps history views from re-recording.
+      const videoUrl = (id) => endpoint('get', 'id=' + encodeURIComponent(id) + '&record=0' + tokenParam);
+
+      // Fetch a card's preview once. Hidden cards (beyond the per-display
       // visible window) aren't loaded until their Expand button reveals them,
       // so the initial page only fires HISTORY_VISIBLE fetches per display.
+      // Video cards get a first-frame preview: preload only metadata, then
+      // seek to the first frame so the browser paints it without pulling the
+      // whole clip (the seek fetches just the head via a Range request).
       function loadCard(card) {
+        const spinner = card.querySelector('.thumb .spinner');
+
+        if (card.dataset.video) {
+          const video = card.querySelector('.thumb video');
+          if (!video || video.dataset.loaded) return;
+          video.dataset.loaded = '1';
+          const badge = card.querySelector('.thumb .play');
+          const reveal = () => {
+            video.classList.add('loaded');
+            if (badge) badge.classList.add('loaded');
+            if (spinner) spinner.remove();
+          };
+          // Some browsers paint the first frame on loadeddata; others only
+          // after an explicit seek. Do both — reveal on whichever lands first.
+          video.onloadedmetadata = () => { try { video.currentTime = 0.1; } catch (_) {} };
+          video.onloadeddata = reveal;
+          video.onseeked = reveal;
+          video.onerror = () => { if (spinner) spinner.textContent = 'Failed'; };
+          video.src = videoUrl(card.dataset.id);
+          return;
+        }
+
         const img = card.querySelector('.thumb img');
         if (!img || img.dataset.loaded) return;
         img.dataset.loaded = '1';
-        const spinner = card.querySelector('.thumb .spinner');
         img.onload = () => { img.classList.add('loaded'); if (spinner) spinner.remove(); };
         img.onerror = () => { if (spinner) spinner.textContent = 'Failed'; };
         img.src = endpoint('get', 'id=' + encodeURIComponent(card.dataset.id) + '&convert=1&bright=0&width=640&height=480&record=0&lowmem=' + LOWMEM + tokenParam);
@@ -184,14 +227,29 @@
         }
 
         if ((btn && btn.classList.contains('view')) || (!btn && cardFromThumb)) {
-          const img = card.querySelector('img');
           const viewer = document.getElementById('viewer');
           const viewerImg = document.getElementById('viewerImg');
-          if (img && viewer && viewerImg) {
+          const viewerVideo = document.getElementById('viewerVideo');
+          if (!viewer) return;
+          if (card.dataset.video) {
+            // Play the clip full-screen from its own streaming URL rather than
+            // reusing the preview element (which is seeked to the first frame).
+            viewerImg.hidden = true;
+            viewerImg.src = '';
+            viewerVideo.hidden = false;
+            viewerVideo.src = videoUrl(id);
+            viewerVideo.play().catch(() => {});
+          } else {
+            const img = card.querySelector('img');
+            if (!img) return;
+            viewerVideo.hidden = true;
+            viewerVideo.removeAttribute('src');
+            viewerVideo.load();
+            viewerImg.hidden = false;
             viewerImg.src = img.src;
-            viewer.classList.add('visible');
-            viewer.setAttribute('aria-hidden','false');
           }
+          viewer.classList.add('visible');
+          viewer.setAttribute('aria-hidden','false');
         }
       });
 
@@ -200,7 +258,14 @@
         viewer.classList.remove('visible');
         viewer.setAttribute('aria-hidden','true');
         document.getElementById('viewerImg').src = '';
+        const viewerVideo = document.getElementById('viewerVideo');
+        viewerVideo.pause();
+        viewerVideo.removeAttribute('src');
+        viewerVideo.load();
       });
+      // Keep clicks on the video controls (play/pause/scrub) from bubbling to
+      // the backdrop and closing the viewer — dismiss with the backdrop or Esc.
+      document.getElementById('viewerVideo').addEventListener('click', (e) => e.stopPropagation());
       window.addEventListener('keydown', (e) => { if (e.key === 'Escape') document.getElementById('viewer').click(); });
     </script>
   </body>

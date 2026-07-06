@@ -74,10 +74,13 @@ test('addEntry caps each bucket independently, dropping that display oldest', ()
     assert.deepEqual(groups.find((g) => g.deviceId === 'b').posts.map((p) => p.id), [11, 10]);
 });
 
-test('listGroups exposes id only (keeps ext out of the HTML template)', () => {
+test('listGroups exposes id + ext (ext lets the template tell videos from images)', () => {
     const h = createHistory();
     h.addEntry({ id: 7, ext: 'jpg', deviceId: 'a' });
-    assert.deepEqual(h.listGroups(), [{ deviceId: 'a', posts: [{ id: 7 }] }]);
+    h.addEntry({ id: 9, ext: 'mp4', deviceId: 'a' });
+    assert.deepEqual(h.listGroups(), [
+        { deviceId: 'a', posts: [{ id: 9, ext: 'mp4' }, { id: 7, ext: 'jpg' }] },
+    ]);
 });
 
 test('findCached returns the entry by id across buckets, or undefined', () => {

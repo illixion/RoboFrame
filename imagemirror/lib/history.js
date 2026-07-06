@@ -41,13 +41,15 @@ function createHistory({ maxSize = 50 } = {}) {
   }
 
   // /history (HTML) groups by display, newest-active display first. Each
-  // group carries id-only posts (ext stays out of the browser template) plus
-  // the bucket size so the page can decide how many to show before expanding.
+  // group carries id + ext posts (ext lets the template tell a video from an
+  // image so it can render a first-frame preview instead of a broken <img>)
+  // plus the bucket size so the page can decide how many to show before
+  // expanding.
   function listGroups() {
     return [...buckets.entries()]
       .map(([deviceId, arr]) => ({
         deviceId,
-        posts: arr.map((e) => ({ id: e.id })),
+        posts: arr.map((e) => ({ id: e.id, ext: e.ext })),
         seq: arr.length ? arr[0].seq : 0,
       }))
       .filter((g) => g.posts.length > 0)
