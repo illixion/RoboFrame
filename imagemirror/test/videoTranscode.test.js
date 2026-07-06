@@ -106,7 +106,7 @@ test('end-to-end: transcode streams fMP4 and commits the cache', { skip: !hasFfm
     assert.deepEqual(fs.readFileSync(cached), body, 'cache tee matches the streamed bytes');
 });
 
-test('end-to-end: already-H.264 <=1080p source needs no transcode', { skip: !hasFfmpeg() }, async () => {
+test('end-to-end: already-H.264 <=1080p30 source needs no transcode', { skip: !hasFfmpeg() }, async () => {
     const dir = tmpDir();
     const src = path.join(dir, 'src264.mp4');
     let made = true;
@@ -122,4 +122,39 @@ test('end-to-end: already-H.264 <=1080p source needs no transcode', { skip: !has
     if (!made) return;
     const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
     assert.equal(await t.sourceNeedsTranscode(2, src), false);
+});
+
+test('end-to-end: 60fps H.264 source is transcoded and capped to 30fps', { skip: !hasFfmpeg() }, async () => {
+    const dir = tmpDir();
+    const src = path.join(dir, 'src60.mp4');
+    let made = true;
+    try {
+        execFileSync('ffmpeg', [
+            '-hide_banner', '-loglevel', 'error',
+            '-f', 'lavfi', '-i', 'testsrc=duration=0.5:size=320x240:rate=60',
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', src,
+        ], { stdio: 'ignore' });
+    } catch {
+        made = false; // ffmpeg built without libx264 — nothing to assert
+    }
+    if (!made) return;
+    const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
+    // 60fps overruns the Pi's 1080p30-rated decoder even though the codec
+    // and resolution qualify for the raw path.
+    assert.equal(await t.sourceNeedsTranscode(3, src), true);
+
+    const res = fakeRes();
+    await t.stream({}, res, 3, src);
+    await new Promise((resolve) => res.on('end', resolve));
+    for (let i = 0; i < 50 && !t.cachedFile(3); i++) {
+        await new Promise((r) => setTimeout(r, 100));
+    }
+    const cached = t.cachedFile(3);
+    assert.ok(cached, 'transcode was committed to the cache');
+    const rate = execFileSync('ffprobe', [
+        '-v', 'error', '-select_streams', 'v:0',
+        '-show_entries', 'stream=avg_frame_rate', '-of', 'csv=p=0', cached,
+    ]).toString().trim();
+    const [num, den] = rate.split('/').map(Number);
+    assert.ok(Math.abs(num / den - 30) < 1, `output frame rate is ~30fps, got ${rate}`);
 });

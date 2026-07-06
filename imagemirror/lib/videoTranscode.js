@@ -10,8 +10,11 @@
 // into a disk cache keyed by post id; replays hit a plain seekable file and
 // go through the ordinary Range-capable streaming path.
 //
-// Sources that are already H.264 at <=1080p are detected via ffprobe and
-// served raw — the client's hardware decoder handles them as-is.
+// Sources that are already H.264 at <=1080p and <=30fps are detected via
+// ffprobe and served raw — the client's hardware decoder handles them as-is.
+// Anything above either bound is downscaled/downsampled: the Pi 3's VideoCore
+// decoder is rated for 1080p30, and feeding it 1080p60 (or 4K) decodes slower
+// than realtime — the video plays in slow motion.
 //
 // Everything degrades to raw streaming: ffmpeg missing, encoder probe
 // failure, or all transcode slots busy simply mean the caller falls back to
@@ -38,7 +41,16 @@ function createVideoTranscoder({
   let encoderPromise = null; // resolves to 'h264_videotoolbox' | 'libx264' | null
   let active = 0;
   let tempCounter = 0;
-  const sourceInfoCache = new Map(); // post id -> { codec, height } | null
+  const sourceInfoCache = new Map(); // post id -> { codec, height, fps } | null
+
+  // 30000/1001 NTSC sources probe as 29.97 — the tolerance keeps them (and
+  // exact-30) on the raw path while catching 48/50/60fps.
+  const MAX_RAW_FPS = 31;
+
+  function fitsRaw(info) {
+    return Boolean(info && info.codec === 'h264' && info.height <= 1080
+      && info.fps > 0 && info.fps <= MAX_RAW_FPS);
+  }
 
   // Probe once which H.264 encoder this ffmpeg build offers. VideoToolbox
   // (macOS hardware) wins; libx264 is the portable fallback. `null` means
@@ -77,41 +89,54 @@ function createVideoTranscoder({
     return fs.existsSync(p) ? p : null;
   }
 
-  // ffprobe the source's video stream. A source that is already H.264 at
-  // <=1080p doesn't need us — the kiosk's hardware decoder takes it raw.
-  function sourceNeedsTranscode(id, filePath) {
-    if (sourceInfoCache.has(id)) {
-      const info = sourceInfoCache.get(id);
-      return !(info && info.codec === 'h264' && info.height <= 1080);
-    }
+  // ffprobe the source's video stream (codec, height, fps). `null` means the
+  // probe failed — callers treat that as "transcode, and cap conservatively".
+  function probeSource(id, filePath) {
+    if (sourceInfoCache.has(id)) return Promise.resolve(sourceInfoCache.get(id));
     return new Promise((resolve) => {
       const fp = spawn(probeBin, [
         '-v', 'error', '-select_streams', 'v:0',
-        '-show_entries', 'stream=codec_name,height', '-of', 'json', filePath,
+        '-show_entries', 'stream=codec_name,height,avg_frame_rate', '-of', 'json', filePath,
       ], { stdio: ['ignore', 'pipe', 'ignore'] });
       let out = '';
       fp.stdout.on('data', (d) => { out += d; });
-      fp.on('error', () => resolve(true)); // probe unavailable -> just transcode
+      fp.on('error', () => resolve(null)); // probe unavailable
       fp.on('close', (code) => {
         let info = null;
         if (code === 0) {
           try {
             const s = (JSON.parse(out).streams || [])[0];
-            if (s) info = { codec: s.codec_name, height: Number(s.height) || 0 };
+            if (s) {
+              const [num, den] = String(s.avg_frame_rate || '').split('/').map(Number);
+              info = {
+                codec: s.codec_name,
+                height: Number(s.height) || 0,
+                fps: num > 0 && den > 0 ? num / den : 0,
+              };
+            }
           } catch { /* fall through */ }
         }
         sourceInfoCache.set(id, info);
-        resolve(!(info && info.codec === 'h264' && info.height <= 1080));
+        resolve(info);
       });
     });
   }
 
-  function encodeArgs(encoder, filePath) {
+  // A source that is already H.264 at <=1080p30 doesn't need us — the
+  // kiosk's hardware decoder takes it raw.
+  async function sourceNeedsTranscode(id, filePath) {
+    return !fitsRaw(await probeSource(id, filePath));
+  }
+
+  function encodeArgs(encoder, filePath, capFps) {
     // Fit within 1080p without ever upscaling; force_divisible_by keeps
     // yuv420p happy on odd source dimensions. `\,` is lavfi escaping, not
-    // shell — these args go through spawn() untouched.
+    // shell — these args go through spawn() untouched. The fps cap only
+    // applies to sources above 30fps (or with an unreadable rate) so 24/25fps
+    // cadence is never resampled.
     const scale = 'scale=min(iw\\,1920):min(ih\\,1080)'
-      + ':force_original_aspect_ratio=decrease:force_divisible_by=2';
+      + ':force_original_aspect_ratio=decrease:force_divisible_by=2'
+      + (capFps ? ',fps=30' : '');
     const video = encoder === 'h264_videotoolbox'
       ? ['-c:v', 'h264_videotoolbox', '-b:v', '8M', '-maxrate', '10M', '-bufsize', '16M']
       : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-maxrate', '10M', '-bufsize', '16M'];
@@ -137,6 +162,8 @@ function createVideoTranscoder({
   async function stream(req, res, id, filePath) {
     const encoder = await detectEncoder();
     if (!encoder) throw new Error('transcoder unavailable');
+    const info = await probeSource(id, filePath);
+    const capFps = !(info && info.fps > 0 && info.fps <= MAX_RAW_FPS);
     active += 1;
 
     await fs.promises.mkdir(cachePath, { recursive: true });
@@ -144,7 +171,7 @@ function createVideoTranscoder({
     const tempPath = path.join(cachePath, `.${id}.${process.pid}.${tempCounter++}.part`);
     const tempWs = fs.createWriteStream(tempPath);
 
-    const ff = spawn(ffmpegPath, encodeArgs(encoder, filePath), {
+    const ff = spawn(ffmpegPath, encodeArgs(encoder, filePath, capFps), {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let ffErr = '';
