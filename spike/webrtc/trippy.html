@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Font Fractal PoC — GPU</title>
+<style>
+html, body { margin: 0; overflow: hidden; background: #000; width: 100%; height: 100%; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const GLYPHS = "█▓▒░@#%&WM8B$QO0CJUYXzcvunxrjft/|()1{}[]?-_+~<>i!lI;:,`'. ";
+let NLAYERS = 90;       // may be reduced on low-fillrate GPUs (set after GL init)
+const COLS = 80, ROWS = 28;
+const CELL_W = 32, CELL_H = 48;
+
+// ── Glyph atlas ────────────────────────────────────────────────────────────
+const atlasCanvas = document.createElement("canvas");
+atlasCanvas.width = CELL_W * GLYPHS.length;
+atlasCanvas.height = CELL_H;
+{
+    const ctx = atlasCanvas.getContext("2d");
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, atlasCanvas.width, atlasCanvas.height);
+    ctx.fillStyle = "#fff";
+    ctx.font = `${Math.floor(CELL_H * 0.9)}px monospace`;
+    ctx.textBaseline = "middle";
+    ctx.textAlign = "center";
+    for (let i = 0; i < GLYPHS.length; i++) {
+        ctx.fillText(GLYPHS[i], i * CELL_W + CELL_W / 2, CELL_H / 2 + 2);
+    }
+}
+
+// ── WebGL2 setup ───────────────────────────────────────────────────────────
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2", { antialias: false, premultipliedAlpha: false });
+
+// ── Adaptive quality ─────────────────────────────────────────────────────────
+// This effect is fillrate-bound (NLAYERS full-screen alpha-blended quads). The
+// Raspberry Pi's V3D / VideoCore GPU has a tiny fraction of a desktop GPU's
+// fillrate, so detect it and cut overdraw + render resolution. Desktop GPUs
+// keep the full 90-layer, dpr-2 experience.
+let DPR_CAP = 2;
+{
+    let renderer = "";
+    const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+    if (dbg) renderer = (gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || "").toLowerCase();
+    const lowPower = /v3d|videocore|vc4|broadcom|mali|llvmpipe|swiftshader|adreno 3/.test(renderer);
+    if (lowPower) {
+        NLAYERS = 36;   // ~2.5x less overdraw
+        DPR_CAP = 1;    // ~4x fewer fragments on a HiDPI/over-scaled surface
+    }
+}
+
+const VS = `#version 300 es
+precision highp float;
+
+in vec2 a_quadPos;        // -0.5 .. 0.5
+in float a_depth;
+
+uniform float u_time;
+uniform vec2  u_viewport;
+uniform float u_perspective;
+
+out vec2 v_uv;
+out float v_depth;
+
+mat3 rotX(float a){ float c=cos(a),s=sin(a); return mat3(1.,0.,0., 0.,c,-s, 0.,s,c); }
+mat3 rotY(float a){ float c=cos(a),s=sin(a); return mat3(c,0.,s, 0.,1.,0., -s,0.,c); }
+mat3 rotZ(float a){ float c=cos(a),s=sin(a); return mat3(c,-s,0., s,c,0., 0.,0.,1.); }
+
+void main() {
+    v_uv = a_quadPos + 0.5;
+    v_depth = a_depth;
+
+    float depth = a_depth;
+    float fontSize = max(6.0, 220.0 - depth * 2.1);
+
+    // letter-spacing pulse → modulate cell width (ease in-out via cos)
+    float pulsePeriod = 1.5 + depth * 0.05;
+    float pulse = 0.5 - 0.5 * cos(6.28318 * u_time / pulsePeriod);
+    float letterSpacing = mix(-0.08, 0.12, pulse) * fontSize;
+    float charW = fontSize * 0.6 + letterSpacing;
+    float charH = fontSize;
+
+    // Local layer-plane position (in world px)
+    vec3 pos = vec3(a_quadPos.x * float(${COLS}) * charW,
+                    a_quadPos.y * float(${ROWS}) * charH,
+                    0.0);
+
+    // NOTE: the original CSS inline transform (pre-rotation + translateZ) is
+    // entirely overridden by the @keyframes 'transform' property, so at t=0
+    // every layer collapses to identity and stacks as one flat wall. We mirror
+    // that here — the fractal emerges purely from per-layer animation speeds.
+
+    // Constant slow angular velocities — never reverses, so no breathing feel.
+    // Velocity grows gently with depth so the stack continuously de-syncs into
+    // the fractal. Layer 0 takes ~5 minutes for a full Y revolution; even the
+    // fastest back layer rotates slowly enough not to sweep past the camera.
+    // Using three incommensurate axis speeds → trajectory never repeats.
+    float vx = 0.011 + depth * 0.00040;
+    float vy = 0.017 + depth * 0.00055;
+    float vz = 0.007 + depth * 0.00025;
+    float angX = u_time * vx;
+    float angY = u_time * vy;
+    float angZ = u_time * vz;
+    pos = rotZ(angZ) * rotY(angY) * rotX(angX) * pos;
+
+    // Slow Z-spread so we see into the stack (constant, no pulse).
+    pos.z += depth * -3.5;
+
+    // CSS-style perspective(P): x' = x / (1 - z/P)
+    float w = 1.0 - pos.z / u_perspective;
+    vec2 screen = pos.xy / w;
+
+    // To clip space
+    vec2 clip = screen / (u_viewport * 0.5);
+    gl_Position = vec4(clip, 0.0, 1.0);
+}
+`;
+
+const FS = `#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+in float v_depth;
+
+uniform sampler2D u_atlas;
+uniform float u_glyphCount;
+uniform float u_time;
+
+out vec4 outColor;
+
+vec3 hsl2rgb(float h, float s, float l) {
+    h = fract(h);
+    vec3 k = mod(vec3(0.0, 8.0, 4.0) + h * 12.0, 12.0);
+    float a = s * min(l, 1.0 - l);
+    return l - a * clamp(min(k - 3.0, 9.0 - k), -1.0, 1.0);
+}
+
+void main() {
+    float cols = float(${COLS});
+    float rows = float(${ROWS});
+
+    vec2 cell = v_uv * vec2(cols, rows);
+    vec2 cellI = floor(cell);
+    vec2 cellF = fract(cell);
+
+    float x = cellI.x;
+    float y = cellI.y;
+    float dx = x - cols * 0.5;
+    float dy = y - rows * 0.5;
+    float dist = sqrt(dx*dx + dy*dy);
+    // Field formula is now time-evolving: ripples flow outward and the spiral
+    // arms rotate, so glyphs continuously morph even on a still layer.
+    float wave   = sin(dist * 0.55 - v_depth * 0.15 - u_time * 0.9);
+    float ang    = atan(dy, dx);
+    float spiral = sin(ang * 8.0 + dist * 0.7 - v_depth * 0.1 + u_time * 0.6);
+    // A third low-frequency term breaks the symmetry over time.
+    float drift  = 0.7 * sin(dx * 0.3 + u_time * 0.4)
+                 * cos(dy * 0.35 - u_time * 0.33);
+    float field = wave + spiral + drift;
+    float norm = floor(((field + 2.7) / 5.4) * (u_glyphCount - 1.0));
+    norm = clamp(norm, 0.0, u_glyphCount - 1.0);
+
+    vec2 atlasUV = vec2((norm + cellF.x) / u_glyphCount, cellF.y);
+    float mask = texture(u_atlas, atlasUV).r;
+
+    // Hue drifts with time → continuous color morph that never loops cleanly.
+    float hue = (v_depth * 7.5 + u_time * 18.0) / 360.0;
+    float light = 0.5 + sin(v_depth * 0.3 + u_time * 0.15) * 0.25;
+    vec3 col = hsl2rgb(hue, 1.0, light);
+
+    outColor = vec4(col * mask, mask);
+}
+`;
+
+function compile(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+// Quad geometry
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+
+const quad = new Float32Array([
+    -0.5, -0.5,  0.5, -0.5,  0.5, 0.5,
+    -0.5, -0.5,  0.5,  0.5, -0.5, 0.5,
+]);
+const quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+const aQuad = gl.getAttribLocation(prog, "a_quadPos");
+gl.enableVertexAttribArray(aQuad);
+gl.vertexAttribPointer(aQuad, 2, gl.FLOAT, false, 0, 0);
+
+// Per-instance depth
+const depths = new Float32Array(NLAYERS);
+for (let i = 0; i < NLAYERS; i++) depths[i] = i;
+const depthBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, depthBuf);
+gl.bufferData(gl.ARRAY_BUFFER, depths, gl.STATIC_DRAW);
+const aDepth = gl.getAttribLocation(prog, "a_depth");
+gl.enableVertexAttribArray(aDepth);
+gl.vertexAttribPointer(aDepth, 1, gl.FLOAT, false, 0, 0);
+gl.vertexAttribDivisor(aDepth, 1);
+
+// Atlas texture
+const tex = gl.createTexture();
+gl.activeTexture(gl.TEXTURE0);
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, atlasCanvas);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.uniform1i(gl.getUniformLocation(prog, "u_atlas"), 0);
+gl.uniform1f(gl.getUniformLocation(prog, "u_glyphCount"), GLYPHS.length);
+gl.uniform1f(gl.getUniformLocation(prog, "u_perspective"), 1200.0);
+
+// u_time is declared in both VS and FS but shares one uniform location.
+const uTime = gl.getUniformLocation(prog, "u_time");
+const uVp   = gl.getUniformLocation(prog, "u_viewport");
+
+gl.enable(gl.BLEND);
+gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);   // over-compositing (premultiplied)
+gl.clearColor(0, 0, 0, 1);
+
+function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP);
+    canvas.width = window.innerWidth * dpr;
+    canvas.height = window.innerHeight * dpr;
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.uniform2f(uVp, canvas.width, canvas.height);
+}
+window.addEventListener("resize", resize);
+resize();
+
+const t0 = performance.now();
+function frame() {
+    const t = (performance.now() - t0) / 1000;
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.uniform1f(uTime, t);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, NLAYERS);
+    requestAnimationFrame(frame);
+}
+frame();
+</script>
+</body>
+</html>

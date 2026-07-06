@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebRTC producer (spike)</title>
+<style>
+  html,body{margin:0;background:#111;color:#0f0;font:13px monospace;}
+  #log{position:fixed;top:0;left:0;padding:6px;white-space:pre;z-index:10;text-shadow:0 0 3px #000;}
+  iframe{position:fixed;top:0;left:0;border:0;width:1920px;height:1080px;
+         /* keep it on-screen but we don't need to look at it; scale to fit window */
+         transform-origin:top left;transform:scale(0.35);}
+</style>
+</head>
+<body>
+<div id="log">producer starting…</div>
+<iframe id="fx"></iframe>
+<script>
+const qs = new URLSearchParams(location.search);
+const EFFECT = qs.get('effect') || 'trippy.html';
+const STREAM = qs.get('stream') || 'scene';
+const FPS    = Number(qs.get('fps') || 60);
+const logEl = document.getElementById('log');
+const log = (...a) => { console.log(...a); logEl.textContent = a.join(' '); };
+
+// LAN-only: host ICE candidates are enough, no STUN/TURN.
+const RTC_CONFIG = { iceServers: [] };
+
+const peers = new Map();   // peerId -> RTCPeerConnection
+let stream = null;
+
+function ws_open() {
+    const ws = new WebSocket(`ws://${location.host}/signal`);
+    ws.onopen = () => { log('ws open, publishing', STREAM); ws.send(JSON.stringify({ type: 'publish', streamId: STREAM })); };
+    ws.onclose = () => { log('ws closed, retrying in 1s'); setTimeout(ws_open, 1000); };
+    ws.onmessage = (e) => handle(ws, JSON.parse(e.data));
+    window._ws = ws;
+}
+
+async function handle(ws, msg) {
+    if (msg.type === 'published') { log(`published "${STREAM}", capturing @${FPS}fps, waiting for subscribers`); return; }
+
+    if (msg.type === 'subscribe') {
+        const { peerId } = msg;
+        log(`new subscriber ${peerId}, sending offer`);
+        const pc = new RTCPeerConnection(RTC_CONFIG);
+        peers.set(peerId, pc);
+
+        // contentHint=detail → encoder favors spatial fidelity (text/scanlines)
+        // over framerate when constrained; without it WebRTC assumes "motion"
+        // and smears high-frequency detail.
+        for (const track of stream.getTracks()) {
+            if (track.kind === 'video') track.contentHint = 'detail';
+            pc.addTrack(track, stream);
+        }
+
+        // Force H.264 so macOS uses the VideoToolbox HW encoder instead of the
+        // default software VP8/VP9 path (the ~70 W / 80 % culprit). H.264 is the
+        // only codec the Pi's VideoCore decodes in hardware anyway.
+        const h264 = RTCRtpSender.getCapabilities('video').codecs
+            .filter(c => /h264/i.test(c.mimeType));
+        for (const tr of pc.getTransceivers()) {
+            if (tr.sender && tr.sender.track && tr.sender.track.kind === 'video' && h264.length) {
+                try { tr.setCodecPreferences(h264); } catch (e) { log('setCodecPreferences failed', e.message); }
+            }
+        }
+
+        pc.onicecandidate = (ev) => {
+            if (ev.candidate) ws.send(JSON.stringify({ type: 'ice', role: 'producer', streamId: STREAM, peerId, candidate: ev.candidate }));
+        };
+        pc.onconnectionstatechange = () => log(`peer ${peerId}: ${pc.connectionState}`);
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        // Lift the bitrate cap (default ~2.5 Mbps is far too low for noisy CRT
+        // content) and pin resolution. On a gigabit LAN ~20 Mbps is free.
+        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+        if (sender) {
+            const p = sender.getParameters();
+            if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+            p.encodings[0].maxBitrate = Number(qs.get('kbps') || 20000) * 1000;
+            p.encodings[0].maxFramerate = FPS;
+            // Encode at most 1080p regardless of the (possibly Retina-2x) capture
+            // backing store — the Pi only displays 1080p, so 4K encode is pure
+            // waste. `down` overrides; default downscales a 2x-dpr 4K canvas to 1080p.
+            const down = Number(qs.get('down') || 0);
+            if (down > 1) p.encodings[0].scaleResolutionDownBy = down;
+            p.degradationPreference = 'maintain-resolution';
+            try { await sender.setParameters(p); } catch (e) { log('setParameters failed', e.message); }
+        }
+
+        ws.send(JSON.stringify({ type: 'offer', streamId: STREAM, peerId, sdp: pc.localDescription }));
+        return;
+    }
+    if (msg.type === 'answer') {
+        const pc = peers.get(msg.peerId);
+        if (pc) await pc.setRemoteDescription(msg.sdp);
+        return;
+    }
+    if (msg.type === 'ice') {
+        const pc = peers.get(msg.peerId);
+        if (pc && msg.candidate) await pc.addIceCandidate(msg.candidate).catch(() => {});
+        return;
+    }
+    if (msg.type === 'peer-gone') {
+        const pc = peers.get(msg.peerId);
+        if (pc) { pc.close(); peers.delete(msg.peerId); }
+        log(`peer ${msg.peerId} gone`);
+    }
+}
+
+// Encoder telemetry — the numbers that tell us whether VideoToolbox is doing
+// the work. encoderImplementation containing "VideoToolbox" == hardware.
+let last = { ts: 0, frames: 0, bytes: 0 };
+async function pollStats() {
+    for (const pc of peers.values()) {
+        const stats = await pc.getStats();
+        let codec = '?';
+        stats.forEach((r) => { if (r.type === 'codec' && /video/i.test(r.mimeType || r.payloadType)) codec = r.mimeType; });
+        stats.forEach((r) => {
+            if (r.type === 'outbound-rtp' && r.kind === 'video') {
+                const dts = (r.timestamp - last.ts) / 1000;
+                const fps = last.ts ? ((r.framesEncoded - last.frames) / dts) : 0;
+                const kbps = last.ts ? ((r.bytesSent - last.bytes) * 8 / dts / 1000) : 0;
+                last = { ts: r.timestamp, frames: r.framesEncoded, bytes: r.bytesSent };
+                logEl.textContent =
+                    `encoder: ${r.encoderImplementation || '?'}\n` +
+                    `codec:   ${codec}\n` +
+                    `res:     ${r.frameWidth || '?'}x${r.frameHeight || '?'}\n` +
+                    `fps:     ${fps.toFixed(1)}\n` +
+                    `kbps:    ${kbps.toFixed(0)}\n` +
+                    `qlimit:  ${r.qualityLimitationReason || '—'}\n` +
+                    `subs:    ${peers.size}`;
+            }
+        });
+        break;   // one peer's stats is enough for the HUD
+    }
+    setTimeout(pollStats, 1000);
+}
+pollStats();
+
+// Load the effect in a same-origin iframe and capture its canvas.
+const iframe = document.getElementById('fx');
+iframe.src = EFFECT;
+iframe.onload = () => {
+    setTimeout(() => {
+        const canvas = iframe.contentDocument.querySelector('canvas');
+        if (!canvas) { log('ERROR: no canvas in effect'); return; }
+        stream = canvas.captureStream(FPS);
+        log(`captured canvas ${canvas.width}x${canvas.height}, opening signaling`);
+        ws_open();
+    }, 500);   // give the effect a moment to size its canvas
+};
+</script>
+</body>
+</html>

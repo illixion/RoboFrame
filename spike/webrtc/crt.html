@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CRT Magnet — Malfunctioning Teletype</title>
+<style>
+html, body { margin: 0; overflow: hidden; background: #000; width: 100%; height: 100%; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const COLS = 120, ROWS = 50;       // visible terminal grid
+const CELL_W = 14, CELL_H = 24;    // px per cell in the text canvas
+const TEXT_COLS = 140, TEXT_ROWS = 160;   // generated page size (wraps); height*CELL_H must stay <= GL_MAX_TEXTURE_SIZE (4096 on Pi 4 V3D)
+
+// ── Fake UNIX text generator ───────────────────────────────────────────────
+const rng  = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const hex  = n => Array.from({length: n}, () => "0123456789abcdef"[rng(0,15)]).join("");
+const pad  = (v, n) => String(v).padStart(n, "0");
+const ip   = () => `${rng(1,255)}.${rng(0,255)}.${rng(0,255)}.${rng(0,255)}`;
+
+const USERS = ["root","ixion","daemon","www-data","postgres","redis","nobody","sshd","systemd-resolve"];
+const HOSTS = ["nyx","helios","atlas","minerva","pegasus","aether","kronos","tartarus"];
+const PATHS = ["/etc","/var/log","/usr/local/bin","/home/ixion","/tmp","/opt/app","/dev","/proc","/usr/share","/srv/www"];
+const FILES = ["nginx.conf","syslog","auth.log","kernel.log","passwd","hosts","resolv.conf","sshd_config","config.yaml","docker-compose.yml","main.py","index.js","README.md",".bashrc","fstab","cron.daily","journal.log","dmesg.txt"];
+const CMDS  = ["ls -la","cat","grep -rn","find . -name","tail -f","ps auxf","systemctl status","journalctl -u","dmesg","ssh","rsync -avz --progress","make -j8","git pull --rebase","vim","curl -sL","docker ps -a","kubectl get pods","tar xzf","chmod 755","strace -p","lsof -i","netstat -tlnp"];
+const SVCS  = ["sshd","nginx","postgresql","redis","systemd","NetworkManager","cron","docker","containerd","cups","bluetoothd","wpa_supplicant"];
+const MONTHS= ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const LEVELS= ["INFO ","WARN ","ERROR","DEBUG","TRACE","NOTIC"];
+const KMSG  = ["link up","link down","device disconnect","probe failed","out of memory","cpu0 throttled","irq 16: nobody cared","ata1.00: failed command","BUG: scheduling while atomic","TCP: request_sock_TCP: overflow","oom-killer invoked"];
+const ERRS  = ["No such file or directory","Permission denied","Connection refused","Operation not permitted","Resource temporarily unavailable","Broken pipe","Address already in use","Host is down","Network unreachable"];
+
+function genLine() {
+    const r = Math.random();
+    if (r < 0.16) {
+        return `${pick(USERS)}@${pick(HOSTS)}:${pick(PATHS)}$ ${pick(CMDS)} ${pick(FILES)}`;
+    }
+    if (r < 0.30) {
+        const perms = ["-rw-r--r--","-rwxr-xr-x","drwxr-xr-x","-rw-------","lrwxrwxrwx"];
+        return `${pick(perms)} 1 ${pick(USERS).padEnd(8)} ${pick(USERS).padEnd(8)} ${String(rng(64,9999999)).padStart(8)} ${pick(MONTHS)} ${String(rng(1,28)).padStart(2)} ${pad(rng(0,23),2)}:${pad(rng(0,59),2)} ${pick(FILES)}`;
+    }
+    if (r < 0.46) {
+        const ts = `2026-${pad(rng(1,12),2)}-${pad(rng(1,28),2)} ${pad(rng(0,23),2)}:${pad(rng(0,59),2)}:${pad(rng(0,59),2)}`;
+        return `[${ts}] ${pick(LEVELS)} ${pick(SVCS)}[${rng(100,9999)}]: ${pick(["accepted connection from","reload signal received","starting","stopped","timeout waiting for","config loaded:","listening on","child exited code","permission denied opening"])} ${pick([ip(), pick(FILES), pick(PATHS), String(rng(1,65535))])}`;
+    }
+    if (r < 0.56) {
+        return ` ${String(rng(1,99999)).padStart(5)} ?        ${pad(rng(0,5),2)}:${pad(rng(0,59),2)}:${pad(rng(0,59),2)} ${pick(SVCS)}`;
+    }
+    if (r < 0.66) {
+        const t = (Math.random() * 100000).toFixed(6).padStart(12);
+        return `[${t}] ${pick(KMSG)} ${hex(8)}`;
+    }
+    if (r < 0.78) {
+        const addr = hex(8);
+        const bytes = Array.from({length: 16}, () => hex(2)).join(" ");
+        return `${addr}  ${bytes}`;
+    }
+    if (r < 0.88) {
+        return `${pick(["error","warning","fatal"])}: ${pick(ERRS)}: ${pick(PATHS)}/${pick(FILES)}`;
+    }
+    if (r < 0.95) {
+        return `==> ${pick(PATHS)}/${pick(FILES)} <==`;
+    }
+    return "";
+}
+
+// ── Render the fake terminal page to a canvas ──────────────────────────────
+const atlas = document.createElement("canvas");
+atlas.width  = TEXT_COLS * CELL_W;
+atlas.height = TEXT_ROWS * CELL_H;
+{
+    const ctx = atlas.getContext("2d");
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, atlas.width, atlas.height);
+    ctx.fillStyle = "#fff";
+    ctx.font = `${Math.floor(CELL_H * 0.82)}px "Courier New", Courier, monospace`;
+    ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+    for (let row = 0; row < TEXT_ROWS; row++) {
+        const line = genLine().slice(0, TEXT_COLS);
+        for (let i = 0; i < line.length; i++) {
+            ctx.fillText(line[i], i * CELL_W, row * CELL_H + 2);
+        }
+    }
+}
+
+// ── WebGL2 ──────────────────────────────────────────────────────────────────
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2", { antialias: false });
+
+const VS = `#version 300 es
+in vec2 a_pos;
+out vec2 v_uv;
+void main() {
+    v_uv = a_pos * 0.5 + 0.5;
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+out vec4 outColor;
+
+uniform sampler2D u_atlas;
+uniform float u_time;
+uniform vec2  u_grid;       // visible terminal grid (cols, rows)
+uniform vec2  u_textGrid;   // size of the source text page (in cells)
+uniform float u_scrollSpeed;
+uniform vec2  u_aspect;     // (screen w/h ratio, 1.0) for circular magnet
+
+float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+vec3 hsl2rgb(float h, float s, float l) {
+    h = fract(h);
+    vec3 k = mod(vec3(0.0, 8.0, 4.0) + h * 12.0, 12.0);
+    float a = s * min(l, 1.0 - l);
+    return l - a * clamp(min(k - 3.0, 9.0 - k), -1.0, 1.0);
+}
+
+// Sample the scrolling terminal page at a given UV. The source canvas is a
+// big pre-rendered Courier "screen" of fake UNIX output; we scroll it
+// vertically and wrap, then occasionally jitter random rows for the
+// "malfunctioning teletype" feel.
+float sampleGlyphField(vec2 uv) {
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 0.0;
+
+    // Cell coords in the visible terminal.
+    vec2 cell = uv * u_grid;
+    float rowI = floor(cell.y);
+
+    // Per-row horizontal jitter: occasional rows tear sideways.
+    float tearSeed = hash(vec2(rowI, floor(u_time * 3.0)));
+    float tearAmt  = step(0.97, tearSeed) * (hash(vec2(rowI, 7.0)) - 0.5) * 0.25;
+    cell.x += tearAmt * u_grid.x;
+
+    // Scroll downward over time.
+    cell.y += u_time * u_scrollSpeed;
+
+    // Wrap into the source page.
+    vec2 wrapped = mod(cell, u_textGrid);
+    vec2 texUV = wrapped / u_textGrid;
+    texUV.y = 1.0 - texUV.y;   // flip V so text reads correctly
+    // Lift antialiased midtones so glyphs read as bright phosphor strokes
+    // rather than washed-out gray.
+    return pow(texture(u_atlas, texUV).r, 0.45);
+}
+
+void main() {
+    vec2 uv = v_uv;
+
+    // CRT barrel distortion (subtle — bulged tube).
+    vec2 cc = uv - 0.5;
+    float r2 = dot(cc, cc);
+    uv = 0.5 + cc * (1.0 + 0.12 * r2);
+
+    // ── Overpowered magnet on a smooth off-screen orbit ────────────────────
+    // The magnet travels on a continuous circular path just outside the
+    // canvas (radius > 0.5 from center), so the warp direction sweeps around
+    // the screen smoothly — no snapping. The whole raster bends toward
+    // wherever the magnet currently is, producing a continuously rotating
+    // projective tilt.
+    float orbitA = u_time * 0.09;
+    float orbitR = 0.95 + 0.18 * sin(u_time * 0.13);   // radius breathes
+    vec2 magnet = vec2(0.5 + orbitR * cos(orbitA),
+                       0.5 + orbitR * sin(orbitA * 0.83 + 0.4));
+
+    vec2 d = (uv - magnet) * u_aspect;
+    float dr = length(d);
+
+    // Long-range gravity-well pull (1/(1+kr), not exp) so the far corner is
+    // still meaningfully tugged. Stronger pull → more dramatic perspective.
+    float pullStrength = 0.62 / (1.0 + 1.8 * dr);
+    vec2 pulledUV = uv + (magnet - uv) * pullStrength;
+
+    // Asymmetric stretch along the magnet axis → tilted "in-perspective" look
+    // rather than circular pinch. Increased amplitude for more angle.
+    vec2 toMag = normalize(d + 1e-4);
+    float along = dot(uv - magnet, toMag);
+    pulledUV += toMag * 0.32 * along * pullStrength;
+
+    float influence = pullStrength;
+    float halo = 1.0 / (1.0 + 2.5 * dr * dr);
+
+    vec2 baseUV = pulledUV;
+
+    // ── Heavy multi-tap chromatic aberration ───────────────────────────────
+    // Instead of a 3-tap R/G/B split, sample the glyph field N times along
+    // the magnet axis, each tap tinted at a different hue across the visible
+    // spectrum. Result is a smeared rainbow ghost of the text — strong near
+    // the magnet, fading to a clean phosphor reading on the far side.
+    const int CHROMA_TAPS = 51;
+    float spread = 0.045 * influence + 0.004;
+    vec3 chromaSum = vec3(0.0);
+    float weightSum = 0.0;
+    for (int i = 0; i < CHROMA_TAPS; i++) {
+        float fi = float(i) / float(CHROMA_TAPS - 1);   // 0..1
+        float off = fi - 0.5;                           // -0.5..0.5
+        vec2 sampUV = baseUV + toMag * spread * off * 2.0;
+        float m = sampleGlyphField(sampUV);
+        // Hue walks the spectrum across the taps; slow drift over time.
+        vec3 tint = hsl2rgb(fi + u_time * 0.04, 1.0, 0.55);
+        // Gaussian-ish weight so middle taps dominate when influence is low.
+        float w = exp(-off * off * 6.0);
+        chromaSum += tint * m * w;
+        weightSum += w;
+    }
+    chromaSum /= weightSum;
+
+    // Clean baseline read for the unaffected text — phosphor amber-green.
+    float mBase = sampleGlyphField(baseUV);
+    // HDR phosphor: values >1 so scanline/grille/vignette attenuation still
+    // lands on a saturated bright green.
+    vec3 phosphor = vec3(0.6, 1.8, 0.4);
+    vec3 phosCol  = phosphor * mBase;
+
+    // Blend: where the magnet has influence, the rainbow smear dominates.
+    float chromaMix = clamp(halo * 1.4, 0.0, 1.0);
+    vec3 col = mix(phosCol, chromaSum * 2.2, chromaMix);
+
+    // ── Scanlines ──────────────────────────────────────────────────────────
+    float scan = 0.78 + 0.22 * sin(v_uv.y * u_grid.y * 6.2831 * 1.5);
+    col *= scan;
+
+    // Subtle aperture-grille vertical stripes
+    float grille = 0.92 + 0.08 * sin(v_uv.x * 1200.0);
+    col *= grille;
+
+    // ── Teletype flicker & noise ───────────────────────────────────────────
+    float flicker = 0.96 + 0.04 * sin(u_time * 47.0);
+    col *= flicker;
+
+    // Occasional horizontal tear: shifts a band of rows briefly.
+    // (Handled by re-sampling — but we keep it lightweight here as a flash.)
+    float tearBand = step(0.997, hash(vec2(floor(v_uv.y * 80.0), floor(u_time * 2.0))));
+    col += tearBand * 0.3;
+
+    // Phosphor glow: cheap bloom by lifting bright regions toward tint.
+    float lum = max(max(col.r, col.g), col.b);
+    col += col * 0.12 * lum;
+
+    // Vignette
+    float vig = smoothstep(1.1, 0.45, length(v_uv - 0.5));
+    col *= vig;
+
+    // Faint scan noise
+    col += (hash(v_uv * 1024.0 + u_time) - 0.5) * 0.04;
+
+    outColor = vec4(col, 1.0);
+}`;
+
+function compile(t, s){ const sh=gl.createShader(t); gl.shaderSource(sh,s); gl.compileShader(sh);
+    if(!gl.getShaderParameter(sh,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh)); return sh; }
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+const aPos = gl.getAttribLocation(prog, "a_pos");
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+const tex = gl.createTexture();
+gl.activeTexture(gl.TEXTURE0);
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, atlas);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+
+gl.uniform1i(gl.getUniformLocation(prog,"u_atlas"), 0);
+gl.uniform2f(gl.getUniformLocation(prog,"u_grid"), COLS, ROWS);
+gl.uniform2f(gl.getUniformLocation(prog,"u_textGrid"), TEXT_COLS, TEXT_ROWS);
+gl.uniform1f(gl.getUniformLocation(prog,"u_scrollSpeed"), 2.5);   // rows/sec
+
+const uTime   = gl.getUniformLocation(prog, "u_time");
+const uAspect = gl.getUniformLocation(prog, "u_aspect");
+
+function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width  = window.innerWidth  * dpr;
+    canvas.height = window.innerHeight * dpr;
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.uniform2f(uAspect, canvas.width / canvas.height, 1.0);
+}
+window.addEventListener("resize", resize);
+resize();
+
+const t0 = performance.now();
+function frame() {
+    const t = (performance.now() - t0) / 1000;
+    gl.uniform1f(uTime, t);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    requestAnimationFrame(frame);
+}
+frame();
+</script>
+</body>
+</html>

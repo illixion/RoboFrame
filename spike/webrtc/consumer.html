@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebRTC consumer (spike)</title>
+<style>
+  html,body{margin:0;background:#000;overflow:hidden;width:100%;height:100%;}
+  video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover;background:#000;}
+  #hud{position:fixed;top:8px;left:8px;font:13px monospace;color:#0f0;
+       white-space:pre;text-shadow:0 0 3px #000;z-index:10;pointer-events:none;}
+</style>
+</head>
+<body>
+<video id="v" autoplay muted playsinline></video>
+<div id="hud">connecting…</div>
+<script>
+const qs = new URLSearchParams(location.search);
+const STREAM = qs.get('stream') || 'scene';
+const v = document.getElementById('v');
+const hud = document.getElementById('hud');
+
+const RTC_CONFIG = { iceServers: [] };   // LAN host candidates only
+let pc = null;
+let peerId = null;
+let firstFrameMs = null;
+const t0 = performance.now();
+
+function ws_open() {
+    const ws = new WebSocket(`ws://${location.host}/signal`);
+    ws.onopen = () => { hud.textContent = 'subscribing…'; ws.send(JSON.stringify({ type: 'subscribe', streamId: STREAM })); };
+    ws.onclose = () => { hud.textContent = 'ws closed, retrying…'; setTimeout(ws_open, 1000); };
+    ws.onmessage = (e) => handle(ws, JSON.parse(e.data));
+    window._ws = ws;
+}
+
+async function handle(ws, msg) {
+    if (msg.type === 'no-producer') { hud.textContent = `no producer for "${STREAM}" yet, retrying…`; setTimeout(() => ws.send(JSON.stringify({ type: 'subscribe', streamId: STREAM })), 1000); return; }
+
+    if (msg.type === 'offer') {
+        peerId = msg.peerId;
+        pc = new RTCPeerConnection(RTC_CONFIG);
+        pc.ontrack = (ev) => {
+            v.srcObject = ev.streams[0];
+            v.onloadeddata = () => { firstFrameMs = Math.round(performance.now() - t0); };  // == imageReady trigger in real kiosk
+        };
+        pc.onicecandidate = (ev) => {
+            if (ev.candidate) ws.send(JSON.stringify({ type: 'ice', role: 'consumer', streamId: STREAM, peerId, candidate: ev.candidate }));
+        };
+        pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') hud.textContent = 'connection FAILED'; };
+        await pc.setRemoteDescription(msg.sdp);
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({ type: 'answer', streamId: STREAM, peerId, sdp: pc.localDescription }));
+        return;
+    }
+    if (msg.type === 'ice' && pc && msg.candidate) {
+        await pc.addIceCandidate(msg.candidate).catch(() => {});
+    }
+}
+
+// Stats overlay: resolution, decode fps, bitrate, codec — the numbers that tell
+// us whether the Pi is HW-decoding smoothly.
+let last = { ts: 0, frames: 0, bytes: 0 };
+async function pollStats() {
+    if (pc) {
+        const stats = await pc.getStats();
+        stats.forEach((r) => {
+            if (r.type === 'inbound-rtp' && r.kind === 'video') {
+                const dts = (r.timestamp - last.ts) / 1000;
+                const fps = last.ts ? ((r.framesDecoded - last.frames) / dts) : 0;
+                const kbps = last.ts ? ((r.bytesReceived - last.bytes) * 8 / dts / 1000) : 0;
+                last = { ts: r.timestamp, frames: r.framesDecoded, bytes: r.bytesReceived };
+                hud.textContent =
+                    `stream: ${STREAM}\n` +
+                    `state: ${pc.connectionState}\n` +
+                    `res:   ${r.frameWidth || '?'}x${r.frameHeight || '?'}\n` +
+                    `fps:   ${fps.toFixed(1)} (decoded ${r.framesDecoded})\n` +
+                    `kbps:  ${kbps.toFixed(0)}\n` +
+                    `drops: ${r.framesDropped || 0}\n` +
+                    `1stfrm:${firstFrameMs != null ? firstFrameMs + 'ms' : '—'}`;
+            }
+        });
+    }
+    setTimeout(pollStats, 1000);
+}
+
+ws_open();
+pollStats();
+</script>
+</body>
+</html>
