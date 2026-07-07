@@ -737,6 +737,17 @@ async function processRequestV2(req, res) {
         res.status(500).send('An error occurred while sending the file.');
         return;
       }
+      // Record videos in /history like images. Playback issues many Range
+      // requests per view — only the opening request (no Range, or one that
+      // starts at byte 0) counts, so mid-file seeks don't re-bump the entry.
+      const range = req.headers.range;
+      if (req.query.record !== '0' && (!range || /^bytes=0-/.test(range))) {
+        history.addEntry({
+          id: parts.id,
+          ext: srcExt,
+          deviceId: req.query.deviceId ? String(req.query.deviceId) : '',
+        });
+      }
       // vcodec=h264: serve/build the hardware-decodable variant. Cache hits
       // stream like any file (Range-capable); a miss pipes ffmpeg's output
       // live. Sources already in H.264 <=1080p, a missing ffmpeg, or a

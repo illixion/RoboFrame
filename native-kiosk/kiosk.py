@@ -423,6 +423,7 @@ class Kiosk:
         self.text_overlay = None         # dict {bg, image_surf, text_surf} or None
         self.effect_lock = threading.Lock()
         self._mpv_ok = None              # shutil.which("mpv"), resolved once
+        self._mpv_focus_args_cache = None  # probed once from --list-options
 
         # Slideshow video: a `playback.current` whose ext is mp4/webm plays
         # in its own fullscreen mpv (base layer, same tier as a photo — not
@@ -832,7 +833,7 @@ class Kiosk:
             "mpv", "--fs", "--no-osc", "--no-input-default-bindings",
             "--no-input-terminal", "--no-terminal", "--really-quiet",
             "--no-audio", "--keep-open=yes", "--loop-file=inf",
-            *self._mpv_hwdec_args(),
+            *self._mpv_focus_args(), *self._mpv_hwdec_args(),
             f"--input-ipc-server={ipc_path}", url,
         ]
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
@@ -845,6 +846,38 @@ class Kiosk:
         # gracefully rather than breaking playback.
         hw = (self.cfg.get("hwdec") or "").strip()
         return [f"--hwdec={hw}"] if hw and hw.lower() != "no" else []
+
+    def _mpv_focus_args(self):
+        # Keep X input focus on the pygame window while mpv is on screen:
+        # mpv is driven entirely over IPC and needs no keyboard, but if its
+        # window takes focus, the kiosk's shortcuts (SPACE save, arrows,
+        # and the GPIO keypad's uinput keystrokes) land in mpv and are
+        # ignored for the whole clip. The option spelling changed across
+        # mpv releases (--focus-on-open=no, then --focus-on=never, with
+        # the old name removed in 0.40), so probe the installed build once
+        # instead of hardcoding either and failing mpv startup outright —
+        # an unknown option is a fatal error, not a warning.
+        if self._mpv_focus_args_cache is None:
+            args = []
+            try:
+                out = subprocess.run(
+                    ["mpv", "--no-config", "--list-options"],
+                    capture_output=True, text=True, timeout=10).stdout
+                for line in out.splitlines():
+                    opt = line.strip()
+                    if opt.startswith("--focus-on ") and "removed" not in opt:
+                        args = ["--focus-on=never"]
+                        break
+                    if opt.startswith("--focus-on-open") and "removed" not in opt:
+                        args = ["--focus-on-open=no"]
+                        break
+            except (OSError, subprocess.SubprocessError):
+                pass
+            self._mpv_focus_args_cache = args
+            if not args:
+                log.warning("mpv has no focus-on option — keyboard input "
+                            "will go to mpv while a video plays")
+        return self._mpv_focus_args_cache
 
     def _play_slideshow_video(self, post):
         pid = post.get("id")
@@ -1191,7 +1224,7 @@ class Kiosk:
             "mpv", "--fs", "--no-osc", "--no-input-default-bindings",
             "--no-input-terminal", "--no-terminal", "--really-quiet",
             "--keep-open=no", "--loop-file=no",
-            *self._mpv_hwdec_args(), url,
+            *self._mpv_focus_args(), *self._mpv_hwdec_args(), url,
         ]
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
@@ -1207,7 +1240,7 @@ class Kiosk:
             "--no-input-terminal", "--no-terminal", "--really-quiet",
             "--no-audio", "--profile=low-latency", "--rtsp-transport=tcp",
             "--keep-open=no", "--loop-file=no",
-            *self._mpv_hwdec_args(), url,
+            *self._mpv_focus_args(), *self._mpv_hwdec_args(), url,
         ]
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
