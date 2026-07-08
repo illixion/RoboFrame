@@ -21,11 +21,12 @@ Protocol summary as implemented here:
     in-process, no blob cache), then send imageReady { id, durationMs } so
     the server sizes the dwell to the clip. A clip that fits the interval
     loops; a longer one plays once and holds its last frame until the
-    server advances (mirrors the web kiosk's <video> loop rule). The
-    `vcodec` config asks /get for an H.264 <=1080p transcode and `hwdec`
-    hands decode to the SoC (Pi VideoCore does H.264 only) — on a
-    cache-miss the transcode streams live, so durationMs may come back 0
-    and the dwell falls back to the interval for that first play.
+    server advances (mirrors the web kiosk's <video> loop rule). The clip
+    length comes from the frame's `current.durationMs` (indexed server-
+    side); mpv is only queried for it when the frame omits it. This matters
+    because `vcodec`/`hwdec` ask /get for a live H.264 <=1080p transcode
+    (Pi VideoCore does H.264 only) whose fragmented MP4 carries no duration
+    in its header — querying mpv would see 0 and advance mid-clip.
   - Prefetch first `upcoming` image in the background (bounded to 1 to keep
     decoded-blob RAM low on Pi 3). Videos are never prefetched.
   - On `displayState { state: off, target: <us> }`: blank to black, pause
@@ -919,8 +920,15 @@ class Kiosk:
         self.slideshow_video = {"proc": proc, "id": pid,
                                 "ipc_path": ipc_path, "gen": gen}
         log.info("slideshow video %s", pid)
+        # The server carries the indexed clip length in the playback frame.
+        # Prefer it: the live-transcoded H.264 arrives as a header-less
+        # fragmented MP4, so querying mpv for `duration` would poll for the
+        # whole timeout and still see 0, and the clip would advance at the
+        # image interval mid-playback.
+        known_dur = int(post.get("durationMs") or 0)
         threading.Thread(target=self._slideshow_video_worker,
-                         args=(proc, ipc_path, pid, gen), daemon=True).start()
+                         args=(proc, ipc_path, pid, gen, known_dur),
+                         daemon=True).start()
 
     def _stop_slideshow_video(self):
         sv = self.slideshow_video
@@ -951,21 +959,25 @@ class Kiosk:
         if self.current_id == sv.get("id"):
             self.current_id = None
 
-    def _slideshow_video_worker(self, proc, ipc_path, pid, gen):
-        """Off-thread: learn the clip length over mpv's IPC socket, set the
-        loop policy, then report imageReady{id, durationMs}. Fenced on `gen`
-        so a superseded clip's late report can't fire. The socket is then
-        handed to the main loop, which uses it to ship the clock/sensors
+    def _slideshow_video_worker(self, proc, ipc_path, pid, gen, known_dur_ms=0):
+        """Off-thread: connect mpv's IPC socket, learn the clip length (from
+        the server-supplied duration when present, else by querying mpv), set
+        the loop policy, then report imageReady{id, durationMs}. Fenced on
+        `gen` so a superseded clip's late report can't fire. The socket is
+        then handed to the main loop, which uses it to ship the clock/sensors
         overlay layer into mpv (overlay-add) for as long as the clip plays.
         """
-        duration_ms = 0
+        duration_ms = int(known_dur_ms) if known_dur_ms and known_dur_ms > 0 else 0
         sock = None
         try:
             sock = self._mpv_connect(ipc_path, proc, timeout=5)
             if sock is not None:
-                dur = self._mpv_get_duration(sock, timeout=5)
-                if dur and dur > 0:
-                    duration_ms = int(round(dur * 1000))
+                # Only fall back to demuxing mpv when the server didn't tell us
+                # the length (older server, or a library that indexed 0).
+                if not duration_ms:
+                    dur = self._mpv_get_duration(sock, timeout=5)
+                    if dur and dur > 0:
+                        duration_ms = int(round(dur * 1000))
                 # Play a clip longer than the dwell exactly once (then
                 # hold its last frame via keep-open); shorter clips keep
                 # looping. Looping a long clip would flash its opening

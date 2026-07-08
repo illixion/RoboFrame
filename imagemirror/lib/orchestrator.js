@@ -465,7 +465,14 @@ function createOrchestrator({
                     if (present.has(id)) continue;
                     if (isPostBlocked(post, blockedIdSet, blockedTagSet)) continue;
                     present.add(id);
-                    channel.queue.push({ id, ext: String(post.file_ext || '') });
+                    // Carry the indexed video duration so the dwell can cover
+                    // a clip that outruns the interval without waiting on a
+                    // client to demux it — the live-transcoded fragmented MP4
+                    // has no duration in its header. Images index duration 0.
+                    const entry = { id, ext: String(post.file_ext || '') };
+                    const durSec = Number(post.duration) || 0;
+                    if (durSec > 0) entry.durationMs = Math.round(durSec * 1000);
+                    channel.queue.push(entry);
                 }
                 const added = channel.queue.length - beforeLen;
                 channel.cursor = nextCursor || null;
@@ -622,8 +629,8 @@ function createOrchestrator({
         channel.phase = 'displaying';
         // A video longer than the interval delays the advance until it has
         // played through; a shorter video (or any image) dwells for the
-        // configured interval. currentDurationMs is 0 unless a session
-        // reported a clip length via imageReady.
+        // configured interval. currentDurationMs is seeded from the indexed
+        // duration in commitCurrent and can be raised by a client's imageReady.
         const dwell = Math.max(MIN_INTERVAL_MS, channel.interval, channel.currentDurationMs || 0);
         channel.dwellDeadline = Date.now() + dwell;
         scheduleDwell(channel);
@@ -709,7 +716,12 @@ function createOrchestrator({
     function commitCurrent(channel) {
         const current = channel.queue[0] || null;
         channel.currentId = current ? current.id : null;
-        channel.currentDurationMs = 0;
+        // Seed the dwell from the indexed duration so a video plays through
+        // even before (or without) a client reporting its length. A client's
+        // imageReady can still raise this via Math.max in notifyImageReady —
+        // e.g. a cached replay where the client demuxes the real duration, or
+        // a library that indexed duration 0.
+        channel.currentDurationMs = Number(current && current.durationMs) || 0;
         clearReadiness(channel);
         channel.expectedReady = expectedReadersFor(channel);
         channel.dwellDeadline = null;

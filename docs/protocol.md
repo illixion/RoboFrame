@@ -170,8 +170,18 @@ image is `max(interval, durationMs)`: a clip shorter than the interval
 loops until the interval elapses (set `video.loop = true`), a clip longer
 than the interval delays the advance until it has played through once
 (set `video.loop = false` so it doesn't restart just before the advance).
-Images omit it and dwell for the plain interval. The longest `durationMs`
-reported across the channel's sessions for the current image wins.
+Images omit it and dwell for the plain interval.
+
+The server also seeds the dwell from the video's **indexed** duration,
+delivered in the playback frame as `current.durationMs` (see the
+`playback` frame below). The effective dwell is the max of the indexed
+duration and every `durationMs` a session reports. A client should prefer
+`current.durationMs` over demuxing the stream: a live-transcoded clip
+(`vcodec=h264` on a cache miss) arrives as a fragmented MP4 with no
+duration in its header, so a player querying its own demuxer sees 0 and
+would advance mid-clip. Reporting `durationMs` back is still useful for a
+library that indexed 0, or for a cached replay whose true length the
+player can read.
 
 The orchestrator's readiness barrier starts the dwell timer as soon as
 the **first** visible session on the channel reports for the current
@@ -456,7 +466,7 @@ with `sessionIds: ["win1", ..., "win10"]`).
     { "id": 4516954, "ext": "png" },
     { "id": 1042171, "ext": "png" },
     { "id": 4239038, "ext": "jpg" },
-    { "id": 4237092, "ext": "jpg" }
+    { "id": 2192588, "ext": "webm", "durationMs": 122000 }
   ]
 }}
 ```
@@ -473,17 +483,21 @@ with `sessionIds: ["win1", ..., "win10"]`).
   `&deviceId=<their deviceId>` so the server's `/history` page can group
   the request under their display; omitting it files the request under
   `others`.
-- `ext` can also be `mp4` or `webm` — those entries are videos. `/get`
-  streams them straight from disk (no resize, no transcode; `convert`,
+- `ext` can also be `mp4` or `webm` — those entries are videos, and they
+  carry `durationMs` (the indexed clip length; absent when the library
+  indexed 0). `/get` streams them straight from disk (`convert`,
   `bright`, `lowmem`, `width`, `height` are ignored) with
-  `Accept-Ranges: bytes` and single-range support. Clients should
-  render with `<video autoplay muted playsInline>` pointed at the
+  `Accept-Ranges: bytes` and single-range support; `vcodec=h264`
+  requests a hardware-decodable H.264 ≤1080p ≤30fps variant. Clients
+  should render with `<video autoplay muted playsInline>` pointed at the
   `/get` URL directly — do **not** fetch-to-blob and reuse, the clip
   may be ~100 MB and is likely to be cut off mid-loop by the next
   playback tick. Fire `imageReady` on `loadeddata` (first frame
-  decoded), the same barrier as images, and include `durationMs` (and
-  set `loop` to whether the clip is shorter than the interval — see
-  `imageReady` above) so a long clip plays through before the advance.
+  decoded), the same barrier as images. Use `current.durationMs` to set
+  `loop` (shorter than the interval → loop; longer → play once) and
+  report it back in `imageReady` — see `imageReady` above; the server
+  already seeds the dwell from it, so a long clip plays through even if a
+  client never reports.
 - A new `current.id` is your cue to start loading. Send `imageReady`
   when the transition completes.
 - Clients MUST pause video playback when the display is off

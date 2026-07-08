@@ -255,6 +255,59 @@ test('imageReady durationMs resets per image so a long clip does not stretch the
     assert.ok(ch.dwellDeadline - Date.now() <= 5000, 'next image dwells for the interval, not the prior clip');
 });
 
+test('indexed video duration seeds the dwell without any client durationMs report', async (t) => {
+    // A live-transcoded clip's fragmented MP4 has no duration in its header,
+    // so a kiosk querying its player sees 0 and reports imageReady with no
+    // durationMs. The dwell must still cover the clip from the indexed
+    // duration carried on the queue entry.
+    const { orch } = harness({
+        pages: [{
+            results: [
+                { _id: 100, file_ext: 'webm', duration: 122 },
+                { _id: 101, file_ext: 'jpg' },
+            ],
+            nextCursor: 0,
+        }],
+    });
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 5000 });
+    await tick(); await tick(); await tick();
+    const ch = orch._channels.get('screen1');
+    assert.equal(ch.currentId, 100);
+    assert.equal(ch.currentDurationMs, 122000, 'dwell seeded from indexed duration');
+
+    // Report WITHOUT a durationMs (the header-less live transcode case).
+    orch.notifyImageReady(ws, ch.currentId);
+    assert.equal(ch.phase, 'displaying');
+    assert.ok(ch.dwellDeadline - Date.now() > 5000, 'dwell covers the clip, not just the interval');
+    assert.ok(ch.dwellDeadline - Date.now() <= 122000);
+});
+
+test('a client durationMs still wins when it exceeds the indexed duration', async (t) => {
+    // Cached replay: the player can read the true length and reports it. If
+    // the index under-counted, the reported value must raise the dwell.
+    const { orch } = harness({
+        pages: [{
+            results: [
+                { _id: 100, file_ext: 'webm', duration: 10 },
+                { _id: 101, file_ext: 'jpg' },
+            ],
+            nextCursor: 0,
+        }],
+    });
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 5000 });
+    await tick(); await tick(); await tick();
+    const ch = orch._channels.get('screen1');
+    assert.equal(ch.currentDurationMs, 10000);
+
+    orch.notifyImageReady(ws, ch.currentId, 22000);
+    assert.equal(ch.currentDurationMs, 22000, 'reported duration raises the seed');
+    assert.ok(ch.dwellDeadline - Date.now() > 10000);
+});
+
 test('readiness barrier: a client leaving before reporting does not wedge the channel', async (t) => {
     const { orch } = harness();
     t.after(() => orch.close());
