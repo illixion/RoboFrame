@@ -68,6 +68,18 @@
       .viewer.visible{display:flex}
       .viewer img,.viewer video{max-width:100%;max-height:100%;height:100%;object-fit:contain}
       .viewer img[hidden],.viewer video[hidden]{display:none}
+      /* Close affordance pinned above everything in the viewer. The fullscreen
+         <video> swallows its own clicks (so its controls work), which leaves a
+         touchscreen with no way to dismiss the backdrop — this button is the
+         reliable exit. Sits clear of the video's control bar at the top. */
+      .viewer .close{
+        position:absolute;top:calc(env(safe-area-inset-top,0px) + 12px);right:calc(env(safe-area-inset-right,0px) + 12px);
+        z-index:1;width:48px;height:48px;display:flex;align-items:center;justify-content:center;
+        appearance:none;border:1px solid rgba(255,255,255,0.35);border-radius:50%;
+        background:rgba(0,0,0,0.55);color:#fff;font-size:26px;line-height:1;cursor:pointer;
+      }
+      .viewer .close:hover{background:rgba(0,0,0,0.8)}
+      .viewer .close:focus-visible{outline:2px solid #fff;outline-offset:2px}
 
       @media (max-width:640px){
         .grid{grid-template-columns:repeat(auto-fill,minmax(120px,1fr))}
@@ -117,6 +129,7 @@
     </div>
 
     <div class="viewer" id="viewer" aria-hidden="true">
+      <button class="close" id="viewerClose" type="button" aria-label="Close">&times;</button>
       <img id="viewerImg" src="" alt="Full size preview" />
       <video id="viewerVideo" playsinline controls loop hidden></video>
     </div>
@@ -253,8 +266,8 @@
         }
       });
 
-      document.getElementById('viewer').addEventListener('click', (e) => {
-        const viewer = e.currentTarget;
+      function closeViewer() {
+        const viewer = document.getElementById('viewer');
         viewer.classList.remove('visible');
         viewer.setAttribute('aria-hidden','true');
         document.getElementById('viewerImg').src = '';
@@ -262,11 +275,16 @@
         viewerVideo.pause();
         viewerVideo.removeAttribute('src');
         viewerVideo.load();
-      });
+      }
+
+      // Backdrop tap closes; the close button is the reliable exit on a
+      // touchscreen, where the fullscreen video swallows its own taps.
+      document.getElementById('viewer').addEventListener('click', closeViewer);
+      document.getElementById('viewerClose').addEventListener('click', (e) => { e.stopPropagation(); closeViewer(); });
       // Keep clicks on the video controls (play/pause/scrub) from bubbling to
-      // the backdrop and closing the viewer — dismiss with the backdrop or Esc.
+      // the backdrop and closing the viewer — dismiss with the button, backdrop or Esc.
       document.getElementById('viewerVideo').addEventListener('click', (e) => e.stopPropagation());
-      window.addEventListener('keydown', (e) => { if (e.key === 'Escape') document.getElementById('viewer').click(); });
+      window.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeViewer(); });
     </script>
   </body>
 </html>
