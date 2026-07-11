@@ -372,6 +372,16 @@ class Kiosk:
         self.screen.fill((0, 0, 0))
         pygame.display.flip()
 
+        # X11 window id of our own window. Video mpv embeds INTO it (--wid)
+        # rather than opening its own top-level window: a child window can't
+        # steal X input focus (so the GPIO keypad's uinput keys keep reaching
+        # us mid-video) and can't be mis-stacked behind us. None on non-X11
+        # (KMS) backends, where mpv falls back to its own window.
+        try:
+            self._wid = pygame.display.get_wm_info().get("window")
+        except Exception:
+            self._wid = None
+
         self.fetcher = Fetcher(cfg, self.size)
         self.conn = Connection(cfg, self._on_ws)
         self.frame_q = queue.Queue()     # inbound from ws thread
@@ -834,7 +844,7 @@ class Kiosk:
             "mpv", "--fs", "--no-osc", "--no-input-default-bindings",
             "--no-input-terminal", "--no-terminal", "--really-quiet",
             "--no-audio", "--keep-open=yes", "--loop-file=inf",
-            *self._mpv_focus_args(), *self._mpv_hwdec_args(),
+            *self._mpv_wid_args(), *self._mpv_focus_args(), *self._mpv_hwdec_args(),
             f"--input-ipc-server={ipc_path}", url,
         ]
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
@@ -879,6 +889,13 @@ class Kiosk:
                 log.warning("mpv has no focus-on option — keyboard input "
                             "will go to mpv while a video plays")
         return self._mpv_focus_args_cache
+
+    def _mpv_wid_args(self):
+        # Embed video in our own window (see __init__). With --wid mpv renders
+        # into a child of our window, so it never becomes a focus-stealing
+        # top-level window — the focus-on args below are then belt-and-braces
+        # for the no-wid (KMS) fallback.
+        return [f"--wid={self._wid}"] if getattr(self, "_wid", None) else []
 
     def _play_slideshow_video(self, post):
         pid = post.get("id")
@@ -948,6 +965,12 @@ class Kiosk:
                     proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+                    # Reap after SIGKILL so a wedged mpv doesn't linger as a
+                    # live process — two 1080p decoders OOM a 1 GB Pi.
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
             except Exception:
                 pass
         if sv.get("ipc_path"):
@@ -1236,7 +1259,7 @@ class Kiosk:
             "mpv", "--fs", "--no-osc", "--no-input-default-bindings",
             "--no-input-terminal", "--no-terminal", "--really-quiet",
             "--keep-open=no", "--loop-file=no",
-            *self._mpv_focus_args(), *self._mpv_hwdec_args(), url,
+            *self._mpv_wid_args(), *self._mpv_focus_args(), *self._mpv_hwdec_args(), url,
         ]
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
@@ -1252,7 +1275,7 @@ class Kiosk:
             "--no-input-terminal", "--no-terminal", "--really-quiet",
             "--no-audio", "--profile=low-latency", "--rtsp-transport=tcp",
             "--keep-open=no", "--loop-file=no",
-            *self._mpv_focus_args(), *self._mpv_hwdec_args(), url,
+            *self._mpv_wid_args(), *self._mpv_focus_args(), *self._mpv_hwdec_args(), url,
         ]
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
