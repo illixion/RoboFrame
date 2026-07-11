@@ -138,6 +138,12 @@ def load_config():
     if vcodec.lower() in ("0", "no", "none", "off"):
         vcodec = ""
     hwdec = pick("HWDEC", kiosk.get("hwdec"), "no")
+    # When on (default), advertise the screen's aspect ratio in slideshowConfig
+    # so the server constrains the queue to matching-aspect posts (ratio:lo..hi).
+    # Off drops the advert entirely, so every post is eligible regardless of
+    # orientation — useful on a display whose aspect matches little of the
+    # library, or when you'd rather crop than filter.
+    ratio_filter = str(pick("RATIO_FILTER", kiosk.get("ratioFilter"), "1")).lower() in ("1", "true", "yes", "on")
     mod_tags = kiosk.get("modTags") or []
     if env_tags := os.environ.get("MOD_TAGS"):
         mod_tags = [t.strip() for t in env_tags.split(",") if t.strip()]
@@ -161,6 +167,7 @@ def load_config():
         "lowmem": lowmem,
         "vcodec": vcodec,
         "hwdec": hwdec,
+        "ratio_filter": ratio_filter,
         "mod_tags": mod_tags,
     }
 
@@ -470,8 +477,9 @@ class Kiosk:
         w, h = self.size
         # Advertise the raw aspect ratio (width/height); the server expands it
         # into its ratio:lo..hi query window. A "W:H" string never matched the
-        # server's numeric parser and was silently ignored.
-        ratio = round(w / h, 4) if h else None
+        # server's numeric parser and was silently ignored. `ratioFilter: false`
+        # sends no ratio, leaving the queue unconstrained by aspect.
+        ratio = round(w / h, 4) if (h and self.cfg.get("ratio_filter", True)) else None
         self.conn.send({
             "sessionId": KIOSK_SESSION_ID,
             "action": "slideshowConfig",
