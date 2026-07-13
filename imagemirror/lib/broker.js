@@ -96,6 +96,16 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     // visible:true the device is treated as visible. Aggregate flips drive
     // both the orchestrator pause/resume and the HA motion publish.
     const visibilityStates = {};
+    // Presence is the slideshow-control signal, kept separate from visibility
+    // (which is now purely home-location telemetry → the HA motion sensor).
+    // Same per-ws OR-aggregate shape as visibilityStates, so >1 display on one
+    // deviceId keeps the slideshow alive as long as any is present.
+    const presenceStates = {};
+    // deviceIds that have ever sent an explicit `present` report. Until a
+    // deviceId appears here its slideshow is still driven by `visibility`
+    // (back-compat for clients that only send visibility); once it reports
+    // presence, visibility no longer touches its channel.
+    const presenceReported = new Set();
     const haStates = {};                   // entity_id → last `update` message
     const deviceWs = new Map();            // deviceId → ws (most recent kiosk for that ID)
     const wsDeviceIds = new WeakMap();     // ws → Set<deviceId> claimed by this ws
@@ -118,6 +128,33 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         state.aggregate = agg;
         state.lastChangedAt = Date.now();
         return agg;
+    }
+
+    // OR-aggregate the per-ws `present` sources for a deviceId. Returns the new
+    // aggregate if it changed, else null. Mirrors recomputeVisibility.
+    function recomputePresence(deviceId) {
+        const state = presenceStates[deviceId];
+        if (!state) return null;
+        let agg = false;
+        for (const v of state.sources.values()) {
+            if (v.present) { agg = true; break; }
+        }
+        if (agg === state.aggregate) return null;
+        state.aggregate = agg;
+        state.lastChangedAt = Date.now();
+        return agg;
+    }
+
+    // The presence value the orchestrator should act on for a deviceId: the
+    // explicit present aggregate once any client has reported it, otherwise the
+    // visibility aggregate (legacy clients that only send visibility). Defaults
+    // to present (true) when neither has been reported.
+    function resolvedPresence(deviceId) {
+        if (presenceReported.has(deviceId)) {
+            return presenceStates[deviceId] ? presenceStates[deviceId].aggregate : false;
+        }
+        const v = visibilityStates[deviceId];
+        return v ? v.aggregate : true;
     }
 
     function attachDeviceId(ws, deviceId) {
@@ -318,13 +355,11 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     // The orchestrator is the single source of truth for "what's playing now".
     // It uses the broker's `broadcast` to push `playback` frames and reads tag
     // list state through the closures below.
-    // Per-deviceId visibility lookup for the prefetcher: skip warming
-    // variants for displays whose panel is off — the kiosk's slideshow is
-    // paused there and we'd just heat the LRU with stale work.
-    function getVisibility(deviceId) {
-        const state = visibilityStates[deviceId];
-        if (!state) return true;
-        return state.aggregate;
+    // Per-deviceId presence lookup for the prefetcher: skip warming variants
+    // for displays no one is present at — the slideshow is parked/dark there
+    // and we'd just heat the LRU with stale work.
+    function getPresence(deviceId) {
+        return resolvedPresence(deviceId);
     }
 
     const orchestrator = search ? createOrchestrator({
@@ -342,7 +377,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         prefetcher,
         imageCache,
         prefetchVariant,
-        getVisibility,
+        getPresence,
         getRatioWindow: () => ratioWindow,
         getSharedTags: () => sharedTags,
         getReadyTimeout: () => readyTimeout,
@@ -447,18 +482,32 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
             const claimed = wsDeviceIds.get(ws);
             if (claimed) {
                 wsDeviceIds.delete(ws);
-                // Drop this ws's visibility contributions before announcing
-                // departure so the aggregate reflects only still-connected
-                // reporters. If removing it flips the aggregate to false,
-                // fan out the same way as an inbound visibility report.
+                // Drop this ws's visibility + presence contributions before
+                // announcing departure so the aggregates reflect only
+                // still-connected reporters. Visibility fans out to the motion
+                // sensor; presence (resolved with the visibility fallback)
+                // drives the slideshow — a departure that empties presence
+                // parks the channel via one dark advance.
                 for (const deviceId of claimed) {
+                    let visChanged = false;
                     const vstate = visibilityStates[deviceId];
-                    if (!vstate || !vstate.sources.has(ws)) continue;
-                    vstate.sources.delete(ws);
-                    const aggregate = recomputeVisibility(deviceId);
-                    if (aggregate !== null) {
-                        mqtt.publishMotion(deviceId, aggregate);
-                        if (orchestrator) orchestrator.notifyVisibility(deviceId, aggregate);
+                    if (vstate && vstate.sources.has(ws)) {
+                        vstate.sources.delete(ws);
+                        const aggregate = recomputeVisibility(deviceId);
+                        if (aggregate !== null) { mqtt.publishMotion(deviceId, aggregate); visChanged = true; }
+                    }
+                    let presChanged = false;
+                    const pstate = presenceStates[deviceId];
+                    if (pstate && pstate.sources.has(ws)) {
+                        pstate.sources.delete(ws);
+                        if (recomputePresence(deviceId) !== null) presChanged = true;
+                    }
+                    // Presence drives the slideshow — re-notify when the resolved
+                    // value moved: presence changed (deviceId uses presence), or
+                    // visibility changed for a deviceId still on the fallback.
+                    if (orchestrator) {
+                        const moved = presenceReported.has(deviceId) ? presChanged : visChanged;
+                        if (moved) orchestrator.notifyPresent(deviceId, resolvedPresence(deviceId));
                     }
                 }
                 for (const deviceId of claimed) {
@@ -537,6 +586,11 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 }
 
             } else if (action === 'visibility') {
+                // Home-location telemetry ONLY — drives the HA motion sensor.
+                // It no longer pauses the slideshow or toggles displayState:
+                // those are `present`'s job now (see the `present` action).
+                // The one exception is back-compat: a deviceId that has never
+                // reported `present` still has its channel driven by visibility.
                 const deviceId = payload?.deviceId;
                 const visible = payload?.visible;
                 if (typeof deviceId !== 'string' || typeof visible !== 'boolean') {
@@ -553,17 +607,35 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 const aggregate = recomputeVisibility(deviceId);
                 if (aggregate !== null) {
                     mqtt.publishMotion(deviceId, aggregate);
-                    if (orchestrator) orchestrator.notifyVisibility(deviceId, aggregate);
-                    if (!aggregate) {
-                        const lastState = displayStates[deviceId]?.payload?.state;
-                        if (lastState === 'on' || lastState === true) {
-                            broadcast({
-                                action: 'displayState',
-                                payload: { target: deviceId, state: 'off' },
-                            }, ws);
-                            mqtt.publishLight(deviceId, { state: 'off' });
-                        }
+                    // Back-compat: only when this deviceId has no explicit
+                    // presence source does visibility still drive its channel.
+                    if (orchestrator && !presenceReported.has(deviceId)) {
+                        orchestrator.notifyPresent(deviceId, aggregate);
                     }
+                }
+
+            } else if (action === 'present') {
+                // Slideshow-control signal: "is a display on this deviceId live
+                // and showing?" OR-aggregated across sources like visibility.
+                // While every source is absent the channel dark-advances one
+                // post and parks; it resumes fresh when any source returns.
+                const deviceId = payload?.deviceId;
+                const present = payload?.present;
+                if (typeof deviceId !== 'string' || typeof present !== 'boolean') {
+                    console.warn('Invalid present payload:', payload);
+                    return;
+                }
+                attachDeviceId(ws, deviceId);
+                presenceReported.add(deviceId);
+                let pstate = presenceStates[deviceId];
+                if (!pstate) {
+                    pstate = { sources: new Map(), aggregate: false, lastChangedAt: 0 };
+                    presenceStates[deviceId] = pstate;
+                }
+                pstate.sources.set(ws, { present, at: Date.now() });
+                const paggregate = recomputePresence(deviceId);
+                if (paggregate !== null && orchestrator) {
+                    orchestrator.notifyPresent(deviceId, paggregate);
                 }
 
             } else if (action === 'reportDisplay') {

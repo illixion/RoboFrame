@@ -21,6 +21,32 @@ let lowLightBrightness = 16;
 let deviceBrightness = 255;
 let halted = false;
 
+// --- Presence reporting ------------------------------------------------
+// `present` is the slideshow-control signal (distinct from `visibility`,
+// which is now home-location telemetry only). We report it from the same
+// "is the slideshow actually on screen" gate the renderer uses
+// (slideshow.js): not tab-hidden, not force-disabled (custom page), and not
+// disabled by an incoming displayState:off / overlay. Wiring it to the full
+// gate — rather than just document.hidden — means that when a co-tenant
+// node-display's PIR clears and broadcasts displayState:off, this page
+// reports present:false and the channel dark-advances, exactly as the old
+// visibility coupling did.
+let lastPresent = null;
+function reportPresence() {
+    if (!state.socket || state.socket.readyState !== WebSocket.OPEN || !state.deviceID) return;
+    const present = !(state.tempDisable || state.forceDisable || document.hidden);
+    if (present === lastPresent) return;
+    lastPresent = present;
+    state.socket.send(JSON.stringify({
+        action: 'present',
+        payload: { deviceId: state.deviceID, present },
+    }));
+}
+// document.hidden transitions fire visibilitychange directly; tempDisable /
+// forceDisable transitions dispatch rf:showingchange from visibility.js.
+document.addEventListener('visibilitychange', reportPresence);
+document.addEventListener('rf:showingchange', reportPresence);
+
 function showFatalBanner(text) {
     let banner = document.getElementById('ws-fatal-banner');
     if (!banner) {
@@ -144,6 +170,10 @@ export function connectWebSocket() {
                 action: 'visibility',
                 payload: { deviceId: state.deviceID, visible: !document.hidden },
             }));
+            // Re-state presence after every (re)connect — the server forgot it
+            // when the socket died. Reset the dedup snapshot so it always sends.
+            lastPresent = null;
+            reportPresence();
             state.socket.send(JSON.stringify({
                 action: 'getDisplayState',
                 payload: { target: state.deviceID },

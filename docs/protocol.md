@@ -78,8 +78,8 @@ connection:
 Single-session clients (web kiosk, node-display) use a constant id like
 `"main"`. The id only needs to be unique *within* a connection; the
 server scopes it under the ws. Connection-wide actions (`block`,
-`visibility`, `getDisplayState`, `ping`, `report*`, `rpcsend`) ignore
-`sessionId`.
+`visibility`, `present`, `getDisplayState`, `ping`, `report*`, `rpcsend`)
+ignore `sessionId`.
 
 A session is created the first time the server sees `slideshowConfig`
 for a `(ws, sessionId)` pair. Closing the underlying ws drops every
@@ -184,16 +184,16 @@ library that indexed 0, or for a cached replay whose true length the
 player can read.
 
 The orchestrator's readiness barrier starts the dwell timer as soon as
-the **first** visible session on the channel reports for the current
+the **first** present session on the channel reports for the current
 image — first-ready wins, not all-ready. When several clients share a
 `deviceId` (e.g. a web kiosk and Spatialstash), the slowest doesn't gate
 the channel and a client leaving mid-barrier can't wedge it. Send it
 once per successful transition (matching the broadcast `current.id`). A
-channel whose sessions are all hidden (each reported `visibility {false}`)
+channel whose sessions are all absent (each reported `present {false}`)
 has nothing to wait for and advances on its own.
 
 The barrier has a **readiness-timeout fallback** (`server.slideshow.readyTimeoutMs`,
-default 15 s; `0` disables). If no visible session reports within the
+default 15 s; `0` disables). If no present session reports within the
 budget the channel promotes the frame anyway and starts the dwell. This
 recovers a client that stays on the socket but stops reporting — a
 frozen render loop, which a dead-socket check would never catch —
@@ -209,31 +209,66 @@ with zero reports** the channel *stalls* — it parks on the current frame
 (barrier still armed, no timers) instead of advancing blind through
 broadcasts, deck bumps, and prefetch conversions nobody will display.
 This is the steady state for a display that's powered off but never
-reported `visibility {false}` (visibility state is in-memory, so it
+reported `present {false}` (presence state is in-memory, so it
 resets on a server restart). Any sign of life resumes the channel and
-clears the streak: an accepted `imageReady`, a `visibility` report for
-the device (reporting `false` flips it to the legitimate dark-display
-mode — wall-clock advance with prefetch suppressed), a session
-(re)registering, or any user action on the channel (`requestNext`,
-`setModTags`, `setTagList`, `reshuffle`, `displaySync`). With the
-fallback disabled (`0`) a channel where no visible session ever reports
-stays on the current frame and never advances; the server won't advance
-blind into work no client can display.
+clears the streak: an accepted `imageReady`, a `present` report for
+the device (reporting `false` triggers the single dark advance described
+under [`present`](#present)), a session (re)registering, or any user
+action on the channel (`requestNext`, `setModTags`, `setTagList`,
+`reshuffle`, `displaySync`). With the fallback disabled (`0`) a channel
+where no present session ever reports stays on the current frame and
+never advances; the server won't advance blind into work no client can
+display.
 
 ### `visibility`
-Report whether this `deviceId` is visible (page in foreground, screen
-backlight on, etc.).
+Report whether a **person is present at** this `deviceId` (PIR motion,
+headset in the room, page in foreground, etc.).
 
 ```json
 { "action": "visibility", "payload": { "deviceId": "screen1", "visible": false } }
 ```
 
-Visibility is keyed on `deviceId`, not on the reporting socket — so
-node-display's PIR loop can drive a kiosk's channel even though the
-kiosk page is the one rendering. `false` pauses the channel's dwell
-timer using a wall-clock deadline; `true` resumes the *remaining* time
-(or advances immediately if the deadline already passed). Never bumps
-the deadline — see *Visibility never resets the timer* below.
+Visibility is **home-location telemetry only** — it drives the HA
+`binary_sensor.roboframe_<deviceId>_motion` and nothing else. It does
+**not** pause the slideshow or toggle `displayState`; those are
+[`present`](#present)'s job. Keyed on `deviceId`, OR-aggregated across
+every socket reporting it (so node-display's PIR loop and a co-located
+page both contribute).
+
+> **Back-compat:** a `deviceId` that has *never* sent a `present` report
+> still has its slideshow driven by `visibility` (legacy clients that
+> only speak visibility keep working). The moment any client reports
+> `present` for that `deviceId`, visibility stops touching its channel —
+> so co-tenants sharing a `deviceId` should migrate to `present` together.
+
+### `present`
+Report whether a display on this `deviceId` is **live and showing the
+slideshow** — the signal that actually drives playback.
+
+```json
+{ "action": "present", "payload": { "deviceId": "screen1", "present": false } }
+```
+
+Keyed on `deviceId` and OR-aggregated across sockets exactly like
+visibility, so **more than one display on one `deviceId`** works: the
+slideshow runs normally as long as *any* source is present. Only clients
+that actually *render* the slideshow send it (web frontend, native-kiosk,
+Spatialstash). A **service client** like node-display — which drives the
+physical panel and reports PIR but never renders (never sends
+`slideshowConfig`) — sends `visibility`/`reportDisplay` but **not**
+`present`; the renderer sharing its `deviceId` derives `present` from the
+panel `displayState` node-display broadcasts.
+
+When the aggregate flips to **false** (every display absent) the channel
+performs **exactly one** *dark advance* — it moves to a fresh post and
+parks. The dark step is silent: no `playback` broadcast, no
+`display_count` bump, no prefetch (nothing is rendering). When a source
+returns (aggregate → **true**) that fresh post is committed through the
+normal load/dwell cycle — delivered, counted, and dwelled from when it is
+actually shown. Net effect: whoever returns sees a **new** image with no
+stale hold and no old→new crossfade, and the server, not the client,
+chose it (no client-side wake-advance). The advance is bounded to a
+single step, so a dark channel never cycles blind.
 
 ### `requestNext` (session-scoped)
 Advance the current channel one step. Any session on the channel may call it.
@@ -669,21 +704,20 @@ on wall-clock time.
 Hidden sessions (visibility=false on their deviceId) are auto-considered
 ready, so a dark display never stalls the barrier.
 
-### Visibility never resets the timer
+### Presence drives freshness; the client never wake-advances
 
-Visibility flips pause/resume the dwell timer using a wall-clock deadline
-that survives suspend/resume cycles. A wake never bumps the deadline.
-This means: if you walk out of a room and back in within the interval,
-the same image is still showing with the rest of its dwell. If you walk
-back in *after* the interval, the channel already advanced — you see the
-current image at whatever point it's at.
+`present` flips control the slideshow. When every display on a `deviceId`
+goes absent the server does **one** dark advance and parks; when a display
+returns, that fresh post is committed and dwelled from when it's shown.
+So walk out and back in and you see a **new** image — the server chose and
+advanced it, silently, while you were away.
 
 **Don't** implement client-side wake-advance ("I just woke up, request
-next"). That's the bug this rule was added to prevent: leaving and
-re-entering a room would refresh the timer indefinitely, and
-double-wakes (server-side wake-advance + client-side wake-advance)
-caused too-fast advances. The server already knows whether the dwell
-expired; trust it.
+next"). That's still forbidden — freshness-on-return is delivered entirely
+by the server-side dark advance above, not by the client requesting `next`
+on a visibility/presence change. Double-wakes (server dark-advance +
+client `requestNext`) would skip too fast. The server already handled it;
+trust it. (`visibility` is telemetry only and never advances anything.)
 
 ### displaySync is a merge, not a primary gate
 
@@ -733,10 +767,10 @@ on different displays, use distinct `deviceId`s.
 
 - [ ] Connect with `?token=<ACCESS_TOKEN>` (or `RPC_TOKEN` if you need `rpcsend`).
 - [ ] On open, send `slideshowConfig { deviceId, interval, modTags?, ... }`. Re-send on every reconnect.
-- [ ] On open, send `visibility { deviceId, visible: true }` (and update on background/foreground).
+- [ ] On open, send `present { deviceId, present: true }` — the slideshow-control signal — and update it on background/foreground. (Send `visibility` too if you want to drive the HA motion sensor / home-location tracking.)
 - [ ] Handle `tagLists` (arrives unsolicited on connect). Read the active list index from each `playback`'s `currentList`.
 - [ ] On every `playback` frame, render `current` and prefetch `upcoming`.
 - [ ] After each successful transition, send `imageReady { id }` with the same id you just rendered.
-- [ ] **Don't** wake-advance locally on visibility changes.
+- [ ] **Don't** wake-advance locally on visibility/presence changes (the server's dark advance already refreshes on return).
 - [ ] **Don't** drive your own dwell timer that races the server's.
 - [ ] Reconnect with backoff on disconnect; halt on close code 1008 (auth failure).

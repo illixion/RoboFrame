@@ -53,7 +53,7 @@ function withDefaultSession(orch) {
         requestReshuffle: (ws) => orch.requestReshuffle(ws, sid(ws)),
         notifyImageReady: (ws, id, durationMs) => orch.notifyImageReady(ws, sid(ws), id, durationMs),
         claimDisplaySync: (ws, enabled) => orch.claimDisplaySync(ws, sid(ws), enabled),
-        notifyVisibility: (...args) => orch.notifyVisibility(...args),
+        notifyPresent: (...args) => orch.notifyPresent(...args),
         setTagList: (ws, listNumber) => orch.setTagList(ws, sid(ws), listNumber),
         notifyBlockedChange: (...args) => orch.notifyBlockedChange(...args),
         requeryAll: (...args) => orch.requeryAll(...args),
@@ -401,7 +401,7 @@ test('a streak of readiness timeouts stalls the channel instead of advancing bli
     assert.equal(ch.phase, 'displaying', 'accepted report promotes the stalled frame');
 });
 
-test('a visibility report resumes a stalled channel', async (t) => {
+test('a presence report resumes a stalled channel', async (t) => {
     const { orch } = harness({ readyTimeout: 40 });
     t.after(() => orch.close());
     const ws = makeFakeWs();
@@ -411,12 +411,12 @@ test('a visibility report resumes a stalled channel', async (t) => {
     ch.readyTimeoutStreak = 2;
     await delay(70);
     assert.equal(ch.phase, 'loading', 'stalled');
-    // The display agent finally reports the screen is off: the streak clears
-    // and the all-hidden short-circuit takes over (wall-clock advance with
-    // prefetch suppressed), which is the legitimate dark-display mode.
-    orch.notifyVisibility('screen1', false);
+    // The display reports it's now absent: the streak clears and the
+    // all-absent short-circuit promotes the loading frame (no reader to wait
+    // on) — a sign of life resumes the channel.
+    orch.notifyPresent('screen1', false);
     assert.equal(ch.readyTimeoutStreak, 0);
-    assert.equal(ch.phase, 'displaying', 'hidden short-circuit promotes');
+    assert.equal(ch.phase, 'displaying', 'absent short-circuit promotes');
 });
 
 test('a re-registering session resumes a stalled channel', async (t) => {
@@ -477,17 +477,17 @@ test('readiness timeout does not fire once the first report promotes the channel
     assert.equal(ch.dwellDeadline, dwellDeadline, 'readiness timeout must not disturb a displaying channel');
 });
 
-test('readiness timeout: an all-hidden channel still promotes immediately, not on the timer', async (t) => {
+test('readiness timeout: an all-absent channel still promotes immediately, not on the timer', async (t) => {
     const { orch } = harness({ readyTimeout: 40 });
     t.after(() => orch.close());
     const ws = makeFakeWs();
-    orch.notifyVisibility('screen1', false);
+    orch.notifyPresent('screen1', false);
     orch.register(ws, { deviceId: 'screen1', interval: 5000 });
     await tick(); await tick(); await tick();
     const ch = orch._channels.get('screen1');
-    // No visible readers → empty expectedReady → immediate promote, with no
+    // No present readers → empty expectedReady → immediate promote, with no
     // readiness timer armed (nothing to wait on).
-    assert.equal(ch.phase, 'displaying', 'all-hidden promotes without waiting for the budget');
+    assert.equal(ch.phase, 'displaying', 'all-absent promotes without waiting for the budget');
     assert.equal(ch.readyTimer, null, 'no readiness timer when there is nothing to wait on');
 });
 
@@ -495,14 +495,14 @@ test('node-display-style WS that never sends slideshowConfig is not in any chann
     const { orch } = harness();
     t.after(() => orch.close());
     const ndWs = makeFakeWs();
-    // node-display sends visibility but never slideshowConfig — the
+    // node-display sends presence/visibility but never slideshowConfig — the
     // orchestrator should not register it as a session.
-    orch.notifyVisibility('screen1', true);
-    assert.equal(orch._channels.size, 0, 'visibility alone must not create a channel');
+    orch.notifyPresent('screen1', true);
+    assert.equal(orch._channels.size, 0, 'a presence report alone must not create a channel');
     assert.ok(!orch._state().channels.find((c) => c.sessionCount > 0));
 });
 
-test('visibility=false pauses the dwell timer; visibility=true resumes the remaining time', async (t) => {
+test('present=false dark-advances one post and parks; present=true resumes on a fresh frame', async (t) => {
     const { orch } = harness();
     t.after(() => orch.close());
     const ws = makeFakeWs();
@@ -512,19 +512,57 @@ test('visibility=false pauses the dwell timer; visibility=true resumes the remai
     const ch = orch._channels.get('screen1');
     assert.equal(ch.phase, 'displaying');
     assert.ok(ch.timer);
-    const deadlineBefore = ch.dwellDeadline;
+    const idBefore = ch.currentId;
 
-    orch.notifyVisibility('screen1', false);
-    assert.equal(ch.timer, null, 'timer cleared while hidden');
-    assert.equal(ch.dwellDeadline, deadlineBefore, 'deadline preserved across pause');
+    // Everyone leaves: exactly one dark advance to a fresh post, then park —
+    // no timer, no live deadline, not yet broadcast/counted.
+    orch.notifyPresent('screen1', false);
+    await tick(); await tick(); await tick();
+    assert.equal(ch.timer, null, 'dwell timer stopped while dark');
+    assert.equal(ch.dwellDeadline, null, 'parked — no live deadline while dark');
+    assert.notEqual(ch.currentId, idBefore, 'advanced one post to a fresh frame while dark');
+    const darkId = ch.currentId;
 
-    orch.notifyVisibility('screen1', true);
-    assert.ok(ch.timer, 'timer rearmed on resume');
-    assert.equal(ch.dwellDeadline, deadlineBefore,
-        'wake must not bump the deadline — that is the bug we are fixing');
+    // Someone returns: the fresh post is committed through a normal load/dwell
+    // cycle (delivered + counted + dwelled from when it's actually shown) —
+    // no stale hold, and no further advance beyond the single dark step.
+    orch.notifyPresent('screen1', true);
+    await tick(); await tick(); await tick();
+    reportAllReady(orch, 'screen1');
+    assert.equal(ch.phase, 'displaying');
+    assert.equal(ch.currentId, darkId, 'returns on the dark-advanced fresh post, not a new one');
+    assert.ok(ch.timer, 'dwell running again after return');
 });
 
-test('hidden display does not stall the readiness barrier (auto-ready)', async (t) => {
+test('dark advance is silent: no playback frame for the fresh post until someone returns', async (t) => {
+    const { orch } = harness();
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 60000 });
+    await tick(); await tick(); await tick();
+    reportAllReady(orch, 'screen1');
+    const ch = orch._channels.get('screen1');
+    const idBefore = ch.currentId;
+
+    orch.notifyPresent('screen1', false);
+    await tick(); await tick(); await tick();
+    const darkId = ch.currentId;
+    assert.notEqual(darkId, idBefore, 'dark-advanced to a fresh post');
+    // No playback frame announces the dark post while everyone is away — so no
+    // broadcast, and (since display_count is bumped only inside broadcastPlayback
+    // on an id change) no display_count bump for a post no one sees.
+    const announcedDark = ws.sent.some(
+        (f) => f.action === 'playback' && f.payload?.current?.id === darkId);
+    assert.equal(announcedDark, false, 'dark advance must not broadcast the fresh post');
+
+    orch.notifyPresent('screen1', true);
+    await tick(); await tick(); await tick();
+    const announcedOnReturn = ws.sent.some(
+        (f) => f.action === 'playback' && f.payload?.current?.id === darkId);
+    assert.ok(announcedOnReturn, 'return delivers (and counts) the fresh post');
+});
+
+test('absent display does not stall the readiness barrier (auto-ready)', async (t) => {
     const { orch } = harness();
     t.after(() => orch.close());
     const visible = makeFakeWs();
@@ -533,14 +571,14 @@ test('hidden display does not stall the readiness barrier (auto-ready)', async (
     orch.register(hidden, { deviceId: 'screen-h', interval: 5000 });
     await tick(); await tick(); await tick();
 
-    // screen-h goes hidden — its kiosk won't render, so it must not block
+    // screen-h goes absent — its display won't render, so it must not block
     // its own channel's barrier.
-    orch.notifyVisibility('screen-h', false);
+    orch.notifyPresent('screen-h', false);
     const ch = orch._channels.get('screen-h');
-    // Channel runs continuously even with no visible reader; it should
-    // short-circuit straight to displaying.
+    // A loading channel with no present reader short-circuits straight to
+    // displaying rather than stalling the barrier.
     assert.equal(ch.phase, 'displaying',
-        'channel with no visible reader auto-promotes (so wall-clock keeps ticking)');
+        'channel with no present reader auto-promotes instead of stalling');
 });
 
 test('block triggers immediate advance + broadcast via notifyBlockedChange', async (t) => {

@@ -374,3 +374,31 @@ test('getDisplayState echoes only the cached panel state, never visibility', asy
 
     ws.close();
 });
+
+test('visibility:false no longer cascades a displayState:off (visibility is telemetry only)', async (t) => {
+    await startServer();
+    t.after(stopServer);
+
+    const a = openClient();
+    const b = openClient();
+    await a.opened; await b.opened;
+    await a.waitForFrames(1); await b.waitForFrames(1); // drain initial pushes
+
+    // Cache a panel 'on' state for kiosk1 (the pre-condition the old cascade
+    // checked before flipping the panel off).
+    a.send(JSON.stringify({ action: 'reportDisplay', payload: { deviceId: 'kiosk1', state: 'on' } }));
+    await new Promise((r) => setTimeout(r, 80));
+
+    const before = a.frames.length;
+    // The room empties. Under the old coupling this broadcast a displayState:off
+    // + light-off; now visibility feeds only the motion sensor.
+    b.send(JSON.stringify({ action: 'visibility', payload: { deviceId: 'kiosk1', visible: false } }));
+    await new Promise((r) => setTimeout(r, 150));
+
+    const offFrame = a.frames.slice(before).find(
+        (f) => f.action === 'displayState' && f.payload?.target === 'kiosk1'
+            && (f.payload.state === 'off' || f.payload.state === false));
+    assert.equal(offFrame, undefined, 'visibility:false must not trigger a displayState:off cascade');
+
+    a.close(); b.close();
+});

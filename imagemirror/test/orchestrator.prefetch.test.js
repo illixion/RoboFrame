@@ -31,7 +31,7 @@ function captureRecorder() {
     };
 }
 
-function harness({ visibility = {}, prefetchVariant } = {}) {
+function harness({ presence = {}, prefetchVariant } = {}) {
     const pages = [
         { results: Array.from({ length: 8 }, (_, i) => ({ _id: i + 1, file_ext: 'jxl' })), nextCursor: null },
     ];
@@ -46,7 +46,7 @@ function harness({ visibility = {}, prefetchVariant } = {}) {
         prefetcher: rec.prefetcher,
         imageCache: cache,
         prefetchVariant: prefetchVariant || (async () => ({ buffer: Buffer.alloc(8), mime: 'image/jpeg', ext: 'jpg' })),
-        getVisibility: (deviceId) => (deviceId in visibility ? visibility[deviceId] : true),
+        getPresence: (deviceId) => (deviceId in presence ? presence[deviceId] : true),
     });
     return { orch, rec, cache };
 }
@@ -70,8 +70,8 @@ test('commitCurrent schedules prefetch for visible session variants', async (t) 
     }
 });
 
-test('display off blocks prefetch entirely', async (t) => {
-    const ctx = harness({ visibility: { k2: false } });
+test('display absent blocks prefetch entirely', async (t) => {
+    const ctx = harness({ presence: { k2: false } });
     t.after(() => ctx.orch.close());
     const ws = makeFakeWs();
     ctx.orch.register(ws, 's1', {
@@ -177,16 +177,16 @@ test('video upcoming entries are skipped by prefetch', async (t) => {
     assert.ok(!scheduledIds.has('5'), 'video id 5 must not be prefetched');
 });
 
-test('notifyVisibility(true) re-triggers prefetch', async (t) => {
-    const visibility = { kV: false };
-    const ctx = harness({ visibility });
+test('notifyPresent(true) re-triggers prefetch', async (t) => {
+    const presence = { kV: false };
+    const ctx = harness({ presence });
     t.after(() => ctx.orch.close());
     ctx.orch.register(makeFakeWs(), 's1', { deviceId: 'kV', interval: 5000, width: 100, height: 100, convert: true });
-    ctx.orch.notifyVisibility('kV', false);
+    ctx.orch.notifyPresent('kV', false);
     await tick(); await tick();
     assert.equal(ctx.rec.calls.length, 0);
-    visibility.kV = true;
-    ctx.orch.notifyVisibility('kV', true);
+    presence.kV = true;
+    ctx.orch.notifyPresent('kV', true);
     await tick(); await tick();
-    assert.ok(ctx.rec.calls.length > 0, 'prefetch should run after visibility on');
+    assert.ok(ctx.rec.calls.length > 0, 'prefetch should run after presence on');
 });

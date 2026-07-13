@@ -43,4 +43,9 @@ export function disable(newState, override = false) {
         if (state.currentPlayback) applyPlayback(state.currentPlayback);
         if (state.currentPost) addToHistory(state.currentPost);
     }
+
+    // The on-screen "showing" state just changed (displayState off/on, overlay,
+    // custom page). ws-client listens and reports `present` so the channel
+    // dark-advances while nothing is shown and resumes fresh when it is.
+    document.dispatchEvent(new CustomEvent('rf:showingchange'));
 }

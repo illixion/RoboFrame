@@ -685,9 +685,20 @@ class Kiosk:
         })
 
     def _send_visibility(self, visible):
+        # Home-location telemetry only (→ HA motion sensor). Does not drive
+        # the slideshow anymore — see _send_present.
         self.conn.send({
             "action": "visibility",
             "payload": {"deviceId": self.cfg["device_id"], "visible": visible},
+        })
+
+    def _send_present(self, present):
+        # Slideshow-control signal: whether this panel is live and showing.
+        # While every display on the deviceId is absent the server dark-
+        # advances one post and parks, so a wake shows a fresh frame.
+        self.conn.send({
+            "action": "present",
+            "payload": {"deviceId": self.cfg["device_id"], "present": present},
         })
 
     def _send_image_ready(self, pid, duration_ms=None):
@@ -711,6 +722,7 @@ class Kiosk:
             self.connected = True
             self._send_slideshow_config()
             self._send_visibility(not self._is_off())
+            self._send_present(not self._is_off())
             self.conn.send({"action": "getDisplayState",
                             "payload": {"target": self.cfg["device_id"]}})
             return
@@ -1814,6 +1826,7 @@ class Kiosk:
             if self.last_playback:
                 self._apply_playback(self.last_playback)
         self._send_visibility(not is_off)
+        self._send_present(not is_off)
 
     def _drain_fetch_ready(self):
         """Promote any fetched surfaces and render if one matches `current`."""

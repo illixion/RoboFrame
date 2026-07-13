@@ -446,7 +446,7 @@ URL; node-display reads `ACCESS_TOKEN` from env/config.
 When `server.mqtt.url` is set, the broker connects to the configured MQTT broker and publishes retained discovery. Per kiosk it sees:
 
 - `light.roboframe_<deviceId>_backlight` — on/off + brightness (0–255). HA writes flow back to the kiosk via the WebSocket `setBrightness` / `displayState` actions.
-- `binary_sensor.roboframe_<deviceId>_motion` — driven by the kiosk's `visibility` action (web frontend / spatialstash) and the on-device PIR HTTP endpoints.
+- `binary_sensor.roboframe_<deviceId>_motion` — home-location telemetry, driven by the kiosk's `visibility` action (web frontend / spatialstash) and the on-device PIR HTTP endpoints. Visibility is now *only* this sensor: the slideshow itself is driven by the separate `present` action (see `docs/protocol.md`), so snapping/backgrounding a viewer no longer pauses playback or toggles the panel.
 - `binary_sensor.roboframe_<deviceId>_connected` — `connectivity` class, ON whenever at least one WebSocket session has claimed this `deviceId` (browser kiosk, Spatialstash window, native kiosk, or node-display). Flips OFF on the last disconnect. Not retained — after a broker restart the state is `unknown` until a client (re)connects.
 - **Connection device triggers** — for every `deviceId` the broker also publishes two MQTT device triggers, exposed in HA as `device` → `RoboFrame <id>` → trigger types `connected` and `disconnected`. These fire HA events directly on the connect/disconnect edge and are immune to the `unknown` / `unavailable` transitions that complicate state-based triggers. Prefer these for automations.
 - `sensor.roboframe_<deviceId>_als` — ambient light reading, published when the kiosk reports one.

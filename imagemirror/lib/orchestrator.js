@@ -84,7 +84,7 @@ function createOrchestrator({
     prefetcher = null,
     imageCache = null,
     prefetchVariant = null,
-    getVisibility = null,
+    getPresence = null,
     getRatioWindow = null,
     getSharedTags = null,
     getReadyTimeout = null,
@@ -136,7 +136,13 @@ function createOrchestrator({
     const sessionsByKey = new Map();
     // ws → Set<sessionKey>; lets us drop every session for a ws on close.
     const wsSessions = new Map();
-    const visibility = new Map();         // deviceId → boolean (true if no report)
+    // Presence — "is any display on this deviceId live and showing?" — drives
+    // the slideshow (dwell, prefetch, readiness). Distinct from `visibility`,
+    // which the broker now uses purely for home-location telemetry (the HA
+    // motion sensor). The broker feeds the *resolved* aggregate here via
+    // notifyPresent: present-reports if the deviceId ever sent one, else the
+    // visibility aggregate (back-compat for clients that only send visibility).
+    const presence = new Map();           // deviceId → boolean (true if no report)
     // displaySync merge is tracked as a property of the *driver channel*,
     // not a specific ws or session. All sessions on the driver channel are
     // considered equal — any of them can release. Original claimer leaving
@@ -255,21 +261,22 @@ function createOrchestrator({
         return mergeDriverChannel !== null;
     }
 
-    function deviceVisible(deviceId) {
-        // Default to visible; only an explicit `visible: false` report pauses.
-        return visibility.get(deviceId) !== false;
+    function devicePresent(deviceId) {
+        // Default to present; only an explicit `present: false` (or, for a
+        // visibility-only client, `visible: false`) resolved by the broker pauses.
+        return presence.get(deviceId) !== false;
     }
 
-    function sessionVisible(sessionKey) {
+    function sessionPresent(sessionKey) {
         const sess = sessionsByKey.get(sessionKey);
-        return sess ? deviceVisible(sess.channel.deviceId) : true;
+        return sess ? devicePresent(sess.channel.deviceId) : true;
     }
 
     function channelActive(channel) {
         if (isMergeActive() && channel === mergeDriverChannel) {
-            return deviceVisible(mergeDriverChannel.deviceId);
+            return devicePresent(mergeDriverChannel.deviceId);
         }
-        return deviceVisible(channel.deviceId);
+        return devicePresent(channel.deviceId);
     }
 
     function snapshot(channel) {
@@ -302,10 +309,10 @@ function createOrchestrator({
     }
 
     function expectedReadersFor(channel) {
-        // Hidden sessions are auto-ready: their displays won't render
-        // while hidden, so demanding an imageReady from them would stall
+        // Absent sessions are auto-ready: their displays won't render
+        // while absent, so demanding an imageReady from them would stall
         // the channel forever — there's no timeout to bail it out.
-        const targets = broadcastTargets(channel).filter(sessionVisible);
+        const targets = broadcastTargets(channel).filter(sessionPresent);
         return new Set(targets);
     }
 
@@ -650,11 +657,11 @@ function createOrchestrator({
         if (!prefetcher || !prefetchVariant || !imageCache) return;
         if (!channel || channel.sessions.size === 0) return;
         if (channel.phase === 'idle' || channel.queue.length <= 1) return;
-        // Display off → kiosk isn't rendering, don't burn CPU warming bytes
-        // it won't ask for.
-        if (getVisibility) {
+        // No one present → nothing's rendering, don't burn CPU warming bytes
+        // no one will ask for (a dark-advancing channel included).
+        if (getPresence) {
             const driver = isMergeActive() ? mergeDriverChannel : channel;
-            if (driver && getVisibility(driver.deviceId) === false) return;
+            if (driver && getPresence(driver.deviceId) === false) return;
         } else if (!channelActive(channel)) {
             return;
         }
@@ -678,7 +685,7 @@ function createOrchestrator({
             : [driverChannel.sessions];
         for (const pool of sessionPools) {
             for (const [key, sess] of pool) {
-                if (!sessionVisible(key)) continue;
+                if (!sessionPresent(key)) continue;
                 const p = sess.params || {};
                 const v = {
                     convert: !!p.convert,
@@ -828,9 +835,9 @@ function createOrchestrator({
         } else {
             // Existing channel — fold the new session into the readiness
             // barrier for the current image if we're still loading and
-            // the session is visible.
+            // the session is present.
             const target = isMergeActive() ? mergeDriverChannel : channel;
-            if (target.phase === 'loading' && sessionVisible(key)) {
+            if (target.phase === 'loading' && sessionPresent(key)) {
                 target.expectedReady.add(key);
             }
             // New session's variant fingerprint may be unseen — warm the
@@ -989,15 +996,37 @@ function createOrchestrator({
         startTimerIfReady(target);
     }
 
-    function notifyVisibility(deviceId, visible) {
+    // Advance one post to a fresh frame when every display on the channel has
+    // gone absent, then park — so the next arrival sees something new without
+    // burning a broadcast, a display_count bump, or prefetch work no one will
+    // see. The post is delivered and counted only when someone returns
+    // (notifyPresent → true re-commits it through the normal load/dwell cycle).
+    // Bounded to a single advance, so a dark channel never cycles blind.
+    async function darkAdvance(channel) {
+        if (channel.phase === 'idle' || channel.currentId === null) return;
+        if (channel.queue.length > 0) channel.queue.shift();
+        await refillQueue(channel);
+        const current = channel.queue[0] || null;
+        channel.currentId = current ? current.id : null;
+        channel.currentDurationMs = Number(current && current.durationMs) || 0;
+        channel.dwellDeadline = null;
+        stopDwellTimer(channel);
+        stopReadyTimer(channel);
+        // phase stays 'displaying'; parked (no timer, not broadcast).
+    }
+
+    // The broker feeds the resolved per-deviceId presence aggregate here
+    // (present-reports if the deviceId ever sent one, else its visibility
+    // aggregate). Presence — not visibility — drives the slideshow.
+    function notifyPresent(deviceId, present) {
         if (typeof deviceId !== 'string' || !deviceId) return;
-        const prev = deviceVisible(deviceId);
-        visibility.set(deviceId, !!visible);
-        if (prev === !!visible) return;
+        const prev = devicePresent(deviceId);
+        presence.set(deviceId, !!present);
+        if (prev === !!present) return;
 
         // Re-evaluate every channel touched by this deviceId. While merged,
         // only the driver channel is running, so we only have to react when
-        // the driver's deviceId visibility flips.
+        // the driver's deviceId presence flips.
         const affected = isMergeActive()
             ? (deviceId === mergeDriverChannel.deviceId ? [mergeDriverChannel] : [])
             : Array.from(channels.values()).filter((c) => c.deviceId === deviceId
@@ -1017,12 +1046,17 @@ function createOrchestrator({
                 }
             } else if (channel.phase === 'displaying') {
                 if (channelActive(channel)) {
-                    if (!channel.timer) scheduleDwell(channel);
+                    // Someone returned: re-commit the (possibly dark-advanced)
+                    // current through a normal load/dwell cycle so it's
+                    // delivered, counted, and dwelled from when it's actually
+                    // shown — a fresh frame with no stale hold on re-entry.
+                    commitCurrent(channel);
                 } else {
-                    stopDwellTimer(channel);
+                    // Everyone left: one dark advance to a fresh post, then park.
+                    darkAdvance(channel).catch(() => {});
                 }
             }
-            if (visible) schedulePrefetch(channel);
+            if (present) schedulePrefetch(channel);
         }
     }
 
@@ -1177,7 +1211,7 @@ function createOrchestrator({
         // default to whatever the displays are currently showing.
         getActiveTagsList: () => sharedTagsList,
         notifyImageReady,
-        notifyVisibility,
+        notifyPresent,
         notifyBlockedChange,
         requeryAll,
         claimDisplaySync,
