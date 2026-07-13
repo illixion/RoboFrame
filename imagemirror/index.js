@@ -92,6 +92,22 @@ const sceneProducer = createSceneProducer({
 });
 process.on('exit', () => sceneProducer.close());
 
+// Graceful shutdown: snapshot the in-memory slideshow deck before exiting so
+// a restart (the deploy git hook sends SIGTERM) resumes the same shuffle
+// order and view counts. `exit` handlers can't await, so the async save runs
+// here on the termination signals. Guarded so a second signal during the
+// write doesn't start a competing snapshot.
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try { await saveRandomRanks(); }
+  catch (err) { console.warn(`[shutdown] random_ranks snapshot failed: ${err.message}`); }
+  process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
 // Set the default user agent for all Axios requests
 axios.defaults.headers.common['User-Agent'] = 'roboframe/1.0';
 
@@ -824,6 +840,13 @@ const RANDOM_RANK_REFRESH_HOURS = pickEnv('RANDOM_RANK_REFRESH_HOURS', srv.slide
 const RANDOM_RANK_REFRESH_INTERVAL_MS = RANDOM_RANK_REFRESH_HOURS > 0
   ? RANDOM_RANK_REFRESH_HOURS * 60 * 60 * 1000
   : 0;
+// Where the in-memory random_ranks deck (shuffle order + per-post view
+// counts) is snapshotted on a clean shutdown so a restart — notably the
+// deploy git hook — resumes the same deck instead of re-shuffling and
+// zeroing every view count. Written only on graceful exit (SIGTERM/SIGINT);
+// the hot path stays purely in-memory so ad-hoc/quick slideshows never touch
+// disk. Empty string disables persistence entirely (always a fresh deck).
+const RANK_STATE_PATH = pickEnv('RANK_STATE_PATH', srv.slideshow?.rankStatePath, path.join(__dirname, 'random_ranks.parquet'));
 
 // Unwrap @duckdb/node-api list values (DuckDBListValue { items: [...] }) into
 // plain JS arrays, matching how the old `duckdb` package returned VARCHAR[]
@@ -934,6 +957,53 @@ async function refreshRandomRanks() {
   });
 }
 
+// Tracks whether random_ranks has been created this run, so a shutdown that
+// fires before init finishes doesn't try to snapshot a table that isn't there.
+let ranksReady = false;
+
+// Boot-time deck load. If a snapshot from a previous clean exit exists, seed
+// random_ranks from it — reconciled against the *current* library so posts
+// added since the snapshot get a fresh rank + zero count and posts removed
+// since drop out. Any read failure (missing/corrupt/schema drift) falls back
+// to a fresh deck, so a bad snapshot can never wedge startup.
+async function loadRandomRanks() {
+  if (!RANK_STATE_PATH || !fs.existsSync(RANK_STATE_PATH)) {
+    return refreshRandomRanks();
+  }
+  try {
+    await new Promise((resolve, reject) => {
+      db.run(`DROP TABLE IF EXISTS random_ranks;`, (err) => (err ? reject(err) : resolve()));
+    });
+    await new Promise((resolve, reject) => {
+      db.run(`
+        CREATE TABLE random_ranks AS
+        SELECT p._id,
+               COALESCE(s.random_rank, RANDOM()) AS random_rank,
+               COALESCE(s.display_count, 0)      AS display_count
+        FROM file_db.posts p
+        LEFT JOIN read_parquet('${RANK_STATE_PATH.replace(/'/g, "''")}') s ON s._id = p._id;
+      `, (err) => (err ? reject(err) : resolve()));
+    });
+    console.log(`Restored random_ranks deck from ${RANK_STATE_PATH}`);
+  } catch (err) {
+    console.warn(`[random_ranks] snapshot restore failed (${err.message}) — starting from a fresh deck`);
+    await refreshRandomRanks();
+  }
+}
+
+// Snapshot the live deck to disk. Writes to a temp sibling then renames so a
+// crash mid-write can't leave a truncated file the next boot would reject.
+// Synchronous-friendly: awaited from the shutdown path before process.exit.
+async function saveRandomRanks() {
+  if (!RANK_STATE_PATH || !ranksReady || !db) return;
+  const tmp = `${RANK_STATE_PATH}.tmp`;
+  await new Promise((resolve, reject) => {
+    db.run(`COPY random_ranks TO '${tmp.replace(/'/g, "''")}' (FORMAT PARQUET);`, (err) => (err ? reject(err) : resolve()));
+  });
+  await fs.promises.rename(tmp, RANK_STATE_PATH);
+  console.log(`Saved random_ranks deck to ${RANK_STATE_PATH}`);
+}
+
 
 (async () => {
   try {
@@ -945,7 +1015,8 @@ async function refreshRandomRanks() {
     db = wrapConnection(await instance.connect());
     if (instanceConfig) console.log(`DuckDB threads capped at ${instanceConfig.threads}`);
     await attachReadOnlyFileDb();
-    await refreshRandomRanks();
+    await loadRandomRanks();
+    ranksReady = true;
 
     if (RANDOM_RANK_REFRESH_INTERVAL_MS > 0) {
       setInterval(refreshRandomRanks, RANDOM_RANK_REFRESH_INTERVAL_MS);
