@@ -383,6 +383,7 @@ On WebSocket connect, every client receives two initial frames: `tagLists`, `cur
 | `lowmem` | Boolean (0/1). Collapses the slideshow prefetch window to next-image-only and forces `/get` to re-encode non-JXL sources to JPEG q85. Required for Pi-class kiosks — WebP/PNG software decode at 1080p saturates the ARM cores. |
 | `nightlightstart`, `nightlightend` | `HH:MM` clock window (24h, kiosk local time). While inside the window the kiosk auto-enables `bright` mode. Cross-midnight (e.g. `22:00`–`06:00`) is supported. Either missing or equal disables the schedule. |
 | `static`, `ratio`, `convert`, `bright`, `nobutton`, `nobg` | Boolean flags (0/1). `bright` ambient-dims the image at the server (used for night-light or any always-dim deployment); a manual `bright=1` is OR-ed with the night-light schedule. |
+| `wallpaper` | Boolean (0/1). Composes every frame onto a `width`×`height` canvas server-side so it always fills the screen (cover-crop when the aspect is close, fit-with-fill otherwise — see `/get`). Forces `ratio` on (the queue is biased to matching-aspect posts so they cover-crop edge to edge), so you don't need to also pass `ratio=1`. |
 | `width`, `height` | Screen dimensions used when fetching `/get` |
 | `top-offset` | CSS top padding (notch / overscan) |
 | `list` | Initial tag list index |

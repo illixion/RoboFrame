@@ -63,6 +63,12 @@ import { isNightLightActive } from './nightlight.js';
 export function getRenderParams() {
     const { width, height } = getScreenSize();
     const manualBright = Number(params.bright) ? 1 : 0;
+    // `?wallpaper=1` composes each frame onto a width×height canvas server-side
+    // (cover-crop when the aspect is close, fit-with-fill otherwise). It relies
+    // on the ratio filter to bias the queue toward matching-aspect posts —
+    // those cover-crop edge-to-edge with no bars — so wallpaper forces the
+    // ratio advert on even when `?ratio` is unset or 0.
+    const wallpaper = Number(params.wallpaper) ? 1 : 0;
     return {
         screenWidth: width,
         screenHeight: height,
@@ -72,7 +78,8 @@ export function getRenderParams() {
         bright: (manualBright || isNightLightActive()) ? 1 : 0,
         convert: Number(params.convert) ? 1 : 0,
         lowmem: Number(params.lowmem) === 1 ? 1 : 0,
-        ratio: Number(params.ratio) ? calculateDisplayRatio(width, height) : null,
+        wallpaper,
+        ratio: (Number(params.ratio) || wallpaper) ? calculateDisplayRatio(width, height) : null,
     };
 }
 
@@ -80,11 +87,12 @@ export function getRenderParams() {
 // in playback frames; the kiosk supplies its own screen dimensions.
 export function buildGetUrl(post) {
     if (!post || !post.id) return null;
-    const { screenWidth, screenHeight, bright, convert, lowmem } = getRenderParams();
+    const { screenWidth, screenHeight, bright, convert, lowmem, wallpaper } = getRenderParams();
     // `deviceId` (the ?ws= channel id) tags the request so /history can group
     // this display's images; omitted when the kiosk has no channel id.
     const device = params.ws ? `&deviceId=${encodeURIComponent(params.ws)}` : '';
-    return api(`/get?id=${post.id}&convert=${convert}&bright=${bright}&width=${screenWidth}&height=${screenHeight}&lowmem=${lowmem}${device}`);
+    const wp = wallpaper ? '&wallpaper=1' : '';
+    return api(`/get?id=${post.id}&convert=${convert}&bright=${bright}&width=${screenWidth}&height=${screenHeight}&lowmem=${lowmem}${wp}${device}`);
 }
 
 export function isVideoExt(ext) {

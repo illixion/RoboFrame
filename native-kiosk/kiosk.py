@@ -144,6 +144,14 @@ def load_config():
     # orientation — useful on a display whose aspect matches little of the
     # library, or when you'd rather crop than filter.
     ratio_filter = str(pick("RATIO_FILTER", kiosk.get("ratioFilter"), "1")).lower() in ("1", "true", "yes", "on")
+    # Wallpaper mode composes each frame onto a width×height canvas server-side
+    # (cover-crop when the aspect is close, fit-with-fill otherwise) so it always
+    # fills the screen. It relies on the ratio filter to bias the queue toward
+    # matching-aspect posts — those cover-crop edge-to-edge with no bars — so
+    # wallpaper forces the filter on even when ratioFilter is disabled.
+    wallpaper = str(pick("WALLPAPER", kiosk.get("wallpaper"), "0")).lower() in ("1", "true", "yes", "on")
+    if wallpaper:
+        ratio_filter = True
     mod_tags = kiosk.get("modTags") or []
     if env_tags := os.environ.get("MOD_TAGS"):
         mod_tags = [t.strip() for t in env_tags.split(",") if t.strip()]
@@ -168,6 +176,7 @@ def load_config():
         "vcodec": vcodec,
         "hwdec": hwdec,
         "ratio_filter": ratio_filter,
+        "wallpaper": wallpaper,
         "mod_tags": mod_tags,
     }
 
@@ -323,6 +332,8 @@ class Fetcher:
             params["lowmem"] = "1"
         if self.cfg["bright"]:
             params["bright"] = "1"
+        if self.cfg.get("wallpaper"):
+            params["wallpaper"] = "1"
         return f"{self.cfg['http_base']}/get?{urllib.parse.urlencode(params)}"
 
     def _loop(self):
