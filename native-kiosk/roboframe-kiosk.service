@@ -6,7 +6,10 @@ Wants=graphical-session.target network-online.target
 [Service]
 Type=simple
 # Replace pi with the kiosk user; the service must run inside a graphical
-# session (Openbox) with DISPLAY pointing at the running X server.
+# session (Openbox) with DISPLAY pointing at the running X server. The user
+# must also be in the 'input' group so the kiosk can read and grab the
+# keypad/keyboard from /dev/input (`usermod -aG input <user>`); without it
+# the kiosk falls back to X-focus keyboard, which a video window can steal.
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/pi/.Xauthority
 Environment=PYTHONUNBUFFERED=1

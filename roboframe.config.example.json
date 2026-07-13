@@ -87,7 +87,7 @@
   },
 
   "kiosk": {
-    "_comment": "Optional. Native SDL2 frontend (native-kiosk/kiosk.py) — a Chromium replacement for memory-constrained boards (Pi 3) running X11 + Openbox. Connects to the same WebSocket as the browser kiosk and renders pixels with pygame + Pillow. Env overrides: WS_URL, ACCESS_TOKEN, INTERVAL, BRIGHT, LOWMEM, RATIO_FILTER, WALLPAPER, MOD_TAGS.",
+    "_comment": "Optional. Native SDL2 frontend (native-kiosk/kiosk.py) — a Chromium replacement for memory-constrained boards (Pi 3) running X11 + Openbox. Connects to the same WebSocket as the browser kiosk and renders pixels with pygame + Pillow. Env overrides: WS_URL, ACCESS_TOKEN, INTERVAL, BRIGHT, LOWMEM, RATIO_FILTER, WALLPAPER, MOD_TAGS, GRAB_KEYBOARD.",
     "wsUrl": "ws://localhost:3123/rpc/ws",
     "interval": 15000,
     "bright": false,
@@ -96,6 +96,8 @@
     "_ratioFilterComment": "When true (default), the kiosk advertises its screen aspect ratio and the server constrains the queue to matching-aspect posts (server.slideshow.ratioWindow tolerance). Set false to show every post regardless of orientation (crop over filter). Env override: RATIO_FILTER.",
     "wallpaper": false,
     "_wallpaperComment": "When true, /get composes each frame onto a width×height canvas so it always fills the screen (cover-crop when the aspect is close, fit-with-fill otherwise). Relies on and forces ratioFilter on so the queue is biased to matching-aspect posts that cover-crop edge to edge. Env override: WALLPAPER.",
+    "grabKeyboard": true,
+    "_grabKeyboardComment": "When true (default), the kiosk reads the keypad/keyboard directly from /dev/input (evdev) and EVIOCGRABs the devices, instead of relying on X11 keyboard focus. This is what keeps the GPIO keypad and any USB keyboard working while a video is on screen — an mpv window (even embedded via --wid) can take X input focus and otherwise swallow every shortcut for the clip's duration. Requires the process to be in the 'input' group; falls back to the pygame/X-focus path when evdev is unavailable (e.g. macOS). Env override: GRAB_KEYBOARD.",
     "modTags": []
   }
 }

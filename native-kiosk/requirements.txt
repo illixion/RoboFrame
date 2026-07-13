@@ -2,6 +2,11 @@ pygame>=2.5
 Pillow>=10.0
 requests>=2.31
 websocket-client>=1.7
+# Linux only: read the keypad/keyboard straight from /dev/input so shortcuts
+# keep working while a video holds X focus (see KeyboardGrabber). The process
+# must be in the 'input' group. Skipped on macOS, where the kiosk falls back
+# to pygame's X-focus keyboard path.
+evdev>=1.6; platform_system == "Linux"
 
 # System dependency (not pip-installable): mpv on PATH is required for video
 # and audio playback — slideshow videos (mp4/webm posts) and the playVideo /

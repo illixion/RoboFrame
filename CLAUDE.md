@@ -37,6 +37,13 @@ Spatialstash is a separate app that implements the same protocol in Swift, it is
   server-side image resize via `/get?width=&height=&lowmem=1` so the Pi
   never decodes a full-res JPEG. Pairs with node-display on the same host:
   node-display owns backlight/PIR, native-kiosk owns pixels.
+  Keyboard/keypad input is read straight from `/dev/input` (evdev) and
+  the devices are `EVIOCGRAB`'d — X11 keyboard focus is deliberately
+  bypassed because an mpv video window (even embedded via `--wid`) can
+  take input focus and otherwise swallow every shortcut for the whole
+  clip. Needs the kiosk user in the `input` group; `grabKeyboard: false`
+  (or no evdev, e.g. macOS) falls back to the pygame/X-focus path. Video
+  embeds via `--wid` purely for correct rendering/stacking, not input.
 - `gpio-agent/` — Python 3 daemon that bridges Pi hardware to the rest
   of the stack: PIR motion sensor → HTTP POST to node-display's
   `/pir/motion` + `/pir/clear` (port 8765), 4x4 matrix keypad → uinput

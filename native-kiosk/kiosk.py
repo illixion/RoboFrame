@@ -55,6 +55,7 @@ import json
 import logging
 import os
 import queue
+import selectors
 import shutil
 import signal
 import socket
@@ -77,6 +78,17 @@ import pygame
 import requests
 import websocket
 from PIL import Image
+
+# Optional: kernel-level keyboard capture (Linux only). When present the
+# kiosk reads and EVIOCGRABs the input devices directly instead of relying
+# on X11 keyboard focus — see KeyboardGrabber. Absent on macOS dev boxes,
+# where we fall back to pygame's KEYDOWN (X focus) path.
+try:
+    import evdev
+    from evdev import ecodes as ecodes
+except Exception:
+    evdev = None
+    ecodes = None
 
 log = logging.getLogger("kiosk")
 
@@ -155,6 +167,12 @@ def load_config():
     mod_tags = kiosk.get("modTags") or []
     if env_tags := os.environ.get("MOD_TAGS"):
         mod_tags = [t.strip() for t in env_tags.split(",") if t.strip()]
+    # Grab the keyboard/keypad at the kernel level (evdev) rather than via
+    # X11 focus. On (default) the kiosk reads /dev/input directly so the
+    # GPIO keypad and any USB keyboard keep reaching it even while mpv is on
+    # screen — an embedded video window can still take X input focus, which
+    # otherwise swallows every shortcut for the duration of the clip.
+    grab_keyboard = str(pick("GRAB_KEYBOARD", kiosk.get("grabKeyboard"), "1")).lower() in ("1", "true", "yes", "on")
 
     if not access_token:
         log.error("ACCESS_TOKEN is required (top-level accessToken in "
@@ -178,6 +196,7 @@ def load_config():
         "ratio_filter": ratio_filter,
         "wallpaper": wallpaper,
         "mod_tags": mod_tags,
+        "grab_keyboard": grab_keyboard,
     }
 
 
@@ -371,6 +390,148 @@ class Fetcher:
             self.ready_q.put((pid, surf))
 
 
+# ---------- keyboard capture ----------------------------------------------
+
+class KeyboardGrabber(threading.Thread):
+    """Read the keypad/keyboard straight from evdev, bypassing X11 focus.
+
+    The kiosk is one fullscreen app, but when it plays a video the mpv
+    window — even embedded via --wid — can take X input focus and swallow
+    every keystroke until the clip ends. Reading /dev/input devices
+    directly, and EVIOCGRAB'ing them for exclusive ownership, sidesteps
+    focus entirely: the GPIO keypad's uinput events and any USB keyboard
+    reach the kiosk no matter which window owns the X focus. Because the
+    grab also hides these devices from X, there is no double-dispatch with
+    the pygame KEYDOWN fallback — a grabbed device never reaches pygame.
+
+    Emits (pygame_key, mods) tuples to `on_key` from its own thread; the
+    caller marshals them onto the main loop. Never started when evdev is
+    unavailable (e.g. a macOS dev box), where the pygame path takes over.
+    """
+
+    # evdev device names we never grab: the HDMI audio-jack presence node
+    # and the HDMI-CEC pseudo-keyboard carry key bits but are neither the
+    # keypad nor a real keyboard.
+    SKIP_NAMES = ("hdmi", "cec", "video bus", "consumer control")
+    RESCAN_SECONDS = 3.0
+
+    def __init__(self, on_key):
+        super().__init__(daemon=True, name="kbd-grab")
+        self.on_key = on_key
+        self._stop = threading.Event()
+        self._devices = {}          # path -> evdev.InputDevice (grabbed)
+        self._ctrl = set()          # currently-held ctrl ecodes
+        self._code_map = self._build_code_map()
+        self._ctrl_codes = {ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL}
+
+    @staticmethod
+    def _build_code_map():
+        e = ecodes
+        m = {
+            e.KEY_B: pygame.K_b, e.KEY_S: pygame.K_s, e.KEY_D: pygame.K_d,
+            e.KEY_P: pygame.K_p, e.KEY_T: pygame.K_t, e.KEY_R: pygame.K_r,
+            e.KEY_SPACE: pygame.K_SPACE, e.KEY_RIGHT: pygame.K_RIGHT,
+            e.KEY_LEFT: pygame.K_LEFT, e.KEY_ESC: pygame.K_ESCAPE,
+            e.KEY_ENTER: pygame.K_RETURN, e.KEY_KPENTER: pygame.K_RETURN,
+        }
+        # Both the number row and the numeric keypad map to the digit keys
+        # (tag-list selection is 's' then a digit).
+        for i in range(10):
+            m[getattr(e, f"KEY_{i}")] = getattr(pygame, f"K_{i}")
+            kp = getattr(e, f"KEY_KP{i}", None)
+            if kp is not None:
+                m[kp] = getattr(pygame, f"K_{i}")
+        return m
+
+    def stop(self):
+        self._stop.set()
+
+    def _keyboardish(self, dev, caps):
+        name = (dev.name or "").lower()
+        if any(s in name for s in self.SKIP_NAMES):
+            return False
+        keys = caps.get(ecodes.EV_KEY, [])
+        return any(k in keys for k in (
+            ecodes.KEY_SPACE, ecodes.KEY_ENTER, ecodes.KEY_ESC,
+            ecodes.KEY_A, ecodes.KEY_B))
+
+    def _rescan(self, sel):
+        """Grab any newly-appeared keyboard device (handles hotplug)."""
+        try:
+            paths = evdev.list_devices()
+        except Exception:
+            return
+        for path in paths:
+            if path in self._devices:
+                continue
+            try:
+                dev = evdev.InputDevice(path)
+                if not self._keyboardish(dev, dev.capabilities()):
+                    dev.close()
+                    continue
+                dev.grab()
+            except Exception as ex:
+                log.debug("keyboard: skip %s: %s", path, ex)
+                continue
+            self._devices[path] = dev
+            sel.register(dev, selectors.EVENT_READ)
+            log.info("keyboard: grabbed %s (%s)", path, dev.name)
+
+    def _drop(self, dev, sel):
+        try:
+            sel.unregister(dev)
+        except Exception:
+            pass
+        self._devices.pop(getattr(dev, "path", None), None)
+        for fn in (dev.ungrab, dev.close):
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def _dispatch(self, ev):
+        if ev.type != ecodes.EV_KEY:
+            return
+        code, val = ev.code, ev.value
+        if code in self._ctrl_codes:
+            if val == 1:
+                self._ctrl.add(code)
+            elif val == 0:
+                self._ctrl.discard(code)
+            return
+        if val != 1:            # initial press only (ignore release/autorepeat)
+            return
+        key = self._code_map.get(code)
+        if key is None:
+            return
+        self.on_key(key, pygame.KMOD_CTRL if self._ctrl else 0)
+
+    def run(self):
+        sel = selectors.DefaultSelector()
+        last_scan = 0.0
+        try:
+            while not self._stop.is_set():
+                now = time.monotonic()
+                if now - last_scan >= self.RESCAN_SECONDS:
+                    self._rescan(sel)
+                    last_scan = now
+                if not self._devices:
+                    self._stop.wait(0.5)
+                    continue
+                for skey, _ in sel.select(timeout=1.0):
+                    dev = skey.fileobj
+                    try:
+                        for ev in dev.read():
+                            self._dispatch(ev)
+                    except OSError:
+                        # device unplugged — release and let rescan re-add
+                        self._drop(dev, sel)
+        finally:
+            for dev in list(self._devices.values()):
+                self._drop(dev, sel)
+            sel.close()
+
+
 # ---------- kiosk ----------------------------------------------------------
 
 class Kiosk:
@@ -391,10 +552,12 @@ class Kiosk:
         pygame.display.flip()
 
         # X11 window id of our own window. Video mpv embeds INTO it (--wid)
-        # rather than opening its own top-level window: a child window can't
-        # steal X input focus (so the GPIO keypad's uinput keys keep reaching
-        # us mid-video) and can't be mis-stacked behind us. None on non-X11
-        # (KMS) backends, where mpv falls back to its own window.
+        # rather than opening its own top-level window, so the video renders
+        # inside our surface and can't be mis-stacked behind us. (Keyboard
+        # input does NOT rely on this: an embedded child can still take X
+        # input focus, so shortcuts come in through KeyboardGrabber, which
+        # reads the devices below the window system.) None on non-X11 (KMS)
+        # backends, where mpv falls back to its own window.
         try:
             self._wid = pygame.display.get_wm_info().get("window")
         except Exception:
@@ -403,6 +566,20 @@ class Kiosk:
         self.fetcher = Fetcher(cfg, self.size)
         self.conn = Connection(cfg, self._on_ws)
         self.frame_q = queue.Queue()     # inbound from ws thread
+
+        # Keyboard/keypad input. When evdev is available and grab is enabled
+        # the grabber owns the input devices and feeds (key, mods) here; the
+        # main loop drains it exactly like pygame KEYDOWN. The pygame path
+        # stays as the fallback for macOS dev boxes and un-grabbable devices.
+        self.key_q = queue.Queue()
+        self._kbd = None
+        if cfg.get("grab_keyboard", True):
+            if evdev is not None:
+                self._kbd = KeyboardGrabber(
+                    lambda k, m: self.key_q.put((k, m)))
+            else:
+                log.info("evdev unavailable; keyboard uses X focus "
+                         "(shortcuts may not reach the kiosk during video)")
 
         # Overlay layer (pygame mirror of public/modules/toast.js,
         # public/modules/sensors.js, and the clock block in
@@ -878,15 +1055,17 @@ class Kiosk:
         return [f"--hwdec={hw}"] if hw and hw.lower() != "no" else []
 
     def _mpv_focus_args(self):
-        # Keep X input focus on the pygame window while mpv is on screen:
-        # mpv is driven entirely over IPC and needs no keyboard, but if its
-        # window takes focus, the kiosk's shortcuts (SPACE save, arrows,
-        # and the GPIO keypad's uinput keystrokes) land in mpv and are
-        # ignored for the whole clip. The option spelling changed across
-        # mpv releases (--focus-on-open=no, then --focus-on=never, with
-        # the old name removed in 0.40), so probe the installed build once
-        # instead of hardcoding either and failing mpv startup outright —
-        # an unknown option is a fatal error, not a warning.
+        # Ask mpv not to take X input focus when its window maps. mpv is
+        # driven entirely over IPC and needs no keyboard, so there's no
+        # reason for it to steal focus from the desktop. This is now only
+        # tidiness — keyboard shortcuts reach the kiosk through
+        # KeyboardGrabber regardless of focus — but a stray focus grab can
+        # still confuse other X clients, so keep it off. The option spelling
+        # changed across mpv releases (--focus-on-open=no, then
+        # --focus-on=never, with the old name removed in 0.40), so probe the
+        # installed build once instead of hardcoding either and failing mpv
+        # startup outright — an unknown option is a fatal error, not a
+        # warning.
         if self._mpv_focus_args_cache is None:
             args = []
             try:
@@ -910,10 +1089,9 @@ class Kiosk:
         return self._mpv_focus_args_cache
 
     def _mpv_wid_args(self):
-        # Embed video in our own window (see __init__). With --wid mpv renders
-        # into a child of our window, so it never becomes a focus-stealing
-        # top-level window — the focus-on args below are then belt-and-braces
-        # for the no-wid (KMS) fallback.
+        # Embed video in our own window (see __init__) so it renders inside
+        # our surface and stays correctly stacked. Empty on the KMS fallback,
+        # where mpv opens its own window.
         return [f"--wid={self._wid}"] if getattr(self, "_wid", None) else []
 
     def _play_slideshow_video(self, post):
@@ -1763,6 +1941,8 @@ class Kiosk:
 
     def run(self):
         self.conn.start()
+        if self._kbd:
+            self._kbd.start()
         clock = pygame.time.Clock()
         running = True
         # The clock overlay updates once per second; that's the natural
@@ -1779,6 +1959,20 @@ class Kiosk:
                         running = False
                     else:
                         self._on_key(ev)
+            # Kernel-level keypad/keyboard (evdev). Grabbed devices bypass X
+            # focus, so these arrive even while a video owns the screen. Same
+            # handling as the pygame KEYDOWN path; a grabbed device never
+            # reaches pygame, so the two can't both fire for one press.
+            try:
+                while True:
+                    key, mods = self.key_q.get_nowait()
+                    if key == pygame.K_ESCAPE:
+                        running = False
+                    else:
+                        self._on_key(
+                            pygame.event.Event(pygame.KEYDOWN, key=key, mod=mods))
+            except queue.Empty:
+                pass
             try:
                 while True:
                     msg = self.frame_q.get_nowait()
@@ -1799,6 +1993,8 @@ class Kiosk:
                 last_clock_tick = now
                 self._overlay_dirty = bool(self._composite_overlay())
             clock.tick(30)
+        if self._kbd:
+            self._kbd.stop()
         self._stop_slideshow_video()
         self._stop_video()
         self._stop_audio()
