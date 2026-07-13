@@ -12,6 +12,10 @@ roboframe.config.json
 *.duckdb
 *.duckdb.wal
 
+# Slideshow deck snapshot (random_ranks persisted on clean exit)
+random_ranks.parquet
+random_ranks.parquet.tmp
+
 # OS files
 .DS_Store
 Thumbs.db
