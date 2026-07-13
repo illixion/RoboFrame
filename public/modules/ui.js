@@ -7,7 +7,7 @@ import { state } from './state.js';
 import { tags } from './tags.js';
 import { showToast } from './toast.js';
 import { disable } from './visibility.js';
-import { blockPost, saveFileRemote, requestNext, requestReshuffle } from './slideshow.js';
+import { blockPost, saveFileRemote, requestNext, requestPrev, requestReshuffle } from './slideshow.js';
 import { sendDisplaySync } from './ws-client.js';
 
 let wakeLock = true;
@@ -188,6 +188,9 @@ function installKeyboard() {
                 break;
             case 'ArrowRight':
                 requestNext();
+                break;
+            case 'ArrowLeft':
+                requestPrev();
                 break;
             case 'q':
                 if (typeof window.AuthOverlay !== 'undefined' && window.AuthOverlay.show) window.AuthOverlay.show();

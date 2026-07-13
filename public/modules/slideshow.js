@@ -17,6 +17,61 @@ import { tags } from './tags.js';
 import { findSobelFocus } from './sobel-focus.js';
 
 let lastSavedPost = null;
+
+// --- Local "previous" history --------------------------------------------
+// Left-arrow walks back through a client-local stack of the posts this
+// display has shown, holds the chosen one for one dwell interval while
+// ignoring incoming `playback` frames, then lets the first frame after the
+// hold resume server-driven playback. The server is never told to go back
+// (all displays on a deviceId share one channel — yanking the whole channel
+// backwards for one viewer's peek is the wrong scope), so this mirrors
+// Spatialstash's history-jump: a local suppression window, per client.
+const HISTORY_MAX = 100;
+let history = [];               // [{ id, ext }] chronological, newest last
+let backSteps = 0;              // how many steps back from newest we're viewing
+let playbackSuppressedUntil = 0; // epoch ms; while future, drop server frames
+let historySeeded = false;
+
+function recordHistory(cur) {
+    if (!cur || !cur.id) return;
+    const last = history[history.length - 1];
+    if (last && last.id === cur.id) return; // dedup consecutive
+    history.push({ id: cur.id, ext: cur.ext });
+    if (history.length > HISTORY_MAX) history.shift();
+}
+
+// Pre-populate the stack from the server's rolling request log so a display
+// that just booted can still step back into what it (or its channel) showed
+// before this session. Best-effort and one-shot. /history.json is newest-
+// first; our stack is chronological, and locally-recorded posts stay newest.
+export function seedHistoryFromServer() {
+    if (historySeeded) return;
+    historySeeded = true;
+    fetch(api('/history.json'))
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+            const list = data && Array.isArray(data.history) ? data.history : [];
+            if (!list.length) return;
+            const seed = list.slice().reverse()
+                .filter((e) => e && e.id)
+                .map((e) => ({ id: e.id, ext: e.ext }));
+            const localIds = new Set(history.map((h) => h.id));
+            history = seed.filter((e) => !localIds.has(e.id)).concat(history).slice(-HISTORY_MAX);
+        })
+        .catch(() => { historySeeded = false; });
+}
+
+// Render an arbitrary post immediately (not the server's current). A recent
+// post is usually still in the blob cache; otherwise the direct /get URL
+// renders fine — a one-off peek isn't worth warming the prefetch cache for.
+function renderHistoryPost(post) {
+    if (!post || !post.id || !state.mediaContainer) return;
+    const entry = mediaCache.get(post.id);
+    if (entry) touchCacheEntry(post.id);
+    const src = entry ? entry.objectUrl : buildGetUrl(post);
+    if (!src) return;
+    crossfadeFullscreenMedia(state.mediaContainer, src, post.id, isVideoExt(post.ext));
+}
 // `lowmem=1` collapses the prefetch window to next-image-only so low-RAM
 // kiosks (Pi 3 etc.) don't OOM holding 5+ decoded blobs in memory.
 const LOW_MEM = Number(params.lowmem) === 1;
@@ -308,6 +363,14 @@ export function crossfadeFullscreenMedia(container, newMediaUrl, postId, isVideo
 // store the metadata so the wake path can re-apply and catch up.
 export function applyPlayback(payload) {
     if (!payload) return;
+    // Holding a "previous" view: ignore server frames entirely — no metadata
+    // update, no prefetch, no render — until the hold expires. The first
+    // frame at/after the deadline clears the hold and resumes live playback.
+    if (playbackSuppressedUntil) {
+        if (Date.now() < playbackSuppressedUntil) return;
+        playbackSuppressedUntil = 0;
+        backSteps = 0;
+    }
     state.currentPlayback = payload;
     if (typeof payload.interval === 'number' && payload.interval > 0) {
         state.interval = payload.interval;
@@ -334,6 +397,7 @@ export function applyPlayback(payload) {
     if (cur && cur.id && cur.id !== state.currentPost && !isHidden) {
         // The server filters blocked posts from its queue; whatever
         // arrives here is intended to be rendered.
+        recordHistory(cur);
         maybeRenderDesiredCurrent();
     }
 }
@@ -342,9 +406,29 @@ export function applyPlayback(payload) {
 const KIOSK_SESSION_ID = 'main';
 
 export function requestNext() {
+    // Forward exits any "previous" hold and returns to live server playback.
+    playbackSuppressedUntil = 0;
+    backSteps = 0;
     if (state.socket && state.socket.readyState === WebSocket.OPEN) {
         state.socket.send(JSON.stringify({ sessionId: KIOSK_SESSION_ID, action: 'requestNext' }));
     }
+}
+
+// Step one post back through the local history stack and hold it for one
+// dwell interval, ignoring server playback frames, then resume. Repeated
+// presses walk further back; each press re-arms the hold.
+export function requestPrev() {
+    const targetIdx = history.length - 1 - (backSteps + 1);
+    if (targetIdx < 0) {
+        showToast('No earlier image');
+        seedHistoryFromServer(); // fill the stack so a later press works
+        return;
+    }
+    backSteps += 1;
+    const post = history[targetIdx];
+    const holdMs = Math.max(2000, Number(state.interval) || 15000);
+    playbackSuppressedUntil = Date.now() + holdMs;
+    renderHistoryPost(post);
 }
 
 export function requestReshuffle() {

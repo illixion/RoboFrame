@@ -35,7 +35,7 @@ import './tags.js';
 import { connectWebSocket } from './ws-client.js';
 import { bootUi } from './ui.js';
 import { initNightLight } from './nightlight.js';
-import { invalidateMediaCache } from './slideshow.js';
+import { invalidateMediaCache, seedHistoryFromServer } from './slideshow.js';
 
 bootUi();
 initNightLight(invalidateMediaCache);
@@ -43,6 +43,9 @@ initNightLight(invalidateMediaCache);
 if (params.ws) {
     state.deviceID = params.ws;
     connectWebSocket();
+    // Pre-populate the left-arrow "previous" stack from the server's rolling
+    // request log so stepping back works right after a page load.
+    seedHistoryFromServer();
 } else {
     console.warn('No ?ws= param — slideshow requires a WebSocket connection. Add ?ws=<deviceId> to the URL.');
 }

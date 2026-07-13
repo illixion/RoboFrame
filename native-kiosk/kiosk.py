@@ -95,6 +95,9 @@ log = logging.getLogger("kiosk")
 KIOSK_SESSION_ID = "main"
 SESSION = requests.Session()
 
+# Depth of the client-local "previous" stack (LEFT arrow). See _show_previous.
+HISTORY_MAX = 100
+
 
 # ---------- config ---------------------------------------------------------
 
@@ -656,6 +659,19 @@ class Kiosk:
         self.awaiting_taglist = False    # 's' then digit: pick a tag list
         self.connected = False
 
+        # Client-local "previous" navigation (LEFT arrow). `history` is a
+        # chronological stack (newest last) of shown posts; `back_steps` is how
+        # far back from newest we're currently viewing; while `suppress_until`
+        # is in the future incoming playback frames are dropped so the peeked
+        # post holds for one interval, then live playback resumes. The server
+        # is never told to go back — one channel is shared across a deviceId,
+        # so the hold is kept per client. Mirrors the web kiosk (slideshow.js).
+        self.history = []                # [{"id", "ext"}] chronological
+        self.back_steps = 0
+        self.suppress_until = 0.0        # monotonic; 0 = live
+        self.nav_override = None         # {"id","ext"} shown via back-nav
+        self._history_seeded = False
+
     # -- WS handlers (run on ws thread, push to main via queue) -------------
 
     def _on_ws(self, msg):
@@ -725,6 +741,9 @@ class Kiosk:
             self._send_present(not self._is_off())
             self.conn.send({"action": "getDisplayState",
                             "payload": {"target": self.cfg["device_id"]}})
+            # Pre-populate the LEFT-arrow "previous" stack from the server's
+            # rolling request log so stepping back works right after start.
+            self._seed_history_from_server()
             return
         if action == "_close":
             log.info("ws close")
@@ -783,11 +802,20 @@ class Kiosk:
     def _apply_playback(self, payload):
         if not payload:
             return
+        # Holding a "previous" view: drop server frames until the hold expires,
+        # then resume live playback from the next frame.
+        if self.suppress_until:
+            if time.monotonic() < self.suppress_until:
+                return
+            self.suppress_until = 0.0
+            self.back_steps = 0
+            self.nav_override = None
         self.last_playback = payload
         iv = payload.get("interval")
         if isinstance(iv, (int, float)) and iv > 0:
             self.interval = iv
         cur = payload.get("current") or {}
+        self._record_history(cur)
         upcoming = payload.get("upcoming") or ([payload["next"]] if payload.get("next") else [])
         up0 = upcoming[0] if upcoming else None
 
@@ -819,6 +847,67 @@ class Kiosk:
         # clip pulled just to be cut off mid-loop is pure waste).
         if up0 and up0.get("id") and not self._is_video(up0):
             self.fetcher.request(up0)
+
+    # -- previous-image history --------------------------------------------
+
+    def _record_history(self, cur):
+        if not cur or not cur.get("id"):
+            return
+        if self.history and self.history[-1]["id"] == cur["id"]:
+            return  # dedup consecutive
+        self.history.append({"id": cur["id"], "ext": cur.get("ext")})
+        if len(self.history) > HISTORY_MAX:
+            self.history.pop(0)
+
+    def _show_previous(self):
+        idx = len(self.history) - 1 - (self.back_steps + 1)
+        if idx < 0:
+            self.toast("No earlier image")
+            self._seed_history_from_server()  # fill the stack for a later press
+            return
+        self.back_steps += 1
+        post = self.history[idx]
+        hold_s = max(2.0, (self.interval or 15000) / 1000.0)
+        self.suppress_until = time.monotonic() + hold_s
+        self.nav_override = post
+        self.toast("Previous")
+        if self._is_off():
+            return
+        if self._is_video(post):
+            self._play_slideshow_video(post)
+        else:
+            self._stop_slideshow_video()
+            self.fetcher.request(post)
+            s = self.fetcher.get(post["id"])
+            if s is not None:
+                self._render(post["id"], s)
+
+    def _seed_history_from_server(self):
+        # One-shot pre-population of the previous stack from the server's
+        # rolling request log (/history.json), so stepping back works right
+        # after start. Runs off-thread; best-effort.
+        if self._history_seeded:
+            return
+        self._history_seeded = True
+        threading.Thread(target=self._seed_history_worker, daemon=True).start()
+
+    def _seed_history_worker(self):
+        try:
+            r = SESSION.get(f"{self.cfg['http_base']}/history.json",
+                            params={"token": self.cfg["access_token"]},
+                            timeout=10)
+            r.raise_for_status()
+            lst = (r.json() or {}).get("history") or []
+        except Exception as e:
+            log.warning("history seed failed: %s", e)
+            self._history_seeded = False
+            return
+        # newest-first → chronological (newest last); locals stay newest.
+        seed = [{"id": e["id"], "ext": e.get("ext")}
+                for e in reversed(lst) if e.get("id")]
+        local_ids = {h["id"] for h in self.history}
+        merged = [e for e in seed if e["id"] not in local_ids] + self.history
+        self.history = merged[-HISTORY_MAX:]
 
     # -- toasts -------------------------------------------------------------
 
@@ -1830,7 +1919,12 @@ class Kiosk:
 
     def _drain_fetch_ready(self):
         """Promote any fetched surfaces and render if one matches `current`."""
-        cur_id = ((self.last_playback or {}).get("current") or {}).get("id")
+        # While holding a "previous" view, render against the peeked post
+        # rather than the server's live current.
+        if self.nav_override:
+            cur_id = self.nav_override.get("id")
+        else:
+            cur_id = ((self.last_playback or {}).get("current") or {}).get("id")
         rendered = False
         try:
             while True:
@@ -1888,7 +1982,8 @@ class Kiosk:
     # Matches the web kiosk's mapping in public/modules/ui.js so the
     # gpio-agent keypad (../gpio-agent/config.json) drives both clients
     # identically: B=block, S=tag list (then digit 0-9), D=displaySync,
-    # P=panel off toggle, SPACE=save, T=reshuffle, RIGHT=next, Ctrl+R=refresh.
+    # P=panel off toggle, SPACE=save, T=reshuffle, RIGHT=next, LEFT=previous,
+    # Ctrl+R=refresh.
     def _on_key(self, ev):
         k = ev.key
         mods = ev.mod
@@ -1938,8 +2033,14 @@ class Kiosk:
             self.conn.send({"sessionId": KIOSK_SESSION_ID, "action": "reshuffle"})
             self.toast("Reshuffling")
         elif k == pygame.K_RIGHT:
+            # Forward exits any "previous" hold and returns to live playback.
+            self.suppress_until = 0.0
+            self.back_steps = 0
+            self.nav_override = None
             self.conn.send({"sessionId": KIOSK_SESSION_ID, "action": "requestNext"})
             self.toast("Next")
+        elif k == pygame.K_LEFT:
+            self._show_previous()
 
     def _save_remote(self, pid):
         try:
