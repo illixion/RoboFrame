@@ -153,6 +153,11 @@ def load_config():
     if vcodec.lower() in ("0", "no", "none", "off"):
         vcodec = ""
     hwdec = pick("HWDEC", kiosk.get("hwdec"), "no")
+    # Cap the transcode height (`vmaxh` on /get). Default 720 for the Pi-class
+    # target: a Pi 3's bcm2835 decoder sustains 720p30 with ~9x realtime
+    # headroom but only ~realtime at 1080p, where real content stutters. A
+    # roomier board can set 1080 to keep full resolution.
+    video_max_height = int(pick("VIDEO_MAX_HEIGHT", kiosk.get("videoMaxHeight"), 720))
     # When on (default), advertise the screen's aspect ratio in slideshowConfig
     # so the server constrains the queue to matching-aspect posts (ratio:lo..hi).
     # Off drops the advert entirely, so every post is eligible regardless of
@@ -196,6 +201,7 @@ def load_config():
         "lowmem": lowmem,
         "vcodec": vcodec,
         "hwdec": hwdec,
+        "video_max_height": video_max_height,
         "ratio_filter": ratio_filter,
         "wallpaper": wallpaper,
         "mod_tags": mod_tags,
@@ -1120,7 +1126,9 @@ class Kiosk:
         # /get streams videos straight from disk with Range support; convert/
         # width/height/lowmem are ignored server-side for video, so omit them.
         # `vcodec` asks for the hardware-decodable H.264 variant (the server
-        # transcodes on demand and falls back to raw when it can't).
+        # transcodes on demand and falls back to raw when it can't); `vmaxh`
+        # caps its height so a Pi-class decoder isn't handed 1080p it can't
+        # sustain.
         params = {
             "id": str(post["id"]),
             "token": self.cfg["access_token"],
@@ -1128,6 +1136,7 @@ class Kiosk:
         }
         if self.cfg["vcodec"]:
             params["vcodec"] = self.cfg["vcodec"]
+            params["vmaxh"] = str(self.cfg["video_max_height"])
         return f"{self.cfg['http_base']}/get?{urllib.parse.urlencode(params)}"
 
     def _spawn_mpv_slideshow(self, url, ipc_path):

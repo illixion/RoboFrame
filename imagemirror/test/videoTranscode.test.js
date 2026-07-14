@@ -43,12 +43,19 @@ test('unusable ffmpeg -> unavailable, never throws', async () => {
     assert.equal(await t.available(), false);
 });
 
-test('cachedFile misses then hits', () => {
+test('cachedFile misses then hits, keyed by height', () => {
     const dir = tmpDir();
     const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
-    assert.equal(t.cachedFile(42), null);
-    fs.writeFileSync(path.join(dir, '42.h264.mp4'), 'x');
-    assert.equal(t.cachedFile(42), path.join(dir, '42.h264.mp4'));
+    assert.equal(t.cachedFile(42), null); // default height 1080
+    fs.writeFileSync(path.join(dir, '42.h264.1080p.mp4'), 'x');
+    assert.equal(t.cachedFile(42), path.join(dir, '42.h264.1080p.mp4'));
+    // A different height cap is a distinct cache entry, not a hit.
+    assert.equal(t.cachedFile(42, 720), null);
+    fs.writeFileSync(path.join(dir, '42.h264.720p.mp4'), 'y');
+    assert.equal(t.cachedFile(42, 720), path.join(dir, '42.h264.720p.mp4'));
+    // Legacy pre-height entries are ignored so they re-encode at current settings.
+    fs.writeFileSync(path.join(dir, '99.h264.mp4'), 'z');
+    assert.equal(t.cachedFile(99), null);
 });
 
 test('prune drops oldest entries beyond the byte cap', async () => {
@@ -122,6 +129,9 @@ test('end-to-end: already-H.264 <=1080p30 source needs no transcode', { skip: !h
     if (!made) return;
     const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
     assert.equal(await t.sourceNeedsTranscode(2, src), false);
+    // ...but a height cap below the source forces a transcode: a 240p source
+    // fits raw under 1080 yet not under 200.
+    assert.equal(await t.sourceNeedsTranscode(2, src, 200), true);
 });
 
 test('end-to-end: 60fps H.264 source is transcoded and capped to 30fps', { skip: !hasFfmpeg() }, async () => {

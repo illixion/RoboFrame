@@ -73,7 +73,8 @@ const JXLINFO_PATH = pickEnv('JXLINFO_PATH', srv.jxlinfoPath, 'jxlinfo');
 
 // `/get?vcodec=h264` for video posts — Pi-class kiosks only hardware-decode
 // H.264, so the server re-encodes other codecs on demand (see
-// lib/videoTranscode.js). Degrades to raw streaming when ffmpeg is absent.
+// lib/videoTranscode.js), capping height to `vmaxh` (default 1080, kiosks 720).
+// Degrades to raw streaming when ffmpeg is absent.
 const videoTranscoder = createVideoTranscoder({
   cachePath: pickEnv('VIDEO_CACHE_PATH', srv.video?.cachePath, path.join(__dirname, 'video_cache')),
   maxCacheBytes: pickEnv('VIDEO_CACHE_MAX_BYTES', srv.video?.cacheMaxBytes, 2 * 1024 * 1024 * 1024, { type: 'number' }),
@@ -766,18 +767,21 @@ async function processRequestV2(req, res) {
       }
       // vcodec=h264: serve/build the hardware-decodable variant. Cache hits
       // stream like any file (Range-capable); a miss pipes ffmpeg's output
-      // live. Sources already in H.264 <=1080p, a missing ffmpeg, or a
-      // saturated transcoder all fall through to the raw file.
+      // live. Sources already in H.264 within the height cap, a missing
+      // ffmpeg, or a saturated transcoder all fall through to the raw file.
+      // `vmaxh` caps the output height (default 1080; Pi-class kiosks send
+      // 720 — see lib/videoTranscode.js for why resolution is the throttle).
       if (req.query.vcodec === 'h264' && await videoTranscoder.available()) {
-        const cached = videoTranscoder.cachedFile(parts.id);
+        const vmaxh = Math.min(1080, Math.max(240, Number(req.query.vmaxh) || 1080));
+        const cached = videoTranscoder.cachedFile(parts.id, vmaxh);
         if (cached) {
           streamVideo(req, res, cached, 'video/mp4', parts.id, 'mp4');
           return;
         }
-        if (await videoTranscoder.sourceNeedsTranscode(parts.id, filePath)
+        if (await videoTranscoder.sourceNeedsTranscode(parts.id, filePath, vmaxh)
             && videoTranscoder.hasFreeSlot()) {
           if (cancelled || res.headersSent) return;
-          await videoTranscoder.stream(req, res, parts.id, filePath);
+          await videoTranscoder.stream(req, res, parts.id, filePath, vmaxh);
           return;
         }
       }

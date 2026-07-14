@@ -10,11 +10,18 @@
 // into a disk cache keyed by post id; replays hit a plain seekable file and
 // go through the ordinary Range-capable streaming path.
 //
-// Sources that are already H.264 at <=1080p and <=30fps are detected via
-// ffprobe and served raw — the client's hardware decoder handles them as-is.
-// Anything above either bound is downscaled/downsampled: the Pi 3's VideoCore
-// decoder is rated for 1080p30, and feeding it 1080p60 (or 4K) decodes slower
-// than realtime — the video plays in slow motion.
+// The caller passes a max height (`vmaxh`, default 1080). Sources already in
+// H.264 at or below that height and <=30fps are detected via ffprobe and
+// served raw — the client's hardware decoder handles them as-is. Anything
+// taller, faster, or in another codec is downscaled/downsampled to fit.
+//
+// The height cap is the real throttle for Pi-class kiosks. A Pi 3's
+// bcm2835-codec decodes 1080p30 at ~realtime with no margin — the memory
+// copy-back path saturates the bus, so real (detailed) content plays slower
+// than realtime and stutters. Dropping to 720p falls off that cliff entirely
+// (measured ~9x realtime headroom on the same board), which is why the
+// native-kiosk asks for `vmaxh=720`. The cap keys the cache, so different
+// clients can request different heights without colliding.
 //
 // Everything degrades to raw streaming: ffmpeg missing, encoder probe
 // failure, or all transcode slots busy simply mean the caller falls back to
@@ -25,7 +32,14 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const CACHE_EXT = '.h264.mp4';
+// Cache entries carry the target height so a 720p and a 1080p request for the
+// same post don't collide. The matcher also sweeps up legacy `${id}.h264.mp4`
+// files (pre-height cache) so they age out of the size budget like any other.
+const CACHE_RE = /\.h264(?:\.\d+p)?\.mp4$/;
+
+function cacheName(id, maxHeight) {
+  return `${id}.h264.${maxHeight}p.mp4`;
+}
 
 function createVideoTranscoder({
   cachePath,
@@ -47,8 +61,8 @@ function createVideoTranscoder({
   // exact-30) on the raw path while catching 48/50/60fps.
   const MAX_RAW_FPS = 31;
 
-  function fitsRaw(info) {
-    return Boolean(info && info.codec === 'h264' && info.height <= 1080
+  function fitsRaw(info, maxHeight) {
+    return Boolean(info && info.codec === 'h264' && info.height <= maxHeight
       && info.fps > 0 && info.fps <= MAX_RAW_FPS);
   }
 
@@ -84,8 +98,8 @@ function createVideoTranscoder({
     return active < maxConcurrent;
   }
 
-  function cachedFile(id) {
-    const p = path.join(cachePath, `${id}${CACHE_EXT}`);
+  function cachedFile(id, maxHeight = 1080) {
+    const p = path.join(cachePath, cacheName(id, maxHeight));
     return fs.existsSync(p) ? p : null;
   }
 
@@ -122,24 +136,29 @@ function createVideoTranscoder({
     });
   }
 
-  // A source that is already H.264 at <=1080p30 doesn't need us — the
-  // kiosk's hardware decoder takes it raw.
-  async function sourceNeedsTranscode(id, filePath) {
-    return !fitsRaw(await probeSource(id, filePath));
+  // A source that is already H.264 within the height cap and <=30fps doesn't
+  // need us — the kiosk's hardware decoder takes it raw.
+  async function sourceNeedsTranscode(id, filePath, maxHeight = 1080) {
+    return !fitsRaw(await probeSource(id, filePath), maxHeight);
   }
 
-  function encodeArgs(encoder, filePath, capFps) {
-    // Fit within 1080p without ever upscaling; force_divisible_by keeps
-    // yuv420p happy on odd source dimensions. `\,` is lavfi escaping, not
-    // shell — these args go through spawn() untouched. The fps cap only
-    // applies to sources above 30fps (or with an unreadable rate) so 24/25fps
-    // cadence is never resampled.
-    const scale = 'scale=min(iw\\,1920):min(ih\\,1080)'
+  function encodeArgs(encoder, filePath, capFps, maxHeight) {
+    // Fit within maxHeight (16:9 width cap) without ever upscaling;
+    // force_divisible_by keeps yuv420p happy on odd source dimensions. `\,` is
+    // lavfi escaping, not shell — these args go through spawn() untouched. The
+    // fps cap only applies to sources above 30fps (or with an unreadable rate)
+    // so 24/25fps cadence is never resampled.
+    const maxW = Math.round((maxHeight * 16) / 9);
+    const scale = `scale=min(iw\\,${maxW}):min(ih\\,${maxHeight})`
       + ':force_original_aspect_ratio=decrease:force_divisible_by=2'
       + (capFps ? ',fps=30' : '');
+    // Bitrate is generous on purpose: the cap that fixes Pi-class playback is
+    // the resolution, not the bitrate, and on a wired kiosk the extra bits buy
+    // a sharper 720p at no cost. VideoToolbox spends far less than the target
+    // on low-motion clips anyway.
     const video = encoder === 'h264_videotoolbox'
-      ? ['-c:v', 'h264_videotoolbox', '-b:v', '8M', '-maxrate', '10M', '-bufsize', '16M']
-      : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-maxrate', '10M', '-bufsize', '16M'];
+      ? ['-c:v', 'h264_videotoolbox', '-b:v', '12M', '-maxrate', '16M', '-bufsize', '24M']
+      : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '19', '-maxrate', '16M', '-bufsize', '24M'];
     return [
       '-hide_banner', '-loglevel', 'error',
       '-i', filePath,
@@ -159,7 +178,7 @@ function createVideoTranscoder({
   // cheap and the next play of the same post then hits the cached file), and
   // only a clean ffmpeg exit commits the cache entry. Caller must have
   // checked available() + hasFreeSlot().
-  async function stream(req, res, id, filePath) {
+  async function stream(req, res, id, filePath, maxHeight = 1080) {
     const encoder = await detectEncoder();
     if (!encoder) throw new Error('transcoder unavailable');
     const info = await probeSource(id, filePath);
@@ -167,11 +186,11 @@ function createVideoTranscoder({
     active += 1;
 
     await fs.promises.mkdir(cachePath, { recursive: true });
-    const finalPath = path.join(cachePath, `${id}${CACHE_EXT}`);
+    const finalPath = path.join(cachePath, cacheName(id, maxHeight));
     const tempPath = path.join(cachePath, `.${id}.${process.pid}.${tempCounter++}.part`);
     const tempWs = fs.createWriteStream(tempPath);
 
-    const ff = spawn(ffmpegPath, encodeArgs(encoder, filePath, capFps), {
+    const ff = spawn(ffmpegPath, encodeArgs(encoder, filePath, capFps, maxHeight), {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let ffErr = '';
@@ -216,7 +235,7 @@ function createVideoTranscoder({
       if (err) return;
       const entries = [];
       for (const name of names) {
-        if (!name.endsWith(CACHE_EXT)) continue;
+        if (!CACHE_RE.test(name)) continue;
         try {
           const st = fs.statSync(path.join(cachePath, name));
           entries.push({ name, size: st.size, mtime: st.mtimeMs });
