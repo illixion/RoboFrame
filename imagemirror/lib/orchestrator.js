@@ -239,7 +239,12 @@ function createOrchestrator({
             // older generation discards its results instead of polluting the
             // freshly-cleared queue with stale-query rows.
             refillGen: 0,
-            lastDisplayedId: null,
+            // Id of the post this channel last counted a view for. A view is
+            // credited only when a *present* screen confirms it rendered the
+            // post (first accepted `imageReady`), not merely when the server
+            // broadcasts it — so dark-advanced, dark-displayed, or
+            // readiness-timeout (unacknowledged) posts never inflate the count.
+            lastCountedId: null,
             // True between the last session leaving and the next one
             // arriving. While parked, timers stay stopped (no wasted DB
             // / prefetch / readiness work) but every other piece of
@@ -335,10 +340,11 @@ function createOrchestrator({
         const targets = broadcastTargets(channel);
         if (targets.length === 0) return;
         const payload = snapshot(channel);
-        if (payload.current && payload.current.id !== channel.lastDisplayedId) {
-            channel.lastDisplayedId = payload.current.id;
-            if (incrementDisplayCount) incrementDisplayCount(payload.current.id);
-        }
+        // NB: view counting is NOT done here. Broadcasting a post doesn't mean
+        // any present screen showed it (dark display, readiness timeout, a
+        // channel whose only sessions are absent). The count is credited in
+        // notifyImageReady, on the first render confirmation from a present
+        // screen — see `lastCountedId`.
         const byWs = groupKeysByWs(targets);
         for (const [ws, sessionIds] of byWs) {
             const data = JSON.stringify({ action: 'playback', sessionIds, payload });
@@ -992,6 +998,14 @@ function createOrchestrator({
         }
         target.ready.add(key);
         markAlive(target);
+        // A present screen has confirmed it rendered this post — credit the
+        // view exactly once per showing (dedup on lastCountedId; a recurring
+        // id counts again as a genuine new view). This is the only place views
+        // are counted, so posts no responding screen showed are never credited.
+        if (target.currentId !== target.lastCountedId) {
+            target.lastCountedId = target.currentId;
+            if (incrementDisplayCount) incrementDisplayCount(target.currentId);
+        }
         dbg(`imageReady accepted: key=${key} id=${id} on ${target.deviceId} ready=${target.ready.size}/${target.expectedReady.size}`);
         startTimerIfReady(target);
     }
@@ -999,8 +1013,9 @@ function createOrchestrator({
     // Advance one post to a fresh frame when every display on the channel has
     // gone absent, then park — so the next arrival sees something new without
     // burning a broadcast, a display_count bump, or prefetch work no one will
-    // see. The post is delivered and counted only when someone returns
-    // (notifyPresent → true re-commits it through the normal load/dwell cycle).
+    // see. The post is delivered when someone returns (notifyPresent → true
+    // re-commits it through the normal load/dwell cycle) and counted only once
+    // that returning screen confirms it rendered (notifyImageReady).
     // Bounded to a single advance, so a dark channel never cycles blind.
     async function darkAdvance(channel) {
         if (channel.phase === 'idle' || channel.currentId === null) return;

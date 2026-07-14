@@ -166,10 +166,11 @@ export function connectWebSocket() {
         reconnectAttempts = 0;
         sendSlideshowConfig();
         if (state.deviceID) {
-            state.socket.send(JSON.stringify({
-                action: 'visibility',
-                payload: { deviceId: state.deviceID, visible: !document.hidden },
-            }));
+            // NB: this fixed display does NOT report `visibility` from tab
+            // state — a hidden/visible tab says nothing about whether a person
+            // is in the room. Motion (visibility) for this deviceId comes
+            // solely from the PIR agent (node-display). `present` (below) is
+            // what tab visibility drives, and it's the slideshow signal.
             // Re-state presence after every (re)connect — the server forgot it
             // when the socket died. Reset the dedup snapshot so it always sends.
             lastPresent = null;

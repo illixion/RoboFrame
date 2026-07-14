@@ -172,6 +172,10 @@ than the interval delays the advance until it has played through once
 (set `video.loop = false` so it doesn't restart just before the advance).
 Images omit it and dwell for the plain interval.
 
+The first accepted `imageReady` for a new id also **credits the post's
+view** (`display_count`) — the server counts a view on confirmed render,
+not on broadcast. See [View counting](#view-counting).
+
 The server also seeds the dwell from the video's **indexed** duration,
 delivered in the playback frame as `current.durationMs` (see the
 `playback` frame below). The effective dwell is the max of the indexed
@@ -221,8 +225,8 @@ never advances; the server won't advance blind into work no client can
 display.
 
 ### `visibility`
-Report whether a **person is present at** this `deviceId` (PIR motion,
-headset in the room, page in foreground, etc.).
+Report whether a **person is physically present at** this `deviceId` —
+real occupancy, not window/tab state.
 
 ```json
 { "action": "visibility", "payload": { "deviceId": "screen1", "visible": false } }
@@ -232,8 +236,18 @@ Visibility is **home-location telemetry only** — it drives the HA
 `binary_sensor.roboframe_<deviceId>_motion` and nothing else. It does
 **not** pause the slideshow or toggle `displayState`; those are
 [`present`](#present)'s job. Keyed on `deviceId`, OR-aggregated across
-every socket reporting it (so node-display's PIR loop and a co-located
-page both contribute).
+every socket reporting it.
+
+Only a client whose window-state genuinely tracks a person reports it:
+- **node-display** — its PIR motion loop (`/pir/motion`, `/pir/clear`).
+- **Spatialstash on Vision Pro** — the headset *is* the person, so its
+  scenePhase (one pinned window per room) is a legitimate occupancy
+  signal; it reports `visibility` alongside `present`.
+
+A **fixed web display does NOT report `visibility` from tab visibility** —
+a hidden/foregrounded tab says nothing about who's in the room. Its
+occupancy comes from a co-located PIR sharing the `deviceId`; tab state
+drives only [`present`](#present).
 
 > **Back-compat:** a `deviceId` that has *never* sent a `present` report
 > still has its slideshow driven by `visibility` (legacy clients that
@@ -264,11 +278,23 @@ performs **exactly one** *dark advance* — it moves to a fresh post and
 parks. The dark step is silent: no `playback` broadcast, no
 `display_count` bump, no prefetch (nothing is rendering). When a source
 returns (aggregate → **true**) that fresh post is committed through the
-normal load/dwell cycle — delivered, counted, and dwelled from when it is
-actually shown. Net effect: whoever returns sees a **new** image with no
-stale hold and no old→new crossfade, and the server, not the client,
-chose it (no client-side wake-advance). The advance is bounded to a
-single step, so a dark channel never cycles blind.
+normal load/dwell cycle — delivered and dwelled from when it is actually
+shown, and **counted only once a present screen confirms it rendered**
+(see [view counting](#view-counting)). Net effect: whoever returns sees a
+**new** image with no stale hold and no old→new crossfade, and the server,
+not the client, chose it (no client-side wake-advance). The advance is
+bounded to a single step, so a dark channel never cycles blind.
+
+**Departure is detected server-side, not just by the client's report.**
+A suspended client (notably visionOS on background) can't reliably send
+`present:false` before the OS freezes its socket, and the half-open socket
+may linger. So the broker also runs a **liveness heartbeat**: it pings
+every client each interval and terminates one that misses a full interval
+of pongs (~5–10s), which fires the normal disconnect path — dropping that
+socket's presence and dark-advancing/parking the channel. A returning
+client reconnects and gets the parked-fresh post replayed on
+(re)`slideshowConfig`. The client should still send `present:false` eagerly
+on background as the fast path; the heartbeat is the backstop.
 
 ### `requestNext` (session-scoped)
 Advance the current channel one step. Any session on the channel may call it.
@@ -718,6 +744,22 @@ by the server-side dark advance above, not by the client requesting `next`
 on a visibility/presence change. Double-wakes (server dark-advance +
 client `requestNext`) would skip too fast. The server already handled it;
 trust it. (`visibility` is telemetry only and never advances anything.)
+
+### View counting
+
+A post's `display_count` (which feeds the least-seen deck ordering) is
+credited **once a present screen confirms it rendered** — i.e. on the
+first accepted [`imageReady`](#imageready-required-for-slideshow-sessions-session-scoped)
+for a channel's current id, not when the server broadcasts the frame.
+This means a post is never counted just because the server *chose* it:
+a dark-advanced post no one saw, a frame broadcast to an all-absent
+channel, and a readiness-**timeout** promotion (screens expected but none
+acked within `SLIDESHOW_READY_TIMEOUT_MS`) all go uncounted. Counting is
+deduped per showing (one count per channel per id; a recurring id counts
+again as a genuine new view). Practical consequence: a client that never
+sends `imageReady` never contributes views — every real client is
+required to send it (see the checklist), so this only drops genuinely
+unconfirmed displays.
 
 ### displaySync is a merge, not a primary gate
 

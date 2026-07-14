@@ -199,26 +199,15 @@ function installKeyboard() {
     });
 }
 
-// ----- Visibility-change forwarding -----------------------------------
+// ----- Tab-visibility → display gate ----------------------------------
+// A hidden browser tab gates the slideshow off (disable → rf:showingchange →
+// ws-client reports `present=false`, so the channel dark-advances/parks). It
+// does NOT report `visibility`: tab state says nothing about room occupancy,
+// which is the motion sensor's job (driven by the PIR agent only). Keeping
+// these separate is the present/visibility separation of concerns.
 function installVisibilityHandlers() {
     document.addEventListener('visibilitychange', () => {
-        if (document.hidden) {
-            disable(true);
-            if (state.socket && state.socket.readyState === WebSocket.OPEN && state.deviceID) {
-                state.socket.send(JSON.stringify({
-                    action: 'visibility',
-                    payload: { deviceId: state.deviceID, visible: false },
-                }));
-            }
-        } else {
-            disable(false);
-            if (state.socket && state.socket.readyState === WebSocket.OPEN && state.deviceID) {
-                state.socket.send(JSON.stringify({
-                    action: 'visibility',
-                    payload: { deviceId: state.deviceID, visible: true },
-                }));
-            }
-        }
+        disable(document.hidden);
     });
 }
 

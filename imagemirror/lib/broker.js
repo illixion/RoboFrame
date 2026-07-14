@@ -111,6 +111,43 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     const wsDeviceIds = new WeakMap();     // ws → Set<deviceId> claimed by this ws
     const deviceRefcount = new Map();      // deviceId → count of live ws that have claimed it
 
+    // --- Liveness heartbeat ------------------------------------------------
+    // visionOS (and any suspended client) can leave a socket half-open: the
+    // TCP path lingers, `ws.on('close')` never fires, and the server keeps
+    // treating the client as present — so it never dark-advances/parks and the
+    // returning viewer sees a stale image. We proactively ping every client;
+    // one that misses a full interval of pongs is terminated, which fires the
+    // normal close path (presence/visibility drop → dark-advance + park; a
+    // returning client then reconnects and gets the parked-fresh post replayed).
+    const HEARTBEAT_INTERVAL_MS = 5000;    // ping cadence → dead sockets reaped in ~5-10s
+    // --- Connected-sensor grace --------------------------------------------
+    // `connected` (binary_sensor.roboframe_<id>_connected) means "a slideshow
+    // client window exists for this deviceId" and drives suppress-wake
+    // automations. A brief background/reconnect churn (or the heartbeat reaping
+    // a suspended-then-resumed VP) must NOT blip it and flap a physical
+    // display awake, so the OFF edge is deferred: when the last socket for a
+    // deviceId drops we start a grace timer, cancelled if any socket reattaches
+    // that deviceId before it fires. Freshness/motion are NOT graced — only
+    // this connectivity signal.
+    const CONNECTED_GRACE_MS = 45000;
+    const connectedOffTimers = new Map();  // deviceId → pending publishConnected(false) timer
+
+    function cancelConnectedOff(deviceId) {
+        const t = connectedOffTimers.get(deviceId);
+        if (t) { clearTimeout(t); connectedOffTimers.delete(deviceId); }
+    }
+
+    function scheduleConnectedOff(deviceId) {
+        cancelConnectedOff(deviceId);
+        const t = setTimeout(() => {
+            connectedOffTimers.delete(deviceId);
+            // Still no live socket for this deviceId after the grace window.
+            if (!(deviceRefcount.get(deviceId) > 0)) mqtt.publishConnected(deviceId, false);
+        }, CONNECTED_GRACE_MS);
+        if (typeof t.unref === 'function') t.unref();
+        connectedOffTimers.set(deviceId, t);
+    }
+
     // Track every (ws, deviceId) association in one place so the close handler
     // can announce a `displayDisconnect` for each deviceId this ws was the
     // most recent reporter for.
@@ -159,6 +196,10 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
 
     function attachDeviceId(ws, deviceId) {
         if (typeof deviceId !== 'string' || !deviceId) return;
+        // A live socket for this deviceId again — cancel any pending
+        // connected-OFF so a reconnect within the grace window is seamless
+        // (connected never blipped, no suppress-wake flap).
+        cancelConnectedOff(deviceId);
         let set = wsDeviceIds.get(ws);
         if (!set) { set = new Set(); wsDeviceIds.set(ws, set); }
         if (!set.has(deviceId)) {
@@ -459,6 +500,13 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         ws.tier = tier;
         console.log(`WebSocket client connected: ${clientId} (tier=${tier})`);
 
+        // Liveness: a healthy client auto-answers protocol pings with a pong
+        // (URLSession / browser WebSocket both do this at the framework level,
+        // even while the app is idle). A suspended client cannot, so it fails
+        // the heartbeat and gets reaped. Any inbound frame also proves life.
+        ws.isAlive = true;
+        ws.on('pong', () => { ws.isAlive = true; });
+
         ws.send(JSON.stringify({ action: 'tagLists', payload: getTagLists() }));
         // currentTagList is per-channel now and arrives in each `playback`
         // frame's `currentList` field. There's no global to send on connect.
@@ -514,7 +562,11 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                     const prev = deviceRefcount.get(deviceId) || 0;
                     if (prev <= 1) {
                         deviceRefcount.delete(deviceId);
-                        mqtt.publishConnected(deviceId, false);
+                        // Grace the OFF edge so a reconnect (or heartbeat-reaped
+                        // VP that resumes) within the window doesn't flap a
+                        // physical display awake. Presence/visibility above are
+                        // NOT graced — freshness and motion stay prompt.
+                        scheduleConnectedOff(deviceId);
                     } else {
                         deviceRefcount.set(deviceId, prev - 1);
                     }
@@ -540,6 +592,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         });
 
         ws.on('message', (message) => {
+            ws.isAlive = true;   // any inbound frame proves the socket is live
             if (Buffer.byteLength(message) > 1024 * 1024) {
                 console.warn(`Received message exceeds 1MB limit from ${clientId}`);
                 ws.send(JSON.stringify({ error: 'Message too large' }));
@@ -913,7 +966,22 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         console.log('Home Assistant sensor forwarding disabled (HA_URL and HA_TOKEN not configured)');
     }
 
+    // Reap half-open sockets: ping every client each interval; one that hasn't
+    // proven life (pong or any inbound frame) since the previous interval is
+    // terminated, firing the normal close path.
+    const heartbeatTimer = setInterval(() => {
+        wss.clients.forEach((ws) => {
+            if (ws.isAlive === false) { try { ws.terminate(); } catch (_) { /* ignore */ } return; }
+            ws.isAlive = false;
+            try { ws.ping(); } catch (_) { /* ignore */ }
+        });
+    }, HEARTBEAT_INTERVAL_MS);
+    if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+
     function close() {
+        clearInterval(heartbeatTimer);
+        for (const t of connectedOffTimers.values()) clearTimeout(t);
+        connectedOffTimers.clear();
         if (dataReloadTimer) clearTimeout(dataReloadTimer);
         if (dataWatcher) dataWatcher.close();
         if (orchestrator) orchestrator.close();

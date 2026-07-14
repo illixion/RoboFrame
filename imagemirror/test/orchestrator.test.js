@@ -78,6 +78,7 @@ function harness({ tagLists = [['cats']], pages, blockedIds = [], blockedTags = 
     let currentList = 0;
     let blockIds = blockedIds.slice();
     let blockTags = blockedTags.slice();
+    const counted = [];  // ids credited a view, in order
     const rawOrch = createOrchestrator({
         search,
         broadcast,
@@ -87,11 +88,13 @@ function harness({ tagLists = [['cats']], pages, blockedIds = [], blockedTags = 
         getBlockedTags: () => blockTags,
         ...(expandBlockedTags ? { expandBlockedTags } : {}),
         getReadyTimeout: () => readyTimeout,
+        incrementDisplayCount: (id) => counted.push(id),
     });
     const orch = withDefaultSession(rawOrch);
     return {
         orch,
         broadcasts,
+        counted,
         search,
         setCurrentList: (n) => { currentList = n; },
         setBlockedIds: (v) => { blockIds = v.slice(); },
@@ -524,8 +527,9 @@ test('present=false dark-advances one post and parks; present=true resumes on a 
     const darkId = ch.currentId;
 
     // Someone returns: the fresh post is committed through a normal load/dwell
-    // cycle (delivered + counted + dwelled from when it's actually shown) —
-    // no stale hold, and no further advance beyond the single dark step.
+    // cycle (delivered, dwelled from when it's actually shown, and counted once
+    // the returning screen's imageReady confirms it) — no stale hold, and no
+    // further advance beyond the single dark step.
     orch.notifyPresent('screen1', true);
     await tick(); await tick(); await tick();
     reportAllReady(orch, 'screen1');
@@ -549,8 +553,9 @@ test('dark advance is silent: no playback frame for the fresh post until someone
     const darkId = ch.currentId;
     assert.notEqual(darkId, idBefore, 'dark-advanced to a fresh post');
     // No playback frame announces the dark post while everyone is away — so no
-    // broadcast, and (since display_count is bumped only inside broadcastPlayback
-    // on an id change) no display_count bump for a post no one sees.
+    // broadcast, and (since display_count is bumped only in notifyImageReady,
+    // when a present screen confirms a render) no display_count bump for a post
+    // no one sees.
     const announcedDark = ws.sent.some(
         (f) => f.action === 'playback' && f.payload?.current?.id === darkId);
     assert.equal(announcedDark, false, 'dark advance must not broadcast the fresh post');
@@ -559,7 +564,49 @@ test('dark advance is silent: no playback frame for the fresh post until someone
     await tick(); await tick(); await tick();
     const announcedOnReturn = ws.sent.some(
         (f) => f.action === 'playback' && f.payload?.current?.id === darkId);
-    assert.ok(announcedOnReturn, 'return delivers (and counts) the fresh post');
+    assert.ok(announcedOnReturn, 'return delivers the fresh post (counted once its render is acked)');
+});
+
+test('view is counted on imageReady render-ack, not on broadcast, and only once per showing', async (t) => {
+    const { orch, counted } = harness();
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 60000 });
+    await tick(); await tick(); await tick();
+    const ch = orch._channels.get('screen1');
+    const id = ch.currentId;
+    // register broadcasts a playback frame, but no screen has confirmed a
+    // render — a broadcast alone must not count a view.
+    assert.deepEqual(counted, [], 'not counted on broadcast alone');
+    orch.notifyImageReady(ws, id);
+    assert.deepEqual(counted, [id], 'counted once the present screen acks the render');
+    // A second ack for the same showing is dropped (channel already displaying)
+    // and must not double-count.
+    orch.notifyImageReady(ws, id);
+    assert.deepEqual(counted, [id], 'same-showing re-ack does not double-count');
+});
+
+test('a dark-advanced post is counted only when a returning screen acks its render', async (t) => {
+    const { orch, counted } = harness();
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'screen1', interval: 60000 });
+    await tick(); await tick(); await tick();
+    const firstId = reportAllReady(orch, 'screen1');
+    assert.deepEqual(counted, [firstId], 'first shown post counted on its ack');
+    const ch = orch._channels.get('screen1');
+
+    orch.notifyPresent('screen1', false);
+    await tick(); await tick(); await tick();
+    const darkId = ch.currentId;
+    assert.notEqual(darkId, firstId, 'dark-advanced to a fresh post');
+    assert.ok(!counted.includes(darkId), 'dark-advanced post not counted while unseen');
+
+    orch.notifyPresent('screen1', true);
+    await tick(); await tick(); await tick();
+    assert.ok(!counted.includes(darkId), 'not counted just because it was re-broadcast on return');
+    reportAllReady(orch, 'screen1');
+    assert.deepEqual(counted, [firstId, darkId], 'counted once the returning screen confirms the render');
 });
 
 test('absent display does not stall the readiness barrier (auto-ready)', async (t) => {
