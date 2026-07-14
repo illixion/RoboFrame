@@ -11,9 +11,11 @@
 // go through the ordinary Range-capable streaming path.
 //
 // The caller passes a max height (`vmaxh`, default 1080). Sources already in
-// H.264 at or below that height and <=30fps are detected via ffprobe and
-// served raw — the client's hardware decoder handles them as-is. Anything
-// taller, faster, or in another codec is downscaled/downsampled to fit.
+// H.264 at or below that height and within the fps budget are detected via
+// ffprobe and served raw — the client's hardware decoder handles them as-is.
+// Anything taller, faster, or in another codec is downscaled/downsampled to
+// fit. The fps budget scales with the height cap: 60fps is allowed at <=720p,
+// 30fps at 1080p (see fpsBudget).
 //
 // The height cap is the real throttle for Pi-class kiosks. A Pi 3's
 // bcm2835-codec decodes 1080p30 at ~realtime with no margin — the memory
@@ -57,13 +59,18 @@ function createVideoTranscoder({
   let tempCounter = 0;
   const sourceInfoCache = new Map(); // post id -> { codec, height, fps } | null
 
-  // 30000/1001 NTSC sources probe as 29.97 — the tolerance keeps them (and
-  // exact-30) on the raw path while catching 48/50/60fps.
-  const MAX_RAW_FPS = 31;
+  // The fps ceiling scales with the height cap: a Pi-class decoder sustains
+  // 720p60 with room to spare (~13% of realtime measured) but only 1080p30, so
+  // 60fps is allowed only when the output is <=720p. The tolerances (31/61)
+  // keep 29.97/59.94 NTSC sources on their native cadence — an exact 30/60
+  // check would resample them. `target` is what a faster source resamples to.
+  function fpsBudget(maxHeight) {
+    return maxHeight <= 720 ? { cap: 61, target: 60 } : { cap: 31, target: 30 };
+  }
 
   function fitsRaw(info, maxHeight) {
     return Boolean(info && info.codec === 'h264' && info.height <= maxHeight
-      && info.fps > 0 && info.fps <= MAX_RAW_FPS);
+      && info.fps > 0 && info.fps <= fpsBudget(maxHeight).cap);
   }
 
   // Probe once which H.264 encoder this ffmpeg build offers. VideoToolbox
@@ -142,16 +149,16 @@ function createVideoTranscoder({
     return !fitsRaw(await probeSource(id, filePath), maxHeight);
   }
 
-  function encodeArgs(encoder, filePath, capFps, maxHeight) {
+  function encodeArgs(encoder, filePath, fpsTarget, maxHeight) {
     // Fit within maxHeight (16:9 width cap) without ever upscaling;
     // force_divisible_by keeps yuv420p happy on odd source dimensions. `\,` is
-    // lavfi escaping, not shell — these args go through spawn() untouched. The
-    // fps cap only applies to sources above 30fps (or with an unreadable rate)
-    // so 24/25fps cadence is never resampled.
+    // lavfi escaping, not shell — these args go through spawn() untouched. A
+    // truthy fpsTarget resamples an over-budget (or unreadable-rate) source;
+    // 0 leaves the native cadence alone (24/25/30, and 50/60 at <=720p).
     const maxW = Math.round((maxHeight * 16) / 9);
     const scale = `scale=min(iw\\,${maxW}):min(ih\\,${maxHeight})`
       + ':force_original_aspect_ratio=decrease:force_divisible_by=2'
-      + (capFps ? ',fps=30' : '');
+      + (fpsTarget ? `,fps=${fpsTarget}` : '');
     // Bitrate is generous on purpose: the cap that fixes Pi-class playback is
     // the resolution, not the bitrate, and on a wired kiosk the extra bits buy
     // a sharper 720p at no cost. VideoToolbox spends far less than the target
@@ -182,7 +189,8 @@ function createVideoTranscoder({
     const encoder = await detectEncoder();
     if (!encoder) throw new Error('transcoder unavailable');
     const info = await probeSource(id, filePath);
-    const capFps = !(info && info.fps > 0 && info.fps <= MAX_RAW_FPS);
+    const { cap, target } = fpsBudget(maxHeight);
+    const fpsTarget = (info && info.fps > 0 && info.fps <= cap) ? 0 : target;
     active += 1;
 
     await fs.promises.mkdir(cachePath, { recursive: true });
@@ -190,7 +198,7 @@ function createVideoTranscoder({
     const tempPath = path.join(cachePath, `.${id}.${process.pid}.${tempCounter++}.part`);
     const tempWs = fs.createWriteStream(tempPath);
 
-    const ff = spawn(ffmpegPath, encodeArgs(encoder, filePath, capFps, maxHeight), {
+    const ff = spawn(ffmpegPath, encodeArgs(encoder, filePath, fpsTarget, maxHeight), {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let ffErr = '';

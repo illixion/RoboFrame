@@ -168,3 +168,46 @@ test('end-to-end: 60fps H.264 source is transcoded and capped to 30fps', { skip:
     const [num, den] = rate.split('/').map(Number);
     assert.ok(Math.abs(num / den - 30) < 1, `output frame rate is ~30fps, got ${rate}`);
 });
+
+test('end-to-end: 60fps source keeps 60fps when capped to 720p', { skip: !hasFfmpeg() }, async () => {
+    const dir = tmpDir();
+    const src = path.join(dir, 'src720_60.mp4');
+    let made = true;
+    try {
+        execFileSync('ffmpeg', [
+            '-hide_banner', '-loglevel', 'error',
+            '-f', 'lavfi', '-i', 'testsrc=duration=0.5:size=1280x720:rate=60',
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', src,
+        ], { stdio: 'ignore' });
+    } catch {
+        made = false; // ffmpeg built without libx264 — nothing to assert
+    }
+    if (!made) return;
+    const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
+    // A 720p60 H.264 source fits the raw path at the 720 cap (60fps is within
+    // budget there) but not at 1080 (30fps budget).
+    assert.equal(await t.sourceNeedsTranscode(7, src, 720), false);
+    assert.equal(await t.sourceNeedsTranscode(7, src, 1080), true);
+
+    // Transcoding a non-H.264 60fps source at 720p preserves 60fps.
+    const m4 = path.join(dir, 'src720_60.m4v');
+    execFileSync('ffmpeg', [
+        '-hide_banner', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', 'testsrc=duration=0.5:size=1280x720:rate=60',
+        '-c:v', 'mpeg4', m4,
+    ], { stdio: 'ignore' });
+    const res = fakeRes();
+    await t.stream({}, res, 8, m4, 720);
+    await new Promise((resolve) => res.on('end', resolve));
+    for (let i = 0; i < 50 && !t.cachedFile(8, 720); i++) {
+        await new Promise((r) => setTimeout(r, 100));
+    }
+    const cached = t.cachedFile(8, 720);
+    assert.ok(cached, 'transcode was committed to the cache');
+    const rate = execFileSync('ffprobe', [
+        '-v', 'error', '-select_streams', 'v:0',
+        '-show_entries', 'stream=avg_frame_rate', '-of', 'csv=p=0', cached,
+    ]).toString().trim();
+    const [num, den] = rate.split('/').map(Number);
+    assert.ok(Math.abs(num / den - 60) < 1, `output frame rate is ~60fps, got ${rate}`);
+});
