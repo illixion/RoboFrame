@@ -422,16 +422,31 @@ const WALLPAPER_BLUR_SIGMA = 24;
 // near-fits (16:10 on 16:9, slightly-too-tall on a phone) still crop clean.
 const WALLPAPER_MAX_CROP = 0.15;
 // Edge-fill detection: sample this many rows/columns at an image's edge and
-// treat it as a solid colour when no channel varies by more than the tolerance
-// across them. Such images (illustrations, screenshots with flat letterbox
-// bars) get that exact colour extended into the gap on that side instead of a
-// blurred copy of the photo, so the subject doesn't ghost through. A few
-// rows/columns ride out JPEG noise without reaching into the subject.
+// treat it as a solid colour when a strong majority of the strip's pixels sit
+// within the tolerance of the strip's median colour. Such images
+// (illustrations, stickers on flat/transparent backgrounds, screenshots with
+// letterbox bars) get that colour extended into the gap on that side instead
+// of a blurred copy of the photo, so the subject doesn't ghost through.
+// Judging against the median with a conforming-fraction threshold means a
+// sticker whose anti-aliased edge or drop shadow touches the border can't
+// veto the fill with a handful of outlier pixels, and the tolerance rides out
+// JPEG noise and soft gradients across the thin strip.
 const WALLPAPER_EDGE_STRIP = 3;
-const WALLPAPER_EDGE_TOLERANCE = 8;
+const WALLPAPER_EDGE_TOLERANCE = 24;
+const WALLPAPER_EDGE_CONFORM = 0.9;
+// Cutout (sticker) detection: an image whose alpha channel has at least this
+// fraction of fully transparent pixels was authored to composite onto a
+// backdrop, so wallpaper gaps get the flatten colour (black) on every side —
+// the transparent background continues seamlessly into the gap no matter how
+// much of the subject touches the image edges. Edge-colour heuristics can't
+// see this (the subject can occupy half an edge strip), hence the dedicated
+// alpha test. Fully transparent pixels don't occur incidentally in photos, so
+// a small fraction is already a strong signal.
+const WALLPAPER_CUTOUT_ALPHA = 8;
+const WALLPAPER_CUTOUT_MIN_FRACTION = 0.02;
 
 // Inspect a strip at one edge (top/bottom/left/right) of a raw RGB buffer and
-// return the mean {r,g,b} when the edge is a near-uniform colour, else null.
+// return a fill {r,g,b} when the edge reads as a solid colour, else null.
 // `data` is tightly packed 3-channel RGB (alpha already flattened out).
 function detectSolidEdge(data, width, height, edge) {
   const strip = WALLPAPER_EDGE_STRIP;
@@ -440,21 +455,46 @@ function detectSolidEdge(data, width, height, edge) {
   else if (edge === 'bottom') y0 = Math.max(0, height - strip);
   else if (edge === 'left') x1 = Math.min(strip, width);
   else x0 = Math.max(0, width - strip); // right
-  let minR = 255, minG = 255, minB = 255, maxR = 0, maxG = 0, maxB = 0;
-  let sumR = 0, sumG = 0, sumB = 0, n = 0;
+
+  // Per-channel histograms → median, robust to outlier pixels (a sticker
+  // subject clipping the edge) that would wreck a mean or a min/max spread.
+  const hist = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)];
+  let n = 0;
+  for (let y = y0; y < y1; y += 1) {
+    for (let x = x0; x < x1; x += 1) {
+      const i = (y * width + x) * 3;
+      hist[0][data[i]] += 1;
+      hist[1][data[i + 1]] += 1;
+      hist[2][data[i + 2]] += 1;
+      n += 1;
+    }
+  }
+  if (n === 0) return null;
+  const median = hist.map((h) => {
+    const mid = n / 2;
+    let acc = 0;
+    for (let v = 0; v < 256; v += 1) {
+      acc += h[v];
+      if (acc >= mid) return v;
+    }
+    return 255;
+  });
+
+  // Count pixels near the median and average them for the fill colour, so the
+  // outliers that were tolerated don't tint the extended background.
+  let conforming = 0;
+  let sumR = 0, sumG = 0, sumB = 0;
   for (let y = y0; y < y1; y += 1) {
     for (let x = x0; x < x1; x += 1) {
       const i = (y * width + x) * 3;
       const r = data[i], g = data[i + 1], b = data[i + 2];
-      if (r < minR) minR = r; if (r > maxR) maxR = r;
-      if (g < minG) minG = g; if (g > maxG) maxG = g;
-      if (b < minB) minB = b; if (b > maxB) maxB = b;
-      sumR += r; sumG += g; sumB += b; n += 1;
+      const dev = Math.max(Math.abs(r - median[0]), Math.abs(g - median[1]), Math.abs(b - median[2]));
+      if (dev > WALLPAPER_EDGE_TOLERANCE) continue;
+      sumR += r; sumG += g; sumB += b; conforming += 1;
     }
   }
-  const spread = Math.max(maxR - minR, maxG - minG, maxB - minB);
-  if (spread > WALLPAPER_EDGE_TOLERANCE) return null;
-  return { r: Math.round(sumR / n), g: Math.round(sumG / n), b: Math.round(sumB / n) };
+  if (conforming / n < WALLPAPER_EDGE_CONFORM) return null;
+  return { r: Math.round(sumR / conforming), g: Math.round(sumG / conforming), b: Math.round(sumB / conforming) };
 }
 
 // A tightly-packed raw RGB rectangle of one solid colour, for compositing into
@@ -467,8 +507,11 @@ function solidRgbRect(width, height, { r, g, b }) {
 
 /**
  * Compose an image onto a virtual canvas of exactly `width`×`height` for use
- * as a device wallpaper / lock-screen background. The aspect mismatch between
- * image and canvas decides the treatment:
+ * as a device wallpaper / lock-screen background. A cutout (sticker) — an
+ * image with a meaningful share of fully transparent pixels — is always fit
+ * whole with plain black in every gap, matching its flattened transparent
+ * background. For everything else the aspect mismatch between image and
+ * canvas decides the treatment:
  *
  *  - Mismatch small enough that covering discards ≤ WALLPAPER_MAX_CROP of the
  *    longer side → cover-crop, centered, so the canvas fills edge to edge with
@@ -500,8 +543,23 @@ async function composeWallpaper(imageBuffer, width, height, { bright = false, qu
   // Fraction of the image's longer side a cover-crop would discard.
   const cropLoss = 1 - Math.min(imgAspect / canvasAspect, canvasAspect / imgAspect);
 
+  // Cutout (sticker) test on the alpha plane. A cutout always takes the
+  // fit-inside path with black in every gap: its transparent background is
+  // flattened to black, so black fill continues it seamlessly no matter what
+  // the subject does at the image edges — and cover-cropping a sticker to
+  // dodge bars would chop the subject for no benefit.
+  let cutout = false;
+  if (meta.hasAlpha) {
+    const alpha = await sharp(imageBuffer).ensureAlpha().extractChannel(3).raw().toBuffer();
+    let transparent = 0;
+    for (let i = 0; i < alpha.length; i += 1) {
+      if (alpha[i] <= WALLPAPER_CUTOUT_ALPHA) transparent += 1;
+    }
+    cutout = transparent / alpha.length >= WALLPAPER_CUTOUT_MIN_FRACTION;
+  }
+
   let canvas;
-  if (cropLoss <= WALLPAPER_MAX_CROP) {
+  if (!cutout && cropLoss <= WALLPAPER_MAX_CROP) {
     // Near-fit: fill the canvas, cropping the small overflow.
     canvas = sharp(imageBuffer).resize(width, height, { fit: 'cover', position: 'centre' });
   } else {
@@ -539,7 +597,7 @@ async function composeWallpaper(imageBuffer, width, height, { bright = false, qu
 
     // Read the resized image once as flat RGB so each gap side can check
     // whether its edge is a solid colour worth extending into the gap.
-    const flatRgb = await sharp(fg.data)
+    const flatRgb = cutout ? null : await sharp(fg.data)
       .flatten({ background: '#000000' })
       .raw()
       .toBuffer({ resolveWithObject: true });
@@ -548,7 +606,7 @@ async function composeWallpaper(imageBuffer, width, height, { bright = false, qu
     let needBlur = false;
     for (const gap of gaps) {
       if (gap.size <= 0) continue;
-      const color = detectSolidEdge(flatRgb.data, fgW, fgH, gap.edge);
+      const color = cutout ? { r: 0, g: 0, b: 0 } : detectSolidEdge(flatRgb.data, fgW, fgH, gap.edge);
       if (color) {
         fills.push({ input: solidRgbRect(gap.rect.w, gap.rect.h, color), raw: { width: gap.rect.w, height: gap.rect.h, channels: 3 }, top: gap.rect.y, left: gap.rect.x });
       } else {
