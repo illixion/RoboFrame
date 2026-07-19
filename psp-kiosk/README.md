@@ -30,13 +30,37 @@ immediate re-pick rather than an error.
 | X | save the current post (`/save`) |
 | O | block the current post (`/block`) — press twice to confirm; advances and drops it from history |
 | TRIANGLE | tag-list picker (UP/DOWN cycle incl. auto, X apply, O cancel) — feeds `/random?list=N` |
-| START | pause/resume the dwell timer |
+| SQUARE | claim/release displaySync (drive every frame in the house) |
+| START | pause/resume the dwell timer (standalone mode) |
 | SELECT | toggle the clock overlay |
 | HOME | exit |
 
 Save and block are the kiosk-tier HTTP routes, so the access token in
 `config.txt` is all they need. History replays request `record=0` so
 browsing back doesn't spam `/history`.
+
+## WebSocket session (server-driven mode)
+
+On boot the kiosk joins the broker at `ws://host:port/rpc/ws?token=…` as
+a real slideshow session (`sessionId "main"`, channel = `device_id`):
+
+- the **server** drives the cadence — `playback` frames push post ids,
+  the PSP fetches the variant over HTTP and confirms with `imageReady`
+  (video posts are acknowledged but not rendered);
+- `displayState { target, state }` turns the panel off/on remotely (HA
+  light entity, same as node-display) — the PSP answers with `present`
+  (parks the channel) and `reportDisplay` (feeds MQTT/HA);
+- RIGHT sends `requestNext`, TRIANGLE's picker applies via `setTagList`,
+  SQUARE claims/releases `displaySync`;
+- if the socket drops, the kiosk falls back to its standalone HTTP
+  dwell loop and reconnects with backoff — a rejected token (close
+  1008) stops the retry per protocol.
+
+Panel power uses `kdisp.prx`, a tiny kernel module wrapping
+`sceDisplayEnable/Disable` (kernel-only) behind a user syscall. It only
+loads under CFW; PPSSPP and OFW fall back to a soft black screen. Build
+it with `make` (it's part of the default target) and ship it next to
+EBOOT.PBP.
 
 ## Build
 

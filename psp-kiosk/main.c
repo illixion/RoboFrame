@@ -34,6 +34,11 @@
 #include <gif_lib.h>
 #include <intraFont.h>
 
+#include "ws.h"
+
+/* kdisp.prx syscall export (weak import — only call when g_hw_display). */
+int kdispSetDisplay(int on);
+
 PSP_MODULE_INFO("RoboFramePSP", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(-1024);
@@ -220,6 +225,58 @@ static void histPurge(long id) {
 static volatile int g_lists_count = -1;   /* -1 = not fetched yet */
 static char g_list_preview[LISTS_MAX][48];
 static volatile int g_active_list = -1;   /* -1 = server default */
+
+/* --- WebSocket session state --- */
+
+#define SESSION_ID "main"
+static volatile int g_ws_up = 0;          /* connected + configured */
+static volatile int g_ws_denied = 0;      /* 1008 close: bad token */
+static volatile int g_we_are_driver = 0;  /* displaySync mergeDriver == us */
+static volatile long g_last_ready_id = 0; /* imageReady dedup */
+static volatile int g_display_on = 1;
+static int g_hw_display = 0;              /* kdisp.prx loaded */
+static volatile int g_net_ready = 0;      /* apctl got an IP */
+
+/* Outgoing WS messages from other threads (main) — the ws thread owns
+ * the socket and drains this. Single producer / single consumer. */
+#define OUTQ_N 8
+static char g_outq[OUTQ_N][192];
+static volatile int g_outq_w = 0, g_outq_r = 0;
+
+static void wsEnqueue(const char *msg) {
+    int next = (g_outq_w + 1) % OUTQ_N;
+    if (next == g_outq_r) return; /* full — drop, requests are re-sendable */
+    snprintf(g_outq[g_outq_w], sizeof(g_outq[0]), "%s", msg);
+    g_outq_w = next;
+}
+
+/* --- naive JSON field extraction (flat, first occurrence after `from`) --- */
+
+static const char *jsonFind(const char *json, const char *key) {
+    char pat[48];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    return strstr(json, pat) ? strstr(json, pat) + strlen(pat) : NULL;
+}
+
+static long jsonLong(const char *json, const char *key, long def) {
+    const char *p = jsonFind(json, key);
+    if (!p) return def;
+    while (*p == ' ') p++;
+    if (*p == '-' || (*p >= '0' && *p <= '9')) return atol(p);
+    return def;
+}
+
+static int jsonStr(const char *json, const char *key, char *out, int outlen) {
+    const char *p = jsonFind(json, key);
+    if (!p) return -1;
+    while (*p == ' ') p++;
+    if (*p != '"') return -1;
+    p++;
+    int i = 0;
+    while (*p && *p != '"' && i < outlen - 1) out[i++] = *p++;
+    out[i] = 0;
+    return 0;
+}
 
 /* Case-insensitive header lookup (newlib hides strcasestr). */
 static char *findHeader(char *haystack, const char *needle) {
@@ -664,15 +721,10 @@ static int fetchImage(Slot *slot, long want_id, int replay) {
     return 0;
 }
 
-/* Fetch /rpc/tags.json and build per-list previews (first tags of each
- * list). Minimal scanner over the [["tag","tag"],...] shape. */
-static void fetchTagLists(void) {
-    unsigned char *body; int blen, status;
-    char path[256];
-    snprintf(path, sizeof(path), "/rpc/tags.json?token=%s", cfg.token);
-    if (httpGet(path, &body, &blen, &status, NULL, 0) < 0) return;
-    if (status != 200) { free(body); return; }
-
+/* Build per-list previews from [["tag","tag"],...] — works on the bare
+ * /rpc/tags.json body and on a whole {"action":"tagLists",...} WS frame
+ * (strings outside the nested arrays sit at depth 0 and are ignored). */
+static void parseTagLists(const unsigned char *body, int blen) {
     int depth = 0, list = -1, in_str = 0, esc = 0, plen = 0;
     for (int i = 0; i < blen; i++) {
         char c = body[i];
@@ -700,8 +752,16 @@ static void fetchTagLists(void) {
                 g_list_preview[list][plen] = 0;
         }
     }
-    free(body);
     g_lists_count = list + 1 > LISTS_MAX ? LISTS_MAX : list + 1;
+}
+
+static void fetchTagLists(void) {
+    unsigned char *body; int blen, status;
+    char path[256];
+    snprintf(path, sizeof(path), "/rpc/tags.json?token=%s", cfg.token);
+    if (httpGet(path, &body, &blen, &status, NULL, 0) < 0) return;
+    if (status == 200) parseTagLists(body, blen);
+    free(body);
 }
 
 /* Run a queued one-shot remote action (save/block/list fetch). */
@@ -733,10 +793,153 @@ static void runAction(void) {
     } else {
         setToast("blocked", 0, 2000);
         histPurge(id);
-        g_req_id = -1;       /* the current post just got blocked — move on */
+        if (!g_ws_up) {
+            g_req_id = -1;   /* the current post just got blocked — move on */
+            g_req_replay = 0;
+            g_want_next = 1;
+        }
+        /* ws mode: the server drops it from the queue and advances any
+         * channel showing it — a playback frame is already on the way */
+    }
+}
+
+/* ------------------------------------------------------------ ws session */
+
+/* Cut panel power (kdisp on CFW) or fall back to a soft black screen,
+ * then tell the server: `present` drives the channel park/dark-advance,
+ * `reportDisplay` feeds the HA light entity. Runs on the ws thread. */
+static void setDisplayPower(int s, int on, int report) {
+    if (g_display_on == on) return;
+    g_display_on = on;
+    if (g_hw_display) kdispSetDisplay(on);
+    if (!report) return;
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "{\"action\":\"present\",\"payload\":{\"deviceId\":\"%s\",\"present\":%s}}",
+             cfg.device_id, on ? "true" : "false");
+    wsSendText(s, msg);
+    snprintf(msg, sizeof(msg),
+             "{\"action\":\"reportDisplay\",\"payload\":{\"deviceId\":\"%s\",\"state\":\"%s\"}}",
+             cfg.device_id, on ? "on" : "off");
+    wsSendText(s, msg);
+}
+
+static void handleWsFrame(int s, const char *json) {
+    char action[32];
+    if (jsonStr(json, "action", action, sizeof(action)) < 0) return;
+
+    if (!strcmp(action, "playback")) {
+        char drv[64] = "";
+        jsonStr(json, "mergeDriver", drv, sizeof(drv));
+        g_we_are_driver = drv[0] && !strcmp(drv, cfg.device_id);
+
+        const char *cur = strstr(json, "\"current\"");
+        if (!cur) return;
+        long id = jsonLong(cur, "id", 0);
+        char ext[16] = "";
+        jsonStr(cur, "ext", ext, sizeof(ext));
+        if (id <= 0) return;
+
+        if (extIsVideo(ext)) {
+            /* Can't play video — confirm readiness so the channel dwells
+             * normally instead of waiting out the readiness timeout. */
+            if (g_last_ready_id != id) {
+                g_last_ready_id = id;
+                char msg[160];
+                snprintf(msg, sizeof(msg),
+                         "{\"sessionId\":\"" SESSION_ID "\",\"action\":\"imageReady\","
+                         "\"payload\":{\"id\":%ld}}", id);
+                wsSendText(s, msg);
+                setToast("video post (not supported) - dwelling", 0, 3000);
+            }
+            return;
+        }
+        if (id == g_slot[g_front].id || id == g_req_id) return;
+        g_req_id = id;
         g_req_replay = 0;
         g_want_next = 1;
+    } else if (!strcmp(action, "tagLists")) {
+        parseTagLists((const unsigned char *)json, (int)strlen(json));
+    } else if (!strcmp(action, "displayState")) {
+        char target[64] = "", state[16] = "";
+        jsonStr(json, "target", target, sizeof(target));
+        if (strcmp(target, cfg.device_id) != 0) return;
+        const char *p = jsonFind(json, "state");
+        int on;
+        if (p && (*p == 't' || *p == 'f')) on = *p == 't';
+        else if (jsonStr(json, "state", state, sizeof(state)) == 0)
+            on = strcasecmp(state, "off") != 0;
+        else return;
+        setDisplayPower(s, on, 1);
     }
+    /* pong / update / everything else: ignore */
+}
+
+static int wsThread(SceSize args, void *argp) {
+    /* net init happens on the fetch thread; wait for it */
+    while (g_running && !g_net_ready) sceKernelDelayThread(200 * 1000);
+
+    int backoff_s = 2;
+    while (g_running && !g_ws_denied) {
+        char path[512];
+        snprintf(path, sizeof(path), "/rpc/ws?token=%s", cfg.token);
+        int s = wsConnect(cfg.host, cfg.port, path);
+        if (s < 0) {
+            sceKernelDelayThread(backoff_s * 1000 * 1000);
+            if (backoff_s < 30) backoff_s *= 2;
+            continue;
+        }
+        backoff_s = 2;
+
+        /* Join the channel. The variant fingerprint must match our /get
+         * parameters so server prefetch converts the right bytes. */
+        char cfgmsg[384];
+        snprintf(cfgmsg, sizeof(cfgmsg),
+                 "{\"sessionId\":\"" SESSION_ID "\",\"action\":\"slideshowConfig\","
+                 "\"payload\":{\"deviceId\":\"%s\",\"interval\":%d,"
+                 "\"ratio\":1.765,\"width\":%d,\"height\":%d,"
+                 "\"lowmem\":%s}}",
+                 cfg.device_id, cfg.dwell_sec * 1000, SCR_W, SCR_H,
+                 cfg.lowmem ? "true" : "false");
+        if (wsSendText(s, cfgmsg) < 0) { wsClose(s); continue; }
+        g_ws_up = 1;
+        setToast("sync: connected", 0, 2000);
+
+        static char rxbuf[24 * 1024];
+        u64 last_rx, now, freq = sceRtcGetTickResolution();
+        sceRtcGetCurrentTick(&last_rx);
+
+        while (g_running) {
+            while (g_outq_r != g_outq_w) {
+                if (wsSendText(s, g_outq[g_outq_r]) < 0) goto drop;
+                g_outq_r = (g_outq_r + 1) % OUTQ_N;
+            }
+            int code = 0;
+            int n = wsPoll(s, rxbuf, sizeof(rxbuf), 200, &code);
+            if (n < 0) {
+                if (code == 1008) g_ws_denied = 1;
+                break;
+            }
+            sceRtcGetCurrentTick(&now);
+            if (n > 0) {
+                last_rx = now;
+                handleWsFrame(s, rxbuf);
+            } else if ((now - last_rx) / freq > 45) {
+                break; /* no traffic (broker pings every few s) — dead */
+            }
+        }
+drop:
+        g_ws_up = 0;
+        g_we_are_driver = 0;
+        wsClose(s);
+        if (g_ws_denied) {
+            setStatus("ws: token rejected (1008)", 1);
+        } else if (g_running) {
+            setToast("sync: reconnecting", 1, 3000);
+            sceKernelDelayThread(2 * 1000 * 1000);
+        }
+    }
+    return 0;
 }
 
 static int fetchThread(SceSize args, void *argp) {
@@ -753,6 +956,7 @@ static int fetchThread(SceSize args, void *argp) {
         snprintf(msg, sizeof(msg), "connected: %s", info.ip);
         setStatus(msg, 0);
     }
+    g_net_ready = 1;
 
     int unsupported_streak = 0;
     while (g_running) {
@@ -907,6 +1111,15 @@ int main(void) {
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 
+    /* Kernel display-power helper: only loads on CFW; everywhere else we
+     * soft-blank. Loaded before threads so g_hw_display is settled. */
+    SceUID kmod = sceKernelLoadModule("kdisp.prx", 0, NULL);
+    if (kmod >= 0) {
+        int st;
+        if (sceKernelStartModule(kmod, 0, NULL, &st, NULL) >= 0)
+            g_hw_display = 1;
+    }
+
     if (!cfg.host[0]) {
         setStatus("config.txt missing host= — see README", 1);
     } else {
@@ -914,6 +1127,9 @@ int main(void) {
                                             0x40000, PSP_THREAD_ATTR_USER, 0);
         if (thid >= 0) sceKernelStartThread(thid, 0, 0);
         else setStatus("fetch thread failed", 1);
+        SceUID wsid = sceKernelCreateThread("ws", wsThread, 0x26,
+                                            0x10000, PSP_THREAD_ATTR_USER, 0);
+        if (wsid >= 0) sceKernelStartThread(wsid, 0, 0);
     }
 
     u64 dwell_start = 0, tick_freq = sceRtcGetTickResolution();
@@ -946,11 +1162,22 @@ int main(void) {
             if (pressed & PSP_CTRL_CROSS) {
                 g_active_list = list_sel;
                 list_mode = 0;
-                char msg[32];
-                if (list_sel < 0) snprintf(msg, sizeof(msg), "list: auto");
-                else snprintf(msg, sizeof(msg), "list %d selected", list_sel);
-                setToast(msg, 0, 2000);
-                if (idle) { g_req_id = -1; g_req_replay = 0; g_want_next = 1; }
+                char msg[96];
+                if (g_ws_up && list_sel >= 0) {
+                    /* server-side: per-channel selection, next playback
+                     * frame arrives against the new list */
+                    snprintf(msg, sizeof(msg),
+                             "{\"sessionId\":\"" SESSION_ID "\","
+                             "\"action\":\"setTagList\","
+                             "\"payload\":{\"listNumber\":%d}}", list_sel);
+                    wsEnqueue(msg);
+                    setToast("list sent to server", 0, 2000);
+                } else {
+                    if (list_sel < 0) snprintf(msg, sizeof(msg), "list: auto");
+                    else snprintf(msg, sizeof(msg), "list %d selected", list_sel);
+                    setToast(msg, 0, 2000);
+                    if (idle) { g_req_id = -1; g_req_replay = 0; g_want_next = 1; }
+                }
             }
             if (pressed & (PSP_CTRL_CIRCLE | PSP_CTRL_TRIANGLE)) list_mode = 0;
         } else {
@@ -959,11 +1186,16 @@ int main(void) {
                     g_hist_pos++;
                     g_req_id = g_hist[g_hist_pos];
                     g_req_replay = 1;
+                    g_want_next = 1;
+                } else if (g_ws_up) {
+                    /* server advances the channel; playback frame follows */
+                    wsEnqueue("{\"sessionId\":\"" SESSION_ID "\","
+                              "\"action\":\"requestNext\",\"payload\":{}}");
                 } else {
                     g_req_id = -1;
                     g_req_replay = 0;
+                    g_want_next = 1;
                 }
-                g_want_next = 1;
             }
             if ((pressed & PSP_CTRL_LEFT) && idle) {
                 if (g_hist_pos > 0) {
@@ -998,17 +1230,31 @@ int main(void) {
                 if (g_lists_count < 0 && g_action == ACT_NONE)
                     g_action = ACT_LISTS;
             }
+            if (pressed & PSP_CTRL_SQUARE) {
+                if (g_ws_up) {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg),
+                             "{\"sessionId\":\"" SESSION_ID "\","
+                             "\"action\":\"displaySync\","
+                             "\"payload\":{\"enabled\":%s}}",
+                             g_we_are_driver ? "false" : "true");
+                    wsEnqueue(msg);
+                    setToast(g_we_are_driver ? "releasing display sync"
+                                             : "claiming display sync", 0, 2500);
+                } else {
+                    setToast("display sync needs the ws session", 1, 2500);
+                }
+            }
             if (pressed & PSP_CTRL_START) paused = !paused;
             if (pressed & PSP_CTRL_SELECT) cfg.clock_on = !cfg.clock_on;
         }
 
-        /* --- dwell timer --- */
-        /* Only arm while idle: once a fetch or fade is in flight the timer
-         * must stay quiet, or the still-expired deadline re-arms want_next
-         * mid-fade and two advances land back to back. */
+        /* --- dwell timer (standalone mode only — the server drives the
+         * cadence through playback frames while the WS session is up) --- */
         u64 now;
         sceRtcGetCurrentTick(&now);
-        if (!paused && g_have_image && !g_want_next && !g_incoming &&
+        if (!g_ws_up && g_display_on &&
+            !paused && g_have_image && !g_want_next && !g_incoming &&
             fade_step < 0 &&
             (now - dwell_start) / tick_freq >= (u64)cfg.dwell_sec)
             g_want_next = 1;
@@ -1020,7 +1266,7 @@ int main(void) {
 
         /* --- advance GIF animation on the visible slot --- */
         Slot *front = &g_slot[g_front];
-        if (front->anim && front->nframes > 1 && fade_step < 0) {
+        if (g_display_on && front->anim && front->nframes > 1 && fade_step < 0) {
             if (front->next_frame_tick == 0)
                 front->next_frame_tick =
                     now + (u64)front->delays_ms[front->frame] * (tick_freq / 1000);
@@ -1042,7 +1288,10 @@ int main(void) {
         sceGuClearColor(0xFF000000);
         sceGuClear(GU_COLOR_BUFFER_BIT);
 
-        if (fade_step >= 0) {
+        if (!g_display_on) {
+            /* panel off (hw-dark on CFW, soft-black elsewhere): keep the
+             * loop alive for WS/input, draw nothing */
+        } else if (fade_step >= 0) {
             /* True crossfade: old fades out while new fades in, so an old
              * image wider than its successor doesn't linger at the edges
              * and pop out when the fade ends. */
@@ -1056,7 +1305,21 @@ int main(void) {
                 g_have_image = 1;
                 fade_step = -1;
                 g_slot[g_front].next_frame_tick = 0;
-                if (!g_incoming_replay) histAppend(g_slot[g_front].id);
+                if (!g_incoming_replay) {
+                    histAppend(g_slot[g_front].id);
+                    /* server-driven mode: confirm the transition so the
+                     * channel's dwell starts (readiness barrier) */
+                    if (g_ws_up && g_last_ready_id != g_slot[g_front].id) {
+                        g_last_ready_id = g_slot[g_front].id;
+                        char msg[160];
+                        snprintf(msg, sizeof(msg),
+                                 "{\"sessionId\":\"" SESSION_ID "\","
+                                 "\"action\":\"imageReady\","
+                                 "\"payload\":{\"id\":%ld}}",
+                                 g_slot[g_front].id);
+                        wsEnqueue(msg);
+                    }
+                }
                 g_incoming_replay = 0;
                 block_arm_id = 0; /* image changed — disarm block confirm */
                 sceRtcGetCurrentTick(&dwell_start);
@@ -1071,7 +1334,7 @@ int main(void) {
             g_status_until = 0;
         }
 
-        if (font) {
+        if (font && g_display_on) {
             intraFontActivate(font);
             if (list_mode) {
                 drawRect(40, 96, SCR_W - 40, 176, 0xC0000000);

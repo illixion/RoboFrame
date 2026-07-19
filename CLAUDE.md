@@ -45,14 +45,18 @@ Spatialstash is a separate app that implements the same protocol in Swift, it is
   (or no evdev, e.g. macOS) falls back to the pygame/X-focus path. Video
   embeds via `--wid` purely for correct rendering/stacking, not input.
 - `psp-kiosk/` — native Sony PSP homebrew client (C + pspdev SDK, GU
-  rendering, intraFont clock overlay). One-shot HTTP pull client:
-  `/random?json=1` to pick a post (skips videos) then
-  `/get?id=&width=480&height=272&lowmem=1`, decoded with libjpeg-turbo,
-  crossfaded on the GPU. Does NOT speak the WS protocol (yet) — it's a
-  standalone dumb display, not an orchestrator session. Build with the
-  pspdev toolchain (`~/pspdev`), test in PPSSPP ≥1.19 with
-  `EnableWlan = True`; see its README for emulator quirks (flash0 font
-  fallback, EAGAIN sockets, intraFont's depth-test flip).
+  rendering, intraFont clock overlay). Full WS slideshow session
+  (`sessionId "main"`, hand-rolled RFC6455 in `ws.c`): server-pushed
+  `playback` ids fetched via `/get?width=480&height=272&lowmem=1`
+  (JPEG via libjpeg-turbo, animated lowmem GIF via giflib), `imageReady`
+  confirmations, `displayState` → panel off/on through `kdisp.prx` (tiny
+  kernel PRX wrapping sceDisplayEnable/Disable; CFW only, soft-blank
+  fallback) + `present`/`reportDisplay` so HA gets a light entity.
+  Falls back to a standalone HTTP `/random` dwell loop when the socket
+  is down. Build with the pspdev toolchain (`~/pspdev`), test in
+  PPSSPP ≥1.19 with `EnableWlan = True`; see its README for emulator
+  quirks (flash0 font fallback, EAGAIN sockets, intraFont's
+  depth-test flip).
 - `gpio-agent/` — Python 3 daemon that bridges Pi hardware to the rest
   of the stack: PIR motion sensor → HTTP POST to node-display's
   `/pir/motion` + `/pir/clear` (port 8765), 4x4 matrix keypad → uinput
