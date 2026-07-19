@@ -14,6 +14,7 @@
 #include <psprtc.h>
 #include <psppower.h>
 #include <psputility.h>
+#include <pspsuspend.h>
 #include <pspnet.h>
 #include <pspnet_inet.h>
 #include <pspnet_apctl.h>
@@ -36,12 +37,22 @@
 
 #include "ws.h"
 
-/* kdisp.prx syscall export (weak import — only call when g_hw_display). */
+/* kdisp.prx syscall exports (weak import — only call when g_hw_display). */
 int kdispSetDisplay(int on);
+int kdispHasLcdPower(void);
 
 PSP_MODULE_INFO("RoboFramePSP", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
-PSP_HEAP_SIZE_KB(-1024);
+/* FIXED 14 MB heap — never use negative ("all but N") sizing here.
+ * Thread stacks, kdisp.prx AND the real net PRXs (sceUtilityLoadNetModule
+ * + the sceNetInit pool) all come from the remaining free user memory on
+ * hardware; PPSSPP HLEs the net modules, so a too-greedy heap only fails
+ * on a real PSP. Measured on 6.60 PRO-B10: -6144 left just 164 K free
+ * (max block 84 K) — negative sizing does not behave there, net init and
+ * thread creation died with NO_MEMORY/FAILED_ALLOC_MEMBLOCK. 14 MB
+ * covers the two 1 MB textures + HTTP/GIF buffers; oversized GIF
+ * animations already degrade gracefully. */
+PSP_HEAP_SIZE_KB(14 * 1024);
 
 #define SCR_W 480
 #define SCR_H 272
@@ -288,7 +299,7 @@ static char *findHeader(char *haystack, const char *needle) {
 
 /* ------------------------------------------------------------------- net */
 
-static int netInitOnce(void) {
+static int netInitOnce(const char **step) {
     int rc;
     /* libcglue also imports sceUtilityGetSystemParamInt, but only gets
      * linked after build.mak's SDK libs — referencing it here keeps all
@@ -296,10 +307,36 @@ static int netInitOnce(void) {
      * import table ("stubs out of order"). */
     int tz = 0;
     sceUtilityGetSystemParamInt(PSP_SYSTEMPARAM_ID_INT_TIMEZONE, &tz);
-    if ((rc = sceUtilityLoadNetModule(PSP_NET_MODULE_COMMON)) < 0) return rc;
-    if ((rc = sceUtilityLoadNetModule(PSP_NET_MODULE_INET)) < 0) return rc;
+    /* On real firmware utility modules load into the 4 MB volatile memory
+     * block (partition 5), which homebrew launched from the XMB may hold
+     * locked — then sceUtilityLoadNetModule dies with FAILED_ALLOC_MEMBLOCK
+     * (0x800200D9) no matter how much user RAM is free. Unlock it first;
+     * harmless error if it wasn't locked. PPSSPP HLEs the loads, so this
+     * only matters on hardware. */
+    sceKernelVolatileMemUnlock(0);
+    /* 0x80110F02 = module already loaded (e.g. after a soft relaunch on
+     * CFW) — not a failure. Loads are retried: right after boot the module
+     * loader can fail transiently while the memory stick / XMB residue
+     * settles. */
+    *step = "utility common";
+    for (int try = 0; try < 5; try++) {
+        rc = sceUtilityLoadNetModule(PSP_NET_MODULE_COMMON);
+        if (rc >= 0 || rc == (int)0x80110F02) break;
+        sceKernelDelayThread(400 * 1000);
+    }
+    if (rc < 0 && rc != (int)0x80110F02) return rc;
+    *step = "utility inet";
+    for (int try = 0; try < 5; try++) {
+        rc = sceUtilityLoadNetModule(PSP_NET_MODULE_INET);
+        if (rc >= 0 || rc == (int)0x80110F02) break;
+        sceKernelDelayThread(400 * 1000);
+    }
+    if (rc < 0 && rc != (int)0x80110F02) return rc;
+    *step = "sceNetInit";
     if ((rc = sceNetInit(128 * 1024, 42, 4 * 1024, 42, 4 * 1024)) < 0) return rc;
+    *step = "sceNetInetInit";
     if ((rc = sceNetInetInit()) < 0) return rc;
+    *step = "sceNetApctlInit";
     if ((rc = sceNetApctlInit(0x8000, 48)) < 0) return rc;
     return 0;
 }
@@ -943,12 +980,16 @@ drop:
 }
 
 static int fetchThread(SceSize args, void *argp) {
-    setStatus("loading net modules", 0);
-    int rc = netInitOnce();
-    if (rc < 0) { setStatus("net init failed", 1); return 0; }
-
+    int rc;
     setStatus("connecting to wifi", 0);
-    if (wifiConnect() < 0) { setStatus("wifi connect failed", 1); return 0; }
+    if ((rc = wifiConnect()) < 0) {
+        char err[96];
+        /* 0x80410A0B/0x80410D09-family: WLAN switch is off. */
+        snprintf(err, sizeof(err), "wifi connect failed 0x%08X%s", rc,
+                 (rc & 0xFFFF0000) == (int)0x80410000 ? " (WLAN switch?)" : "");
+        setStatus(err, 1);
+        return 0;
+    }
 
     union SceNetApctlInfo info;
     if (sceNetApctlGetInfo(PSP_NET_APCTL_INFO_IP, &info) == 0) {
@@ -1111,6 +1152,24 @@ int main(void) {
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 
+    /* Net module loading happens HERE, on the main thread, before kdisp
+     * and before any worker thread exists: on real firmware
+     * sceUtilityLoadNetModule is picky about the calling context (PPSSPP
+     * HLEs it and doesn't care — this only ever failed on hardware). */
+    setStatus("loading net modules", 0);
+    const char *step = "?";
+    int net_ok = 0;
+    int rc = netInitOnce(&step);
+    if (rc < 0) {
+        char err[96];
+        snprintf(err, sizeof(err), "net init failed: %s 0x%08X (free %dK max %dK)",
+                 step, rc, sceKernelTotalFreeMemSize() / 1024,
+                 sceKernelMaxFreeMemSize() / 1024);
+        setStatus(err, 1);
+    } else {
+        net_ok = 1;
+    }
+
     /* Kernel display-power helper: only loads on CFW; everywhere else we
      * soft-blank. Loaded before threads so g_hw_display is settled. */
     SceUID kmod = sceKernelLoadModule("kdisp.prx", 0, NULL);
@@ -1119,14 +1178,28 @@ int main(void) {
         if (sceKernelStartModule(kmod, 0, NULL, &st, NULL) >= 0)
             g_hw_display = 1;
     }
+    setToast(!g_hw_display          ? "display: soft blank (no kdisp)"
+             : kdispHasLcdPower()   ? "display: backlight control"
+                                    : "display: engine only", 0, 5000);
 
     if (!cfg.host[0]) {
         setStatus("config.txt missing host= — see README", 1);
-    } else {
+    } else if (net_ok) {
+        /* 128 KB stack: decode buffers live on the heap; the real net
+         * modules now occupy part of the free region this stack comes
+         * from, and 256 KB stopped fitting on hardware. */
         SceUID thid = sceKernelCreateThread("fetch", fetchThread, 0x25,
-                                            0x40000, PSP_THREAD_ATTR_USER, 0);
-        if (thid >= 0) sceKernelStartThread(thid, 0, 0);
-        else setStatus("fetch thread failed", 1);
+                                            0x20000, PSP_THREAD_ATTR_USER, 0);
+        if (thid >= 0) {
+            sceKernelStartThread(thid, 0, 0);
+        } else {
+            char err[96];
+            snprintf(err, sizeof(err),
+                     "fetch thread failed 0x%08X (free %dK max %dK)", thid,
+                     sceKernelTotalFreeMemSize() / 1024,
+                     sceKernelMaxFreeMemSize() / 1024);
+            setStatus(err, 1);
+        }
         SceUID wsid = sceKernelCreateThread("ws", wsThread, 0x26,
                                             0x10000, PSP_THREAD_ATTR_USER, 0);
         if (wsid >= 0) sceKernelStartThread(wsid, 0, 0);
@@ -1391,6 +1464,8 @@ int main(void) {
 
     if (font) intraFontUnload(font);
     intraFontShutdown();
+    /* Never hand a powered-off LCD back to the XMB. */
+    if (g_hw_display && !g_display_on) kdispSetDisplay(1);
     sceGuTerm();
     sceKernelExitGame();
     return 0;
