@@ -1,0 +1,29 @@
+# RoboFrame PSP kiosk config — copy to config.txt next to EBOOT.PBP.
+# imagemirror must be reachable over plain HTTP from the PSP's network
+# (bind it to the LAN, not localhost).
+
+host=192.168.1.10
+port=3123
+token=CHANGE_ME
+
+# PSP saved-network profile index to connect with (Settings > Network
+# Settings > Infrastructure Mode; first saved connection = 1).
+wifi_profile=1
+
+# Seconds each image stays up, and crossfade duration.
+dwell_sec=20
+fade_ms=700
+
+# Shown in imagemirror's /history device buckets.
+device_id=psp-kiosk
+
+# Extra query appended verbatim to /random — must start with '&' and be
+# URL-encoded, e.g. &q=ratio%3A1.5..2.0
+extra_query=
+
+# 1 = HH:MM overlay bottom-right (SELECT toggles at runtime).
+clock=1
+clock_size=1.4
+
+# 1 = ask the server for lower JPEG quality (smaller downloads over 802.11b).
+lowmem=1

@@ -44,6 +44,15 @@ Spatialstash is a separate app that implements the same protocol in Swift, it is
   clip. Needs the kiosk user in the `input` group; `grabKeyboard: false`
   (or no evdev, e.g. macOS) falls back to the pygame/X-focus path. Video
   embeds via `--wid` purely for correct rendering/stacking, not input.
+- `psp-kiosk/` — native Sony PSP homebrew client (C + pspdev SDK, GU
+  rendering, intraFont clock overlay). One-shot HTTP pull client:
+  `/random?json=1` to pick a post (skips videos) then
+  `/get?id=&width=480&height=272&lowmem=1`, decoded with libjpeg-turbo,
+  crossfaded on the GPU. Does NOT speak the WS protocol (yet) — it's a
+  standalone dumb display, not an orchestrator session. Build with the
+  pspdev toolchain (`~/pspdev`), test in PPSSPP ≥1.19 with
+  `EnableWlan = True`; see its README for emulator quirks (flash0 font
+  fallback, EAGAIN sockets, intraFont's depth-test flip).
 - `gpio-agent/` — Python 3 daemon that bridges Pi hardware to the rest
   of the stack: PIR motion sensor → HTTP POST to node-display's
   `/pir/motion` + `/pir/clear` (port 8765), 4x4 matrix keypad → uinput

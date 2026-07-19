@@ -1,0 +1,10 @@
+# Per-install config (contains the access token)
+config.txt
+# PPSSPP's open-source firmware font substitute, copied locally for
+# emulator testing — not ours to redistribute
+ltn0.pgf
+# Build artifacts
+*.o
+*.elf
+PARAM.SFO
+EBOOT.PBP
