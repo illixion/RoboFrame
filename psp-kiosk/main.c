@@ -31,6 +31,7 @@
 #include <string.h>
 
 #include <turbojpeg.h>
+#include <gif_lib.h>
 #include <intraFont.h>
 
 PSP_MODULE_INFO("RoboFramePSP", 0, 1, 0);
@@ -118,9 +119,40 @@ static void setupCallbacks(void) {
  * a single writer per field are sufficient — no atomics needed. */
 
 typedef struct {
-    unsigned int *pixels;   /* BUF_W * TEX_H RGBA, 16-byte aligned */
+    unsigned int *pixels;   /* BUF_W * TEX_H RGBA, 16-byte aligned — the
+                             * texture the GE samples (current frame) */
     int w, h;               /* valid image area */
+    /* Animated GIFs: packed w*h RGBA frames + per-frame delays. Static
+     * images leave anim NULL / nframes 1. */
+    unsigned char *anim;
+    unsigned int *delays_ms;
+    int nframes, frame;
+    u64 next_frame_tick;
 } Slot;
+
+/* Cap on decoded animation storage per slot. Two slots can be live at
+ * once and the PSP-1000 only has ~24 MB of user RAM. */
+#define MAX_ANIM_BYTES (6 * 1024 * 1024)
+
+static void slotFreeAnim(Slot *s) {
+    free(s->anim);
+    free(s->delays_ms);
+    s->anim = NULL;
+    s->delays_ms = NULL;
+    s->nframes = 1;
+    s->frame = 0;
+}
+
+/* Copy packed frame n into the slot's strided texture and flush it out of
+ * the dcache so the GE sees it. */
+static void slotShowFrame(Slot *s, int n) {
+    if (!s->anim || n >= s->nframes) return;
+    const unsigned char *src = s->anim + (size_t)n * s->w * s->h * 4;
+    for (int y = 0; y < s->h; y++)
+        memcpy(s->pixels + y * BUF_W, src + (size_t)y * s->w * 4, s->w * 4);
+    sceKernelDcacheWritebackRange(s->pixels, BUF_W * s->h * 4);
+    s->frame = n;
+}
 
 static Slot g_slot[2];
 static volatile int g_front = 0;          /* slot the main thread displays */
@@ -390,12 +422,127 @@ static long pickPostId(void) {
     return -1;
 }
 
-/* Fetch + decode one image into slot. Returns 0 on success. */
+/* ------------------------------------------------------------ gif decode */
+
+typedef struct { const unsigned char *buf; int len, pos; } GifMem;
+
+static int gifMemRead(GifFileType *g, GifByteType *out, int n) {
+    GifMem *m = g->UserData;
+    if (n > m->len - m->pos) n = m->len - m->pos;
+    memcpy(out, m->buf + m->pos, n);
+    m->pos += n;
+    return n;
+}
+
+/* Composite one GIF raster onto the RGBA canvas, honoring per-frame
+ * palette, offset, transparency and interlacing. */
+static void gifBlitFrame(unsigned int *canvas, int cw, int ch,
+                         GifFileType *gif, SavedImage *img, int transparent) {
+    GifImageDesc *d = &img->ImageDesc;
+    ColorMapObject *cmap = d->ColorMap ? d->ColorMap : gif->SColorMap;
+    if (!cmap) return;
+    static const int ipass_start[] = { 0, 4, 2, 1 };
+    static const int ipass_step[]  = { 8, 8, 4, 2 };
+    int row = 0;
+    for (int pass = 0; pass < (d->Interlace ? 4 : 1); pass++) {
+        int ystart = d->Interlace ? ipass_start[pass] : 0;
+        int ystep  = d->Interlace ? ipass_step[pass] : 1;
+        for (int y = ystart; y < d->Height; y += ystep, row++) {
+            int cy = d->Top + y;
+            if (cy < 0 || cy >= ch) continue;
+            const GifByteType *src = img->RasterBits + (size_t)row * d->Width;
+            unsigned int *dst = canvas + (size_t)cy * cw;
+            for (int x = 0; x < d->Width; x++) {
+                int cx = d->Left + x;
+                int ci = src[x];
+                if (cx < 0 || cx >= cw || ci == transparent ||
+                    ci >= cmap->ColorCount)
+                    continue;
+                GifColorType c = cmap->Colors[ci];
+                dst[cx] = 0xFF000000u | ((unsigned int)c.Blue << 16) |
+                          ((unsigned int)c.Green << 8) | c.Red;
+            }
+        }
+        if (!d->Interlace) break;
+    }
+}
+
+/* Decode an animated GIF into slot->anim (packed RGBA frames) and stage
+ * frame 0. Frames beyond MAX_ANIM_BYTES are dropped. Returns 0 on success. */
+static int decodeGif(Slot *slot, const unsigned char *buf, int len) {
+    GifMem mem = { buf, len, 0 };
+    int gerr = 0;
+    GifFileType *gif = DGifOpen(&mem, gifMemRead, &gerr);
+    if (!gif) { setStatus("gif open failed", 1); return -1; }
+    if (DGifSlurp(gif) != GIF_OK || gif->ImageCount < 1) {
+        DGifCloseFile(gif, &gerr);
+        setStatus("gif decode failed", 1);
+        return -1;
+    }
+    int w = gif->SWidth, h = gif->SHeight;
+    if (w <= 0 || h <= 0 || w > BUF_W || h > TEX_H) {
+        DGifCloseFile(gif, &gerr);
+        setStatus("gif too large", 1);
+        return -1;
+    }
+
+    size_t frame_bytes = (size_t)w * h * 4;
+    int max_frames = (int)(MAX_ANIM_BYTES / frame_bytes);
+    int nframes = gif->ImageCount < max_frames ? gif->ImageCount : max_frames;
+    if (nframes < 1) nframes = 1;
+
+    slotFreeAnim(slot);
+    unsigned char *anim = malloc((size_t)nframes * frame_bytes);
+    unsigned int *delays = malloc(nframes * sizeof(unsigned int));
+    unsigned int *canvas = malloc(frame_bytes);
+    if (!anim || !delays || !canvas) {
+        free(anim); free(delays); free(canvas);
+        DGifCloseFile(gif, &gerr);
+        setStatus("gif: out of memory", 1);
+        return -1;
+    }
+    /* Opaque black canvas: we composite over black anyway, and it keeps
+     * every texel opaque for the crossfade blend. */
+    for (size_t i = 0; i < frame_bytes / 4; i++) canvas[i] = 0xFF000000u;
+
+    for (int i = 0; i < nframes; i++) {
+        GraphicsControlBlock gcb = { .DelayTime = 10, .TransparentColor = -1,
+                                     .DisposalMode = DISPOSAL_UNSPECIFIED };
+        DGifSavedExtensionToGCB(gif, i, &gcb);
+        gifBlitFrame(canvas, w, h, gif, &gif->SavedImages[i], gcb.TransparentColor);
+        memcpy(anim + (size_t)i * frame_bytes, canvas, frame_bytes);
+        unsigned int ms = (unsigned int)gcb.DelayTime * 10;
+        delays[i] = ms < 20 ? 100 : ms;
+        /* Post-frame disposal. PREVIOUS is approximated as BACKGROUND —
+         * black — rather than keeping a second canvas copy around. */
+        if (gcb.DisposalMode == DISPOSE_BACKGROUND ||
+            gcb.DisposalMode == DISPOSE_PREVIOUS) {
+            GifImageDesc *d = &gif->SavedImages[i].ImageDesc;
+            for (int y = d->Top; y < d->Top + d->Height && y < h; y++)
+                for (int x = d->Left; x < d->Left + d->Width && x < w; x++)
+                    if (y >= 0 && x >= 0) canvas[(size_t)y * w + x] = 0xFF000000u;
+        }
+    }
+    free(canvas);
+    DGifCloseFile(gif, &gerr);
+
+    slot->anim = anim;
+    slot->delays_ms = delays;
+    slot->nframes = nframes;
+    slot->w = w;
+    slot->h = h;
+    memset(slot->pixels, 0, BUF_W * TEX_H * 4);
+    slotShowFrame(slot, 0);
+    return 0;
+}
+
+/* Fetch + decode one image into slot. Returns 0 on success, -1 on a
+ * transport/server error (worth backing off), -2 on unsupported content
+ * (re-pick another post immediately). */
 static int fetchImage(Slot *slot) {
     long id = pickPostId();
     if (id < 0) return -1;
 
-    setStatus("downloading...", 0);
     char path[768];
     snprintf(path, sizeof(path),
              "/get?id=%ld&token=%s&width=%d&height=%d&lowmem=%d&deviceId=%s",
@@ -410,12 +557,17 @@ static int fetchImage(Slot *slot) {
         free(body);
         return -1;
     }
-    if (strncasecmp(ctype, "image/jpeg", 10) != 0) {
-        char msg[96];
-        snprintf(msg, sizeof(msg), "skipping non-jpeg: %s", ctype);
-        setStatus(msg, 1);
+    if (strncasecmp(ctype, "image/gif", 9) == 0) {
+        int rc = decodeGif(slot, body, blen);
         free(body);
-        return -1;
+        if (rc == 0) setStatus("", 0);
+        return rc;
+    }
+    if (strncasecmp(ctype, "image/jpeg", 10) != 0) {
+        /* e.g. animated WebP from a server without the GIF lowmem variant —
+         * not an error worth stalling on, just draw a different post */
+        free(body);
+        return -2;
     }
 
     tjhandle tj = tjInitDecompress();
@@ -428,6 +580,7 @@ static int fetchImage(Slot *slot) {
         setStatus("jpeg header rejected", 1);
         return -1;
     }
+    slotFreeAnim(slot);
     memset(slot->pixels, 0, BUF_W * TEX_H * 4);
     int rc = tjDecompress2(tj, body, blen, (unsigned char *)slot->pixels,
                            w, BUF_W * 4, h, TJPF_RGBA, TJFLAG_FASTDCT);
@@ -465,18 +618,29 @@ static int fetchThread(SceSize args, void *argp) {
         setStatus(msg, 0);
     }
 
+    int unsupported_streak = 0;
     while (g_running) {
         if (!g_want_next || g_incoming) {
             sceKernelDelayThread(50 * 1000);
             continue;
         }
         int back = g_front ^ 1;
-        if (fetchImage(&g_slot[back]) == 0) {
+        int rc = fetchImage(&g_slot[back]);
+        if (rc == 0) {
             g_want_next = 0;
             g_incoming = 1;
+        } else if (rc == -2) {
+            /* unsupported content: try another post right away, but don't
+             * hammer a library that's mostly unsupported formats */
+            if (++unsupported_streak >= 4) {
+                unsupported_streak = 0;
+                sceKernelDelayThread(5 * 1000 * 1000);
+            }
+            continue;
         } else {
             sceKernelDelayThread(5 * 1000 * 1000); /* error → retry in 5 s */
         }
+        unsupported_streak = 0;
     }
     return 0;
 }
@@ -559,6 +723,17 @@ static void drawSlot(const Slot *s, int alpha) {
     sceGuDrawArray(GU_SPRITES, VFMT, i, 0, v);
 }
 
+/* Untextured translucent rectangle (text backdrops). */
+static void drawRect(int x0, int y0, int x1, int y1, unsigned int color) {
+    sceGuDisable(GU_TEXTURE_2D);
+    Vertex *v = sceGuGetMemory(2 * sizeof(Vertex));
+    v[0] = (Vertex){ 0, 0, color, (short)x0, (short)y0, 0 };
+    v[1] = (Vertex){ 0, 0, color, (short)x1, (short)y1, 0 };
+    sceKernelDcacheWritebackRange(v, 2 * sizeof(Vertex));
+    sceGuDrawArray(GU_SPRITES, VFMT, 2, 0, v);
+    sceGuEnable(GU_TEXTURE_2D);
+}
+
 
 /* ------------------------------------------------------------------- main */
 
@@ -613,15 +788,33 @@ int main(void) {
         if (pressed & PSP_CTRL_SELECT) cfg.clock_on = !cfg.clock_on;
 
         /* --- dwell timer --- */
+        /* Only arm while idle: once a fetch or fade is in flight the timer
+         * must stay quiet, or the still-expired deadline re-arms want_next
+         * mid-fade and two advances land back to back. */
         u64 now;
         sceRtcGetCurrentTick(&now);
-        if (!paused && g_have_image &&
+        if (!paused && g_have_image && !g_want_next && !g_incoming &&
+            fade_step < 0 &&
             (now - dwell_start) / tick_freq >= (u64)cfg.dwell_sec)
             g_want_next = 1;
 
         /* --- take incoming image, start crossfade --- */
         if (g_incoming && fade_step < 0) {
             fade_step = g_have_image ? 0 : fade_frames; /* first image: cut */
+        }
+
+        /* --- advance GIF animation on the visible slot --- */
+        Slot *front = &g_slot[g_front];
+        if (front->anim && front->nframes > 1 && fade_step < 0) {
+            if (front->next_frame_tick == 0)
+                front->next_frame_tick =
+                    now + (u64)front->delays_ms[front->frame] * (tick_freq / 1000);
+            if (now >= front->next_frame_tick) {
+                int nf = (front->frame + 1) % front->nframes;
+                slotShowFrame(front, nf);
+                front->next_frame_tick =
+                    now + (u64)front->delays_ms[nf] * (tick_freq / 1000);
+            }
         }
 
         if (!(power_tick++ % 300)) scePowerTick(PSP_POWER_TICK_DISPLAY);
@@ -635,14 +828,19 @@ int main(void) {
         sceGuClear(GU_COLOR_BUFFER_BIT);
 
         if (fade_step >= 0) {
+            /* True crossfade: old fades out while new fades in, so an old
+             * image wider than its successor doesn't linger at the edges
+             * and pop out when the fade ends. */
             int a = fade_step * 255 / fade_frames;
-            drawSlot(&g_slot[g_front], 255);
+            drawSlot(&g_slot[g_front], 255 - a);
             drawSlot(&g_slot[g_front ^ 1], a);
             if (fade_step++ >= fade_frames) {
                 g_front ^= 1;
                 g_incoming = 0;
+                g_want_next = 0; /* drop any re-arm that raced the fade */
                 g_have_image = 1;
                 fade_step = -1;
+                g_slot[g_front].next_frame_tick = 0;
                 sceRtcGetCurrentTick(&dwell_start);
             }
         } else {
@@ -658,6 +856,10 @@ int main(void) {
                 snprintf(clk, sizeof(clk), "%02d:%02d", t.hour, t.minute);
                 intraFontSetStyle(font, cfg.clock_size, 0xDDFFFFFF, 0xFF000000,
                                   0.0f, INTRAFONT_ALIGN_RIGHT);
+                int tw = (int)intraFontMeasureText(font, clk);
+                int th = (int)(16.0f * cfg.clock_size);
+                drawRect(SCR_W - 8 - tw - 6, SCR_H - 10 - th - 2,
+                         SCR_W - 8 + 6, SCR_H - 10 + 6, 0x90000000);
                 intraFontPrint(font, SCR_W - 8, SCR_H - 10, clk);
             }
             if (g_status[0]) {

@@ -243,6 +243,48 @@ async function convertToAnimatedWebP(imageData) {
 }
 
 /**
+ * Convert an animated JXL to a size-capped animated GIF. Same djxl → APNG →
+ * per-frame split as convertToAnimatedWebP, but each frame is resized before
+ * the join and the result is GIF: this is the `lowmem=1` animated variant for
+ * clients that can't decode WebP at all (PSP kiosk) or only in software
+ * (Pi-class boards). 256 colors is the price of universal decodability.
+ * @param {Buffer} imageData - Raw JXL bytes.
+ * @param {number} [width] - Max output width (fit inside, no enlargement).
+ * @param {number} [height] - Max output height.
+ * @returns {Promise<Buffer>}
+ */
+async function convertToAnimatedGif(imageData, width, height) {
+  const apngBuf = await new Promise((resolve, reject) => {
+    const chunks = [];
+    let err = '';
+    const djxl = spawn(DJXL_PATH, ['-', '-', '--output_format', 'apng']);
+    djxl.stdout.on('data', (c) => chunks.push(c));
+    djxl.stderr.on('data', (c) => { err += c.toString(); });
+    djxl.on('error', (e) => reject(new Error(`djxl spawn failed: ${e.message}`)));
+    djxl.on('close', (code) => {
+      if (code !== 0) return reject(new Error(`djxl exit ${code}: ${err.trim()}`));
+      resolve(Buffer.concat(chunks));
+    });
+    djxl.stdin.on('error', () => {});
+    djxl.stdin.end(imageData);
+  });
+
+  const frames = splitApngFrames(apngBuf);
+  const delay = frames.map((f) => Math.round(((f.delayNum || 1) / (f.delayDen || 100)) * 1000));
+  // Frames are resized individually (identical source dims → identical output
+  // dims) because libvips' joined-animation resize needs page-height plumbing
+  // that per-frame PNG resize sidesteps.
+  const resized = await Promise.all(frames.map((f) =>
+    sharp(f.png)
+      .resize(width || null, height || null, { fit: 'inside', withoutEnlargement: true })
+      .png()
+      .toBuffer()));
+  return sharp(resized, { join: { animated: true } })
+    .gif({ loop: 0, delay, effort: 4 })
+    .toBuffer();
+}
+
+/**
  * Probe a JXL buffer with jxlinfo and resolve true if it's animated.
  * jxlinfo prints "JPEG XL animation" on the header line for animated files.
  * Resolves false on any failure — caller falls through to the static path.
@@ -688,8 +730,13 @@ async function computeVariant({ id, convert, bright, width, height, lowmem, wall
   const srcExt = path.extname(filePath).slice(1).toLowerCase();
 
   if (animatedMode) {
-    finalBuffer = await convertToAnimatedWebP(data);
-    finalMimeType = 'image/webp';
+    if (lowmem) {
+      finalBuffer = await convertToAnimatedGif(data, width, height);
+      finalMimeType = 'image/gif';
+    } else {
+      finalBuffer = await convertToAnimatedWebP(data);
+      finalMimeType = 'image/webp';
+    }
   } else if (wallpaper) {
     // Compose onto the requested canvas. JXL sources are decoded first since
     // sharp can't read them; everything else sharp handles directly.

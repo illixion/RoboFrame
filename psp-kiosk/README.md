@@ -1,9 +1,12 @@
 # psp-kiosk — RoboFrame client for the Sony PSP
 
 Native homebrew slideshow client that turns a PSP into a RoboFrame
-display. Fetches server-resized JPEGs from imagemirror over WiFi,
-renders double-buffered at vsync with alpha crossfades, and overlays a
-clock from the PSP's RTC. Videos are skipped (real kiosks play those).
+display. Fetches server-resized JPEGs (and low-res animated GIFs — the
+`lowmem=1` variant imagemirror builds for animated posts) from
+imagemirror over WiFi, renders double-buffered at vsync with alpha
+crossfades, and overlays a clock from the PSP's RTC. Videos are skipped
+(real kiosks play those); other unsupported formats trigger an
+immediate re-pick rather than an error.
 
 ## How it works
 

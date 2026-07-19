@@ -10,7 +10,7 @@ LIBDIR =
 LDFLAGS =
 # build.mak appends -lpspdebug -lpspdisplay -lpspge -lpspctrl -lpspnet
 # -lpspnet_apctl after this list; repeating them here breaks stub ordering.
-LIBS = -lintrafont -lturbojpeg -lpspgu -lpspgum -lpsprtc -lpsppower \
+LIBS = -lintrafont -lturbojpeg -lgif -lpspgu -lpspgum -lpsprtc -lpsppower \
        -lpsputility -lm
 
 EXTRA_TARGETS = EBOOT.PBP
