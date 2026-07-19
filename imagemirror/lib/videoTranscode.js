@@ -36,11 +36,16 @@ const { spawn } = require('child_process');
 
 // Cache entries carry the target height so a 720p and a 1080p request for the
 // same post don't collide. The matcher also sweeps up legacy `${id}.h264.mp4`
-// files (pre-height cache) so they age out of the size budget like any other.
-const CACHE_RE = /\.h264(?:\.\d+p)?\.mp4$/;
+// files (pre-height cache) and MJPEG variants so they age out of the size
+// budget like any other.
+const CACHE_RE = /\.h264(?:\.\d+p)?\.mp4$|\.mjpeg$/;
 
 function cacheName(id, maxHeight) {
   return `${id}.h264.${maxHeight}p.mp4`;
+}
+
+function mjpegName(id, { w, h, fps, sec }) {
+  return `${id}.${w}x${h}.${fps}fps.${sec}s.mjpeg`;
 }
 
 function createVideoTranscoder({
@@ -236,6 +241,49 @@ function createVideoTranscoder({
     });
   }
 
+  // MJPEG variant for decoder-poor clients (the PSP kiosk): a plain
+  // concatenation of JPEG frames the client splits on SOI markers and feeds
+  // to its JPEG decoder. Unlike the H.264 path this transcodes to the cache
+  // *first* and serves the finished file — the outputs are small (fps- and
+  // duration-capped), and a complete response with Content-Length is what a
+  // hand-rolled HTTP client on 802.11b wants. Silent by design (-an).
+  // Resolves to the cached path, or null when ffmpeg is missing/fails —
+  // the route turns that into an error the client treats as "skip".
+  const mjpegInflight = new Map();
+  function mjpeg(id, filePath, opts) {
+    const finalPath = path.join(cachePath, mjpegName(id, opts));
+    if (fs.existsSync(finalPath)) return Promise.resolve(finalPath);
+    if (mjpegInflight.has(finalPath)) return mjpegInflight.get(finalPath);
+    const job = fs.promises.mkdir(cachePath, { recursive: true }).then(() => new Promise((resolve) => {
+      const tempPath = path.join(cachePath, `.${id}.${process.pid}.${tempCounter++}.part`);
+      const scale = `scale=min(iw\\,${opts.w}):min(ih\\,${opts.h})`
+        + `:force_original_aspect_ratio=decrease,fps=${opts.fps}`;
+      const ff = spawn(ffmpegPath, [
+        '-hide_banner', '-loglevel', 'error',
+        '-i', filePath, '-t', String(opts.sec),
+        '-vf', scale, '-an', '-c:v', 'mjpeg', '-q:v', String(opts.q ?? 7),
+        '-f', 'mjpeg', '-y', tempPath,
+      ], { stdio: ['ignore', 'ignore', 'pipe'] });
+      let ffErr = '';
+      ff.stderr.on('data', (d) => { ffErr += d; });
+      ff.on('error', () => resolve(null));
+      ff.on('close', (code) => {
+        if (code === 0) {
+          fs.rename(tempPath, finalPath, (err) => {
+            if (err) { log.error(`mjpeg cache commit failed for ${id}: ${err.message}`); resolve(null); }
+            else { prune(); resolve(finalPath); }
+          });
+        } else {
+          fs.unlink(tempPath, () => {});
+          log.error(`mjpeg transcode failed for ${id} (ffmpeg exit ${code}): ${ffErr.trim().slice(0, 500)}`);
+          resolve(null);
+        }
+      });
+    })).finally(() => mjpegInflight.delete(finalPath));
+    mjpegInflight.set(finalPath, job);
+    return job;
+  }
+
   // Drop the oldest cache entries beyond maxCacheBytes. Runs after each
   // commit; mtime order approximates LRU well enough for a slideshow.
   function prune() {
@@ -260,7 +308,7 @@ function createVideoTranscoder({
     });
   }
 
-  return { available, hasFreeSlot, cachedFile, sourceNeedsTranscode, stream, prune };
+  return { available, hasFreeSlot, cachedFile, sourceNeedsTranscode, stream, mjpeg, prune };
 }
 
 module.exports = { createVideoTranscoder };

@@ -48,7 +48,9 @@ Spatialstash is a separate app that implements the same protocol in Swift, it is
   rendering, intraFont clock overlay). Full WS slideshow session
   (`sessionId "main"`, hand-rolled RFC6455 in `ws.c`): server-pushed
   `playback` ids fetched via `/get?width=480&height=272&lowmem=1`
-  (JPEG via libjpeg-turbo, animated lowmem GIF via giflib), `imageReady`
+  (JPEG via libjpeg-turbo, animated lowmem GIF via giflib, webm/mp4 as
+  silent server-transcoded MJPEG via `/get?vcodec=mjpeg` — see
+  imagemirror's lib/videoTranscode.js), `imageReady`
   confirmations, `displayState` → panel off/on through `kdisp.prx` (tiny
   kernel PRX wrapping sceDisplayEnable/Disable; CFW only, soft-blank
   fallback) + `present`/`reportDisplay` so HA gets a light entity.

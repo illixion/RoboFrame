@@ -870,6 +870,24 @@ async function processRequestV2(req, res) {
           deviceId: req.query.deviceId ? String(req.query.deviceId) : '',
         });
       }
+      // vcodec=mjpeg: capped, silent MJPEG for decoder-poor clients (the PSP
+      // kiosk splits it on SOI markers and plays via its JPEG decoder). Built
+      // fully into the cache before serving, so the response is a complete
+      // file with Content-Length. A failed/absent ffmpeg is a 503 the client
+      // treats as "skip this post".
+      if (req.query.vcodec === 'mjpeg') {
+        const clamp = (v, lo, hi, dflt) => Math.min(hi, Math.max(lo, Number(v) || dflt));
+        const file = await videoTranscoder.mjpeg(parts.id, filePath, {
+          w: clamp(req.query.width, 64, 960, 480),
+          h: clamp(req.query.height, 64, 544, 272),
+          fps: clamp(req.query.fps, 4, 24, 12),
+          sec: clamp(req.query.vmaxsec, 2, 60, 15),
+        });
+        if (cancelled || res.headersSent) return;
+        if (file) streamVideo(req, res, file, 'video/x-motion-jpeg', parts.id, 'mjpeg');
+        else res.status(503).send('mjpeg transcode unavailable');
+        return;
+      }
       // vcodec=h264: serve/build the hardware-decodable variant. Cache hits
       // stream like any file (Range-capable); a miss pipes ffmpeg's output
       // live. Sources already in H.264 within the height cap, a missing

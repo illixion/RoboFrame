@@ -4,9 +4,11 @@ Native homebrew slideshow client that turns a PSP into a RoboFrame
 display. Fetches server-resized JPEGs (and low-res animated GIFs — the
 `lowmem=1` variant imagemirror builds for animated posts) from
 imagemirror over WiFi, renders double-buffered at vsync with alpha
-crossfades, and overlays a clock from the PSP's RTC. Videos are skipped
-(real kiosks play those); other unsupported formats trigger an
-immediate re-pick rather than an error.
+crossfades, and overlays a clock from the PSP's RTC. Video posts
+(webm/mp4) play as silent 12 fps clips: imagemirror transcodes them to
+capped MJPEG (`/get?vcodec=mjpeg`, 15 s max) and the PSP JPEG-decodes
+each frame on demand at 333 MHz, looping until the next advance. Other
+unsupported formats trigger an immediate re-pick rather than an error.
 
 ## How it works
 
@@ -46,7 +48,8 @@ a real slideshow session (`sessionId "main"`, channel = `device_id`):
 
 - the **server** drives the cadence — `playback` frames push post ids,
   the PSP fetches the variant over HTTP and confirms with `imageReady`
-  (video posts are acknowledged but not rendered);
+  (webm/mp4 posts render via the MJPEG variant; anything the server
+  can't transcode is acknowledged and dwelled on the current image);
 - `displayState { target, state }` turns the panel off/on remotely (HA
   light entity, same as node-display) — the PSP answers with `present`
   (parks the channel) and `reportDisplay` (feeds MQTT/HA);

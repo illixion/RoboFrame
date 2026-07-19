@@ -143,6 +143,13 @@ typedef struct {
      * images leave anim NULL / nframes 1. */
     unsigned char *anim;
     unsigned int *delays_ms;
+    /* Video posts (server-transcoded MJPEG): the compressed stream stays in
+     * RAM and frames are JPEG-decoded on demand at a fixed cadence — a
+     * 15 s clip is ~3 MB compressed vs ~90 MB as raw RGBA frames. */
+    unsigned char *mjpeg;
+    unsigned int *mjpeg_off;   /* per-frame byte offsets into mjpeg */
+    int mjpeg_len;
+    int frame_ms;              /* fixed frame delay when delays_ms is NULL */
     int nframes, frame;
     u64 next_frame_tick;
 } Slot;
@@ -154,8 +161,13 @@ typedef struct {
 static void slotFreeAnim(Slot *s) {
     free(s->anim);
     free(s->delays_ms);
+    free(s->mjpeg);
+    free(s->mjpeg_off);
     s->anim = NULL;
     s->delays_ms = NULL;
+    s->mjpeg = NULL;
+    s->mjpeg_off = NULL;
+    s->mjpeg_len = 0;
     s->nframes = 1;
     s->frame = 0;
 }
@@ -169,6 +181,30 @@ static void slotShowFrame(Slot *s, int n) {
         memcpy(s->pixels + y * BUF_W, src + (size_t)y * s->w * 4, s->w * 4);
     sceKernelDcacheWritebackRange(s->pixels, BUF_W * s->h * 4);
     s->frame = n;
+}
+
+/* JPEG-decode MJPEG frame n straight into the slot's texture. ~30-40 ms at
+ * 333 MHz for 480x272 — done in whichever thread advances the video, and
+ * the vsync loop simply absorbs it (video is the only thing on screen). */
+static int mjpegShowFrame(Slot *s, int n) {
+    if (!s->mjpeg || n >= s->nframes) return -1;
+    unsigned int start = s->mjpeg_off[n];
+    unsigned int end = n + 1 < s->nframes ? s->mjpeg_off[n + 1]
+                                          : (unsigned int)s->mjpeg_len;
+    tjhandle tj = tjInitDecompress();
+    if (!tj) return -1;
+    int rc = tjDecompress2(tj, s->mjpeg + start, end - start,
+                           (unsigned char *)s->pixels, s->w, BUF_W * 4, s->h,
+                           TJPF_RGBA, TJFLAG_FASTDCT);
+    tjDestroy(tj);
+    if (rc < 0) return -1;
+    for (int y = 0; y < s->h; y++) {
+        unsigned int *row = s->pixels + y * BUF_W;
+        for (int x = 0; x < s->w; x++) row[x] |= 0xFF000000;
+    }
+    sceKernelDcacheWritebackRange(s->pixels, BUF_W * s->h * 4);
+    s->frame = n;
+    return 0;
 }
 
 static Slot g_slot[2];
@@ -533,6 +569,18 @@ static int extIsVideo(const char *ext) {
     return 0;
 }
 
+/* Server-playable videos: imagemirror only treats webm/mp4 as video posts,
+ * so only those reach its vcodec=mjpeg transcoder. */
+static int extIsPlayableVideo(const char *ext) {
+    return !strcasecmp(ext, "mp4") || !strcasecmp(ext, "webm");
+}
+
+/* MJPEG request shape — the delay baked into playback must match the fps
+ * asked of the server. 12 fps / 15 s keeps a clip ~2-4 MB: streamable over
+ * 802.11b inside the broker's 15 s readiness window. */
+#define VIDEO_FPS 12
+#define VIDEO_MAX_SEC 15
+
 /* Pick a random non-video post id via /random?json=1. Returns id or -1. */
 static long pickPostId(void) {
     for (int attempt = 0; attempt < 5 && g_running; attempt++) {
@@ -566,7 +614,9 @@ static long pickPostId(void) {
             int i = 0;
             while (*extp && *extp != '"' && i < 15) ext[i++] = *extp++;
         }
-        if (extIsVideo(ext)) continue; /* redraw — videos are for real kiosks */
+        /* webm/mp4 play via the server's MJPEG transcode; exotic containers
+         * would go down the image pipeline and fail, so re-pick those. */
+        if (extIsVideo(ext) && !extIsPlayableVideo(ext)) continue;
         return id;
     }
     setStatus("only videos came up, giving up", 1);
@@ -687,6 +737,62 @@ static int decodeGif(Slot *slot, const unsigned char *buf, int len) {
     return 0;
 }
 
+/* Video posts arrive as server-transcoded MJPEG (see imagemirror's
+ * vcodec=mjpeg): concatenated JPEGs, each frame ending in EOI with the next
+ * frame's SOI immediately adjacent. Splitting on that FFD9FFD8 seam is
+ * sturdier than scanning for bare SOIs, which can false-positive inside
+ * table segments. Takes ownership of body on success. */
+static int decodeMjpeg(Slot *slot, unsigned char *body, int blen) {
+    if (blen > MAX_ANIM_BYTES) { free(body); return -2; }
+
+    int cap = 64, n = 1;
+    unsigned int *off = malloc(cap * sizeof(unsigned int));
+    if (!off) { free(body); return -1; }
+    off[0] = 0;
+    for (int i = 0; i + 3 < blen; i++) {
+        if (body[i] == 0xFF && body[i + 1] == 0xD9 &&
+            body[i + 2] == 0xFF && body[i + 3] == 0xD8) {
+            if (n == cap) {
+                cap *= 2;
+                unsigned int *no = realloc(off, cap * sizeof(unsigned int));
+                if (!no) { free(off); free(body); return -1; }
+                off = no;
+            }
+            off[n++] = i + 2;
+            i += 2;
+        }
+    }
+
+    tjhandle tj = tjInitDecompress();
+    int w = 0, h = 0, subsamp = 0, colorspace = 0;
+    if (!tj || tjDecompressHeader3(tj, body, blen, &w, &h, &subsamp,
+                                   &colorspace) < 0 ||
+        w <= 0 || h <= 0 || w > BUF_W || h > TEX_H) {
+        if (tj) tjDestroy(tj);
+        free(off);
+        free(body);
+        return -2;
+    }
+    tjDestroy(tj);
+
+    slotFreeAnim(slot);
+    memset(slot->pixels, 0, BUF_W * TEX_H * 4);
+    slot->w = w;
+    slot->h = h;
+    slot->mjpeg = body;
+    slot->mjpeg_off = off;
+    slot->mjpeg_len = blen;
+    slot->nframes = n;
+    slot->frame_ms = 1000 / VIDEO_FPS;
+    slot->frame = 0;
+    slot->next_frame_tick = 0;
+    if (mjpegShowFrame(slot, 0) < 0) {
+        slotFreeAnim(slot); /* frees body + offsets */
+        return -2;
+    }
+    return 0;
+}
+
 /* Fetch + decode one image into slot. Returns 0 on success, -1 on a
  * transport/server error (worth backing off), -2 on unsupported content
  * (re-pick another post immediately). */
@@ -695,21 +801,34 @@ static int fetchImage(Slot *slot, long want_id, int replay) {
     if (id < 0) return -1;
 
     /* History replays skip the server-side /history record so browsing
-     * back doesn't spam duplicate entries. */
+     * back doesn't spam duplicate entries. The vcodec/fps/vmaxsec params
+     * only bite on video posts — image variants ignore them. */
     char path[768];
     snprintf(path, sizeof(path),
-             "/get?id=%ld&token=%s&width=%d&height=%d&lowmem=%d&deviceId=%s%s",
+             "/get?id=%ld&token=%s&width=%d&height=%d&lowmem=%d&deviceId=%s"
+             "&vcodec=mjpeg&fps=%d&vmaxsec=%d%s",
              id, cfg.token, SCR_W, SCR_H, cfg.lowmem, cfg.device_id,
-             replay ? "&record=0" : "");
+             VIDEO_FPS, VIDEO_MAX_SEC, replay ? "&record=0" : "");
     unsigned char *body; int blen, status;
     char ctype[64];
     if (httpGet(path, &body, &blen, &status, ctype, sizeof(ctype)) < 0) return -1;
+    if (status == 503) {
+        /* mjpeg transcode unavailable (no ffmpeg on the server) — treat the
+         * post as unsupported rather than an error worth backing off on. */
+        free(body);
+        return -2;
+    }
     if (status != 200) {
         char msg[64];
         snprintf(msg, sizeof(msg), "server: HTTP %d on /get", status);
         setStatus(msg, 1);
         free(body);
         return -1;
+    }
+    if (strncasecmp(ctype, "video/x-motion-jpeg", 19) == 0) {
+        int rc = decodeMjpeg(slot, body, blen); /* owns body */
+        if (rc == 0) { slot->id = id; setStatus("", 0); }
+        return rc;
     }
     if (strncasecmp(ctype, "image/gif", 9) == 0) {
         int rc = decodeGif(slot, body, blen);
@@ -877,9 +996,11 @@ static void handleWsFrame(int s, const char *json) {
         jsonStr(cur, "ext", ext, sizeof(ext));
         if (id <= 0) return;
 
-        if (extIsVideo(ext)) {
-            /* Can't play video — confirm readiness so the channel dwells
-             * normally instead of waiting out the readiness timeout. */
+        if (extIsVideo(ext) && !extIsPlayableVideo(ext)) {
+            /* Exotic container the server won't transcode — confirm
+             * readiness so the channel dwells normally instead of waiting
+             * out the readiness timeout. webm/mp4 fall through and fetch
+             * the MJPEG variant like any image. */
             if (g_last_ready_id != id) {
                 g_last_ready_id = id;
                 char msg[160];
@@ -1022,6 +1143,23 @@ static int fetchThread(SceSize args, void *argp) {
              * of an unsupported id falls back to a fresh random pick. */
             g_req_id = -1;
             g_req_replay = 0;
+            if (want_id >= 0 && g_ws_up) {
+                /* server-pushed id we can't show (e.g. video the transcoder
+                 * rejected): ack readiness and park on the current image so
+                 * the channel dwells instead of eating the 15 s timeout —
+                 * showing a random substitute would desync from the server */
+                if (g_last_ready_id != want_id) {
+                    g_last_ready_id = want_id;
+                    char msg[160];
+                    snprintf(msg, sizeof(msg),
+                             "{\"sessionId\":\"" SESSION_ID "\","
+                             "\"action\":\"imageReady\","
+                             "\"payload\":{\"id\":%ld}}", want_id);
+                    wsEnqueue(msg);
+                }
+                g_want_next = 0;
+                continue;
+            }
             if (++unsupported_streak >= 4) {
                 unsupported_streak = 0;
                 sceKernelDelayThread(5 * 1000 * 1000);
@@ -1337,17 +1475,34 @@ int main(void) {
             fade_step = g_have_image ? 0 : fade_frames; /* first image: cut */
         }
 
-        /* --- advance GIF animation on the visible slot --- */
+        /* --- advance GIF/MJPEG animation on the visible slot --- */
         Slot *front = &g_slot[g_front];
-        if (g_display_on && front->anim && front->nframes > 1 && fade_step < 0) {
+        if (g_display_on && (front->anim || front->mjpeg) &&
+            front->nframes > 1 && fade_step < 0) {
+            unsigned int cur_ms = front->delays_ms
+                ? front->delays_ms[front->frame] : (unsigned int)front->frame_ms;
             if (front->next_frame_tick == 0)
-                front->next_frame_tick =
-                    now + (u64)front->delays_ms[front->frame] * (tick_freq / 1000);
+                front->next_frame_tick = now + (u64)cur_ms * (tick_freq / 1000);
             if (now >= front->next_frame_tick) {
                 int nf = (front->frame + 1) % front->nframes;
-                slotShowFrame(front, nf);
-                front->next_frame_tick =
-                    now + (u64)front->delays_ms[nf] * (tick_freq / 1000);
+                if (front->anim) slotShowFrame(front, nf);
+                else mjpegShowFrame(front, nf);
+                unsigned int nxt_ms = front->delays_ms
+                    ? front->delays_ms[nf] : (unsigned int)front->frame_ms;
+                front->next_frame_tick = now + (u64)nxt_ms * (tick_freq / 1000);
+            }
+        }
+
+        /* Video decode is a per-frame JPEG decompress — run the CPU at full
+         * clock while a video is front, drop back to the cool photo-frame
+         * clock otherwise. */
+        {
+            static int fast_clock = 0;
+            int want_fast = front->mjpeg != NULL;
+            if (want_fast != fast_clock) {
+                fast_clock = want_fast;
+                if (want_fast) scePowerSetClockFrequency(333, 333, 166);
+                else scePowerSetClockFrequency(222, 222, 111);
             }
         }
 
