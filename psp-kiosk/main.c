@@ -122,6 +122,7 @@ typedef struct {
     unsigned int *pixels;   /* BUF_W * TEX_H RGBA, 16-byte aligned — the
                              * texture the GE samples (current frame) */
     int w, h;               /* valid image area */
+    long id;                /* imagemirror post id */
     /* Animated GIFs: packed w*h RGBA frames + per-frame delays. Static
      * images leave anim NULL / nframes 1. */
     unsigned char *anim;
@@ -157,15 +158,68 @@ static void slotShowFrame(Slot *s, int n) {
 static Slot g_slot[2];
 static volatile int g_front = 0;          /* slot the main thread displays */
 static volatile int g_incoming = 0;       /* fetch thread filled back slot */
+static volatile int g_incoming_replay = 0; /* incoming is a history replay */
 static volatile int g_want_next = 1;      /* main asks fetch for an image */
 static volatile int g_have_image = 0;     /* at least one image ever shown */
 static char g_status[128] = "starting";   /* fetch thread → status line */
 static volatile int g_status_is_error = 0;
+static volatile u64 g_status_until = 0;   /* 0 = sticky, else expiry tick */
 
 static void setStatus(const char *msg, int is_error) {
     snprintf(g_status, sizeof(g_status), "%s", msg);
     g_status_is_error = is_error;
+    g_status_until = 0;
 }
+
+/* Transient toast: clears itself after ms (render loop enforces). */
+static void setToast(const char *msg, int is_error, int ms) {
+    u64 now, freq = sceRtcGetTickResolution();
+    sceRtcGetCurrentTick(&now);
+    snprintf(g_status, sizeof(g_status), "%s", msg);
+    g_status_is_error = is_error;
+    g_status_until = now + (u64)ms * (freq / 1000);
+}
+
+/* --- navigation / remote-action mailboxes (main → fetch thread) --- */
+
+static volatile long g_req_id = -1;       /* -1 = pick random, else replay */
+static volatile int g_req_replay = 0;     /* don't append to history */
+
+#define ACT_NONE  0
+#define ACT_SAVE  1
+#define ACT_BLOCK 2
+#define ACT_LISTS 3
+static volatile int g_action = ACT_NONE;
+static volatile long g_action_id = 0;
+
+/* Ring of recently shown post ids for LEFT/RIGHT navigation. */
+#define HIST_MAX 64
+static long g_hist[HIST_MAX];
+static int g_hist_len = 0, g_hist_pos = -1;
+
+static void histAppend(long id) {
+    if (g_hist_len == HIST_MAX) {
+        memmove(g_hist, g_hist + 1, (HIST_MAX - 1) * sizeof(long));
+        g_hist_len--;
+    }
+    g_hist[g_hist_len++] = id;
+    g_hist_pos = g_hist_len - 1;
+}
+
+static void histPurge(long id) {
+    int w = 0;
+    for (int i = 0; i < g_hist_len; i++)
+        if (g_hist[i] != id) g_hist[w++] = g_hist[i];
+    if (g_hist_pos >= w) g_hist_pos = w - 1;
+    g_hist_len = w;
+}
+
+/* --- tag-list picker state --- */
+
+#define LISTS_MAX 32
+static volatile int g_lists_count = -1;   /* -1 = not fetched yet */
+static char g_list_preview[LISTS_MAX][48];
+static volatile int g_active_list = -1;   /* -1 = server default */
 
 /* Case-insensitive header lookup (newlib hides strcasestr). */
 static char *findHeader(char *haystack, const char *needle) {
@@ -388,10 +442,13 @@ static int extIsVideo(const char *ext) {
 /* Pick a random non-video post id via /random?json=1. Returns id or -1. */
 static long pickPostId(void) {
     for (int attempt = 0; attempt < 5 && g_running; attempt++) {
+        char list_q[24] = "";
+        if (g_active_list >= 0)
+            snprintf(list_q, sizeof(list_q), "&list=%d", g_active_list);
         char path[768];
         snprintf(path, sizeof(path),
-                 "/random?json=1&token=%s&width=%d&height=%d%s",
-                 cfg.token, SCR_W, SCR_H, cfg.extra_query);
+                 "/random?json=1&token=%s&width=%d&height=%d%s%s",
+                 cfg.token, SCR_W, SCR_H, list_q, cfg.extra_query);
         unsigned char *body; int blen, status;
         if (httpGet(path, &body, &blen, &status, NULL, 0) < 0) return -1;
         if (status != 200) {
@@ -539,14 +596,17 @@ static int decodeGif(Slot *slot, const unsigned char *buf, int len) {
 /* Fetch + decode one image into slot. Returns 0 on success, -1 on a
  * transport/server error (worth backing off), -2 on unsupported content
  * (re-pick another post immediately). */
-static int fetchImage(Slot *slot) {
-    long id = pickPostId();
+static int fetchImage(Slot *slot, long want_id, int replay) {
+    long id = want_id >= 0 ? want_id : pickPostId();
     if (id < 0) return -1;
 
+    /* History replays skip the server-side /history record so browsing
+     * back doesn't spam duplicate entries. */
     char path[768];
     snprintf(path, sizeof(path),
-             "/get?id=%ld&token=%s&width=%d&height=%d&lowmem=%d&deviceId=%s",
-             id, cfg.token, SCR_W, SCR_H, cfg.lowmem, cfg.device_id);
+             "/get?id=%ld&token=%s&width=%d&height=%d&lowmem=%d&deviceId=%s%s",
+             id, cfg.token, SCR_W, SCR_H, cfg.lowmem, cfg.device_id,
+             replay ? "&record=0" : "");
     unsigned char *body; int blen, status;
     char ctype[64];
     if (httpGet(path, &body, &blen, &status, ctype, sizeof(ctype)) < 0) return -1;
@@ -560,7 +620,7 @@ static int fetchImage(Slot *slot) {
     if (strncasecmp(ctype, "image/gif", 9) == 0) {
         int rc = decodeGif(slot, body, blen);
         free(body);
-        if (rc == 0) setStatus("", 0);
+        if (rc == 0) { slot->id = id; setStatus("", 0); }
         return rc;
     }
     if (strncasecmp(ctype, "image/jpeg", 10) != 0) {
@@ -599,8 +659,84 @@ static int fetchImage(Slot *slot) {
     sceKernelDcacheWritebackRange(slot->pixels, BUF_W * TEX_H * 4);
     slot->w = w;
     slot->h = h;
+    slot->id = id;
     setStatus("", 0);
     return 0;
+}
+
+/* Fetch /rpc/tags.json and build per-list previews (first tags of each
+ * list). Minimal scanner over the [["tag","tag"],...] shape. */
+static void fetchTagLists(void) {
+    unsigned char *body; int blen, status;
+    char path[256];
+    snprintf(path, sizeof(path), "/rpc/tags.json?token=%s", cfg.token);
+    if (httpGet(path, &body, &blen, &status, NULL, 0) < 0) return;
+    if (status != 200) { free(body); return; }
+
+    int depth = 0, list = -1, in_str = 0, esc = 0, plen = 0;
+    for (int i = 0; i < blen; i++) {
+        char c = body[i];
+        if (in_str) {
+            if (esc) { esc = 0; continue; }
+            if (c == '\\') { esc = 1; continue; }
+            if (c == '"') { in_str = 0; continue; }
+            if (list >= 0 && list < LISTS_MAX && plen < 44)
+                g_list_preview[list][plen++] = c;
+            continue;
+        }
+        if (c == '"') {
+            in_str = 1;
+            /* separate tags in the preview with a space */
+            if (list >= 0 && list < LISTS_MAX && plen > 0 && plen < 44)
+                g_list_preview[list][plen++] = ' ';
+        } else if (c == '[') {
+            if (++depth == 2) {
+                list++;
+                plen = 0;
+                if (list < LISTS_MAX) g_list_preview[list][0] = 0;
+            }
+        } else if (c == ']') {
+            if (depth-- == 2 && list >= 0 && list < LISTS_MAX)
+                g_list_preview[list][plen] = 0;
+        }
+    }
+    free(body);
+    g_lists_count = list + 1 > LISTS_MAX ? LISTS_MAX : list + 1;
+}
+
+/* Run a queued one-shot remote action (save/block/list fetch). */
+static void runAction(void) {
+    int act = g_action;
+    long id = g_action_id;
+    g_action = ACT_NONE;
+    if (act == ACT_LISTS) { fetchTagLists(); return; }
+    if (id <= 0) return;
+
+    char path[256];
+    snprintf(path, sizeof(path), "/%s?id=%ld&token=%s",
+             act == ACT_SAVE ? "save" : "block", id, cfg.token);
+    unsigned char *body; int blen, status;
+    if (httpGet(path, &body, &blen, &status, NULL, 0) < 0) {
+        setToast(act == ACT_SAVE ? "save failed" : "block failed", 1, 3000);
+        return;
+    }
+    free(body);
+    if (status != 200) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "%s: HTTP %d",
+                 act == ACT_SAVE ? "save" : "block", status);
+        setToast(msg, 1, 3000);
+        return;
+    }
+    if (act == ACT_SAVE) {
+        setToast("saved", 0, 2000);
+    } else {
+        setToast("blocked", 0, 2000);
+        histPurge(id);
+        g_req_id = -1;       /* the current post just got blocked — move on */
+        g_req_replay = 0;
+        g_want_next = 1;
+    }
 }
 
 static int fetchThread(SceSize args, void *argp) {
@@ -620,18 +756,27 @@ static int fetchThread(SceSize args, void *argp) {
 
     int unsupported_streak = 0;
     while (g_running) {
+        if (g_action != ACT_NONE) runAction();
         if (!g_want_next || g_incoming) {
             sceKernelDelayThread(50 * 1000);
             continue;
         }
         int back = g_front ^ 1;
-        int rc = fetchImage(&g_slot[back]);
+        long want_id = g_req_id;
+        int replay = g_req_replay;
+        int rc = fetchImage(&g_slot[back], want_id, replay);
         if (rc == 0) {
+            g_incoming_replay = replay;
+            g_req_id = -1;
+            g_req_replay = 0;
             g_want_next = 0;
             g_incoming = 1;
         } else if (rc == -2) {
             /* unsupported content: try another post right away, but don't
-             * hammer a library that's mostly unsupported formats */
+             * hammer a library that's mostly unsupported formats. A replay
+             * of an unsupported id falls back to a fresh random pick. */
+            g_req_id = -1;
+            g_req_replay = 0;
             if (++unsupported_streak >= 4) {
                 unsupported_streak = 0;
                 sceKernelDelayThread(5 * 1000 * 1000);
@@ -723,8 +868,11 @@ static void drawSlot(const Slot *s, int alpha) {
     sceGuDrawArray(GU_SPRITES, VFMT, i, 0, v);
 }
 
-/* Untextured translucent rectangle (text backdrops). */
+/* Untextured translucent rectangle (text backdrops). Depth test must be
+ * re-disabled here: intraFontPrint force-enables it on exit, so any rect
+ * drawn after a text print would otherwise be culled. */
 static void drawRect(int x0, int y0, int x1, int y1, unsigned int color) {
+    sceGuDisable(GU_DEPTH_TEST);
     sceGuDisable(GU_TEXTURE_2D);
     Vertex *v = sceGuGetMemory(2 * sizeof(Vertex));
     v[0] = (Vertex){ 0, 0, color, (short)x0, (short)y0, 0 };
@@ -776,6 +924,8 @@ int main(void) {
     int paused = 0;
     unsigned int prev_buttons = 0;
     int power_tick = 0;
+    int list_mode = 0, list_sel = -1;
+    long block_arm_id = 0;
 
     while (g_running) {
         /* --- input --- */
@@ -783,9 +933,74 @@ int main(void) {
         sceCtrlPeekBufferPositive(&pad, 1);
         unsigned int pressed = pad.Buttons & ~prev_buttons;
         prev_buttons = pad.Buttons;
-        if (pressed & (PSP_CTRL_CROSS | PSP_CTRL_RIGHT)) g_want_next = 1;
-        if (pressed & PSP_CTRL_START) paused = !paused;
-        if (pressed & PSP_CTRL_SELECT) cfg.clock_on = !cfg.clock_on;
+        int idle = fade_step < 0 && !g_want_next && !g_incoming;
+
+        if (list_mode) {
+            /* Tag-list picker: UP/DOWN cycle (auto → 0..n-1), X apply,
+             * O or TRIANGLE cancel. */
+            int n = g_lists_count;
+            if (n > 0 && (pressed & PSP_CTRL_UP))
+                list_sel = list_sel >= n - 1 ? -1 : list_sel + 1;
+            if (n > 0 && (pressed & PSP_CTRL_DOWN))
+                list_sel = list_sel <= -1 ? n - 1 : list_sel - 1;
+            if (pressed & PSP_CTRL_CROSS) {
+                g_active_list = list_sel;
+                list_mode = 0;
+                char msg[32];
+                if (list_sel < 0) snprintf(msg, sizeof(msg), "list: auto");
+                else snprintf(msg, sizeof(msg), "list %d selected", list_sel);
+                setToast(msg, 0, 2000);
+                if (idle) { g_req_id = -1; g_req_replay = 0; g_want_next = 1; }
+            }
+            if (pressed & (PSP_CTRL_CIRCLE | PSP_CTRL_TRIANGLE)) list_mode = 0;
+        } else {
+            if ((pressed & PSP_CTRL_RIGHT) && idle) {
+                if (g_hist_pos < g_hist_len - 1) { /* forward through history */
+                    g_hist_pos++;
+                    g_req_id = g_hist[g_hist_pos];
+                    g_req_replay = 1;
+                } else {
+                    g_req_id = -1;
+                    g_req_replay = 0;
+                }
+                g_want_next = 1;
+            }
+            if ((pressed & PSP_CTRL_LEFT) && idle) {
+                if (g_hist_pos > 0) {
+                    g_hist_pos--;
+                    g_req_id = g_hist[g_hist_pos];
+                    g_req_replay = 1;
+                    g_want_next = 1;
+                } else {
+                    setToast("start of history", 0, 1500);
+                }
+            }
+            if ((pressed & PSP_CTRL_CROSS) && g_have_image &&
+                g_action == ACT_NONE) {
+                g_action_id = g_slot[g_front].id;
+                g_action = ACT_SAVE;
+            }
+            if ((pressed & PSP_CTRL_CIRCLE) && g_have_image &&
+                g_action == ACT_NONE) {
+                /* blocking is persistent — require a second press */
+                if (block_arm_id == g_slot[g_front].id) {
+                    g_action_id = g_slot[g_front].id;
+                    g_action = ACT_BLOCK;
+                    block_arm_id = 0;
+                } else {
+                    block_arm_id = g_slot[g_front].id;
+                    setToast("press O again to block", 0, 3000);
+                }
+            }
+            if (pressed & PSP_CTRL_TRIANGLE) {
+                list_mode = 1;
+                list_sel = g_active_list;
+                if (g_lists_count < 0 && g_action == ACT_NONE)
+                    g_action = ACT_LISTS;
+            }
+            if (pressed & PSP_CTRL_START) paused = !paused;
+            if (pressed & PSP_CTRL_SELECT) cfg.clock_on = !cfg.clock_on;
+        }
 
         /* --- dwell timer --- */
         /* Only arm while idle: once a fetch or fade is in flight the timer
@@ -841,14 +1056,44 @@ int main(void) {
                 g_have_image = 1;
                 fade_step = -1;
                 g_slot[g_front].next_frame_tick = 0;
+                if (!g_incoming_replay) histAppend(g_slot[g_front].id);
+                g_incoming_replay = 0;
+                block_arm_id = 0; /* image changed — disarm block confirm */
                 sceRtcGetCurrentTick(&dwell_start);
             }
         } else {
             drawSlot(&g_slot[g_front], 255);
         }
 
+        /* expire toasts */
+        if (g_status[0] && g_status_until && now >= g_status_until) {
+            g_status[0] = 0;
+            g_status_until = 0;
+        }
+
         if (font) {
             intraFontActivate(font);
+            if (list_mode) {
+                drawRect(40, 96, SCR_W - 40, 176, 0xC0000000);
+                char line[96];
+                if (g_lists_count < 0) {
+                    snprintf(line, sizeof(line), "Tag list: loading...");
+                } else if (list_sel < 0) {
+                    snprintf(line, sizeof(line), "Tag list: auto (server default)");
+                } else {
+                    snprintf(line, sizeof(line), "Tag list %d of %d: %.44s",
+                             list_sel, g_lists_count - 1,
+                             g_list_preview[list_sel][0]
+                                 ? g_list_preview[list_sel] : "(empty)");
+                }
+                intraFontSetStyle(font, 0.9f, 0xFFFFFFFF, 0xFF000000,
+                                  0.0f, INTRAFONT_ALIGN_CENTER);
+                intraFontPrint(font, SCR_W / 2, 124, line);
+                intraFontSetStyle(font, 0.7f, 0xDDCCCCCC, 0xFF000000,
+                                  0.0f, INTRAFONT_ALIGN_CENTER);
+                intraFontPrint(font, SCR_W / 2, 156,
+                               "UP/DOWN change   X apply   O cancel");
+            }
             if (cfg.clock_on) {
                 ScePspDateTime t;
                 sceRtcGetCurrentClockLocalTime(&t);

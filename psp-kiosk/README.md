@@ -25,10 +25,18 @@ immediate re-pick rather than an error.
 
 | Button | Action |
 | --- | --- |
-| X / D-pad right | next image now |
+| D-pad right | next image (steps forward through history first) |
+| D-pad left | previous image (local history, up to 64 back) |
+| X | save the current post (`/save`) |
+| O | block the current post (`/block`) — press twice to confirm; advances and drops it from history |
+| TRIANGLE | tag-list picker (UP/DOWN cycle incl. auto, X apply, O cancel) — feeds `/random?list=N` |
 | START | pause/resume the dwell timer |
 | SELECT | toggle the clock overlay |
 | HOME | exit |
+
+Save and block are the kiosk-tier HTTP routes, so the access token in
+`config.txt` is all they need. History replays request `record=0` so
+browsing back doesn't spam `/history`.
 
 ## Build
 
