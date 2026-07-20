@@ -17,7 +17,7 @@
   "license": "MIT",
   "dependencies": {
     "@roboframe/shared": "*",
-    "axios": "^1.16.0",
+    "axios": "^1.18.1",
     "body-parser": "^2.2.2",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
