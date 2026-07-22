@@ -220,11 +220,15 @@ the deadline) is the canary for the wake-advance class of bug.
   - `vcodec=h264` → mp4 at **source res/fps** (cap via `vmaxh`/`vmaxfps`,
     `0` = no cap) — for clients that render H.264 as an animated image.
   - `gif=1` → animated **GIF** (PSP); no flag → animated **WebP**.
+  - `rawanimated=1` → the **untouched source** (no conversion) — for a client
+    that decodes animated formats itself. Spatialstash uses this: animated JXL
+    goes to its on-device WASM decoder, GIF/WebP animate directly in `<img>`.
   The response `Content-Type` is the only signal — the post's `ext` stays
   `jxl` — so clients switch renderer by sniffing the fetched MIME type
   (web kiosk: `blob.type`; native-kiosk: `Content-Type` → mpv). mp4 falls
   back to WebP/GIF when there's no usable H.264 encoder. `imageCache.keyOf`
-  must include `gif`/`h264`/`vmaxh`/`vmaxfps` or these variants collide.
+  must include `gif`/`h264`/`vmaxh`/`vmaxfps`/`rawanimated` or these variants
+  collide.
 - **All H.264 output (video + animated) is capped by `vmaxh`/`vmaxfps`**
   (`0` = source), encoded via VideoToolbox when available, else libx264
   `-preset ultrafast`. The video-transcode cache keys on both caps

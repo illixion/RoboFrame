@@ -701,7 +701,7 @@ function lookupPostPath(postId) {
 
 // Encode the variant requested by /get (or the prefetcher). Pure async —
 // no req/res. Returns { buffer, mime, ext } or throws.
-async function computeVariant({ id, convert, bright, width, height, lowmem, wallpaper, gif, h264, vmaxh, vmaxfps }) {
+async function computeVariant({ id, convert, bright, width, height, lowmem, wallpaper, gif, h264, vmaxh, vmaxfps, rawanimated }) {
   const row = await lookupPostPath(id);
   if (!row) {
     const err = new Error('Post not found');
@@ -733,7 +733,13 @@ async function computeVariant({ id, convert, bright, width, height, lowmem, wall
   const srcExt = path.extname(filePath).slice(1).toLowerCase();
 
   if (animatedMode) {
-    if (gif) {
+    if (rawanimated) {
+      // Client decodes the animated source itself (Spatialstash: JXL via its
+      // WASM decoder, GIF/WebP via `<img>`). Hand back the untouched bytes so
+      // no server-side WebP/GIF/mp4 conversion runs.
+      finalBuffer = data;
+      finalMimeType = EXT_MIME[srcExt] || 'application/octet-stream';
+    } else if (gif) {
       // Decoder-poor clients (PSP kiosk) opt back into GIF: they can't play
       // mp4 and can't know a post is animated before fetching, so `gif=1`
       // rides along on every request and the server returns GIF for animated
@@ -809,6 +815,11 @@ function variantKeyParts(query) {
     h264: query.vcodec === 'h264',
     vmaxh: Math.max(0, Number(query.vmaxh) || 0),
     vmaxfps: Math.max(0, Number(query.vmaxfps) || 0),
+    // `rawanimated=1`: deliver an animated post as its untouched source rather
+    // than a converted WebP/GIF/mp4 — for clients that decode animated JXL/GIF/
+    // WebP themselves (Spatialstash: JXL via its WASM decoder, GIF/WebP via
+    // `<img>`). Stills are unaffected (already served raw).
+    rawanimated: Boolean(Number(query.rawanimated) || 0),
   };
 }
 
