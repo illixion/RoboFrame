@@ -10,11 +10,13 @@
 // into a disk cache keyed by post id; replays hit a plain seekable file and
 // go through the ordinary Range-capable streaming path.
 //
-// The caller passes a max height (`vmaxh`, default 1080). Sources already in
-// H.264 at or below that height and within the fps budget are detected via
-// ffprobe and served raw — the client's hardware decoder handles them as-is.
-// Anything taller, faster, or in another codec is downscaled/downsampled to
-// fit. Every transcode is capped at 30fps (see fpsBudget).
+// The caller passes a max height (`vmaxh`) and max fps (`vmaxfps`). Sources
+// already in H.264 within both caps are detected via ffprobe and served raw —
+// the client's hardware decoder handles them as-is. Anything taller, faster,
+// or in another codec is downscaled/downsampled to fit. A cap of `0` means "no
+// cap" (source resolution / frame rate): Pi kiosks ask for 720/30, while a
+// client that renders H.264 directly (Spatialstash) asks for 0/0 to get the
+// original. VideoToolbox encodes when available, else libx264 -preset ultrafast.
 //
 // The height cap is the real throttle for Pi-class kiosks. A Pi 3's
 // bcm2835-codec decodes 1080p30 at ~realtime with no margin — the memory
@@ -38,14 +40,16 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
-// Cache entries carry the target height so a 720p and a 1080p request for the
-// same post don't collide. The matcher also sweeps up legacy `${id}.h264.mp4`
-// files (pre-height cache) and MJPEG variants so they age out of the size
-// budget like any other.
-const CACHE_RE = /\.h264(?:\.\d+p)?\.mp4$|\.mjpeg$/;
+// Cache entries carry the target height and fps cap so requests with
+// different budgets (a kiosk's 720p30 vs Spatialstash's original 0p0fps)
+// don't collide. The matcher also sweeps up legacy `${id}.h264.mp4` /
+// `${id}.h264.720p.mp4` files (pre-fps cache) and MJPEG variants so they age
+// out of the size budget like any other. `0` in either slot means "no cap"
+// (source resolution / frame rate).
+const CACHE_RE = /\.h264(?:\.\d+p)?(?:\.\d+fps)?\.mp4$|\.mjpeg$/;
 
-function cacheName(id, maxHeight) {
-  return `${id}.h264.${maxHeight}p.mp4`;
+function cacheName(id, maxHeight, maxFps) {
+  return `${id}.h264.${maxHeight}p.${maxFps}fps.mp4`;
 }
 
 function mjpegName(id, { w, h, fps, sec }) {
@@ -68,18 +72,17 @@ function createVideoTranscoder({
   let tempCounter = 0;
   const sourceInfoCache = new Map(); // post id -> { codec, height, fps } | null
 
-  // Every mp4 this server emits is capped at 30fps — for both the video posts
-  // and the animated path. Pi-class decoders stutter past 720p30 on real
-  // content, and 30fps keeps the whole pipeline on one budget. The 31
-  // tolerance keeps 29.97 NTSC sources on their native cadence (an exact 30
-  // check would resample them); `target` is what a faster source resamples to.
-  function fpsBudget() {
-    return { cap: 31, target: 30 };
-  }
-
-  function fitsRaw(info, maxHeight) {
-    return Boolean(info && info.codec === 'h264' && info.height <= maxHeight
-      && info.fps > 0 && info.fps <= fpsBudget().cap);
+  // A source already H.264 within the height + fps caps is served raw — the
+  // client decodes it as-is, no transcode. Either cap set to `0` means "no
+  // cap": clients that want the source resolution / frame rate (Spatialstash,
+  // which renders via an <img> and can take original H.264) pass 0/0. Pi-class
+  // kiosks pass 720/30. The +1 fps tolerance keeps 29.97 NTSC on its native
+  // cadence (an exact check would resample it).
+  function fitsRaw(info, maxHeight, maxFps) {
+    if (!info || info.codec !== 'h264' || !(info.fps > 0)) return false;
+    const heightOk = maxHeight <= 0 || info.height <= maxHeight;
+    const fpsOk = maxFps <= 0 || info.fps <= maxFps + 1;
+    return heightOk && fpsOk;
   }
 
   // Probe once which H.264 encoder this ffmpeg build offers. VideoToolbox
@@ -114,8 +117,8 @@ function createVideoTranscoder({
     return active < maxConcurrent;
   }
 
-  function cachedFile(id, maxHeight = 1080) {
-    const p = path.join(cachePath, cacheName(id, maxHeight));
+  function cachedFile(id, maxHeight = 1080, maxFps = 30) {
+    const p = path.join(cachePath, cacheName(id, maxHeight, maxFps));
     return fs.existsSync(p) ? p : null;
   }
 
@@ -152,10 +155,10 @@ function createVideoTranscoder({
     });
   }
 
-  // A source that is already H.264 within the height cap and <=30fps doesn't
-  // need us — the kiosk's hardware decoder takes it raw.
-  async function sourceNeedsTranscode(id, filePath, maxHeight = 1080) {
-    return !fitsRaw(await probeSource(id, filePath), maxHeight);
+  // A source already H.264 within the height + fps caps doesn't need us — the
+  // client's decoder takes it raw. 0/0 caps accept any H.264 source as-is.
+  async function sourceNeedsTranscode(id, filePath, maxHeight = 1080, maxFps = 30) {
+    return !fitsRaw(await probeSource(id, filePath), maxHeight, maxFps);
   }
 
   // Shared H.264 → fragmented-mp4 arg builder for both the video-post stream
@@ -163,22 +166,29 @@ function createVideoTranscoder({
   // animated path passes 'apng' since a .apng file is probed as a still PNG);
   // `audio` is false for the silent animated path.
   function encodeArgs(encoder, filePath, fpsTarget, maxHeight, { inputFormat = null, audio = true } = {}) {
-    // Fit within maxHeight (16:9 width cap) without ever upscaling;
-    // force_divisible_by keeps yuv420p happy on odd source dimensions. `\,` is
-    // lavfi escaping, not shell — these args go through spawn() untouched. A
-    // truthy fpsTarget resamples an over-budget (or unreadable-rate) source;
-    // 0 leaves the native cadence alone (24/25/30).
-    const maxW = Math.round((maxHeight * 16) / 9);
-    const scale = `scale=min(iw\\,${maxW}):min(ih\\,${maxHeight})`
-      + ':force_original_aspect_ratio=decrease:force_divisible_by=2'
-      + (fpsTarget ? `,fps=${fpsTarget}` : '');
-    // Bitrate is generous on purpose: the cap that fixes Pi-class playback is
-    // the resolution, not the bitrate, and on a wired kiosk the extra bits buy
-    // a sharper 720p at no cost. VideoToolbox spends far less than the target
-    // on low-motion clips anyway.
+    // maxHeight<=0 → no cap: keep the source resolution, forcing only even
+    // dimensions for yuv420p. Otherwise fit within maxHeight (16:9 width cap)
+    // without ever upscaling; force_divisible_by keeps yuv420p happy on odd
+    // source dimensions. `\,` is lavfi escaping, not shell — these args go
+    // through spawn() untouched. A truthy fpsTarget resamples an over-budget
+    // (or unreadable-rate) source; 0 leaves the native cadence alone.
+    let scale;
+    if (maxHeight > 0) {
+      const maxW = Math.round((maxHeight * 16) / 9);
+      scale = `scale=min(iw\\,${maxW}):min(ih\\,${maxHeight})`
+        + ':force_original_aspect_ratio=decrease:force_divisible_by=2';
+    } else {
+      scale = 'scale=trunc(iw/2)*2:trunc(ih/2)*2';
+    }
+    if (fpsTarget) scale += `,fps=${fpsTarget}`;
+    // VideoToolbox (hardware) when available; libx264 -preset ultrafast is the
+    // portable fallback — fast enough to keep up with original-resolution
+    // transcodes on a CPU encoder. Bitrate is generous on purpose: on a wired
+    // LAN the extra bits buy sharpness at no real cost, and VideoToolbox
+    // spends far less than the target on low-motion clips anyway.
     const video = encoder === 'h264_videotoolbox'
       ? ['-c:v', 'h264_videotoolbox', '-b:v', '12M', '-maxrate', '16M', '-bufsize', '24M']
-      : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '19', '-maxrate', '16M', '-bufsize', '24M'];
+      : ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '19', '-maxrate', '16M', '-bufsize', '24M'];
     return [
       '-hide_banner', '-loglevel', 'error',
       ...(inputFormat ? ['-f', inputFormat] : []),
@@ -199,16 +209,18 @@ function createVideoTranscoder({
   // cheap and the next play of the same post then hits the cached file), and
   // only a clean ffmpeg exit commits the cache entry. Caller must have
   // checked available() + hasFreeSlot().
-  async function stream(req, res, id, filePath, maxHeight = 1080) {
+  async function stream(req, res, id, filePath, maxHeight = 1080, maxFps = 30) {
     const encoder = await detectEncoder();
     if (!encoder) throw new Error('transcoder unavailable');
     const info = await probeSource(id, filePath);
-    const { cap, target } = fpsBudget();
-    const fpsTarget = (info && info.fps > 0 && info.fps <= cap) ? 0 : target;
+    // maxFps<=0 → keep the native cadence; otherwise resample only when the
+    // source is over budget (or its rate is unreadable).
+    const fpsTarget = maxFps <= 0 ? 0
+      : ((info && info.fps > 0 && info.fps <= maxFps + 1) ? 0 : maxFps);
     active += 1;
 
     await fs.promises.mkdir(cachePath, { recursive: true });
-    const finalPath = path.join(cachePath, cacheName(id, maxHeight));
+    const finalPath = path.join(cachePath, cacheName(id, maxHeight, maxFps));
     const tempPath = path.join(cachePath, `.${id}.${process.pid}.${tempCounter++}.part`);
     const tempWs = fs.createWriteStream(tempPath);
 
@@ -293,10 +305,12 @@ function createVideoTranscoder({
     return job;
   }
 
-  // Animated-still → short looping 720p30 H.264 mp4, sharing encodeArgs with
-  // the video-post path. Animated JXL posts are delivered as video to every
-  // client that can decode it (the web kiosk's <video>, native-kiosk's mpv);
-  // this is the encode step. The caller passes the APNG it already produced
+  // Animated-still → short looping H.264 mp4, sharing encodeArgs with the
+  // video-post path. Animated JXL posts are delivered as video to every client
+  // that can decode it (the web kiosk's <video>, native-kiosk's mpv,
+  // Spatialstash's <img>); this is the encode step. `maxHeight`/`maxFps` cap
+  // the output — Pi kiosks pass 720/30, clients that want the source geometry
+  // (Spatialstash) pass 0/0. The caller passes the APNG it already produced
   // from the source via djxl — ffmpeg's apng demuxer reads it, but only from
   // a seekable file (it errors "Function not implemented" on a pipe), so the
   // APNG is staged to a temp file first. The mp4 still streams out over pipe:1
@@ -304,7 +318,7 @@ function createVideoTranscoder({
   // the clips are small, cached in the image variant cache, and served with a
   // Content-Length like any image variant. Returns null when no H.264 encoder
   // is available — the caller falls back to the pre-mp4 WebP/GIF variants.
-  async function animatedToMp4(apng) {
+  async function animatedToMp4(apng, { maxHeight = 0, maxFps = 0 } = {}) {
     const encoder = await detectEncoder();
     if (!encoder) return null;
 
@@ -317,7 +331,7 @@ function createVideoTranscoder({
         const chunks = [];
         let ffErr = '';
         const ff = spawn(ffmpegPath,
-          encodeArgs(encoder, tempPath, fpsBudget().target, 720, { inputFormat: 'apng', audio: false }),
+          encodeArgs(encoder, tempPath, maxFps > 0 ? maxFps : 0, maxHeight, { inputFormat: 'apng', audio: false }),
           { stdio: ['ignore', 'pipe', 'pipe'] });
         ff.stdout.on('data', (c) => chunks.push(c));
         ff.stderr.on('data', (c) => { ffErr += c; });

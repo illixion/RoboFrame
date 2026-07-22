@@ -149,8 +149,10 @@ Joins this session to the channel for `deviceId`. Send on every
   images. They must match the corresponding `/get?…` query parameters
   this session will use, otherwise the prefetched bytes will be the
   wrong variant and every cycle pays the conversion cost on the hot
-  path. Omitting `lowmem`/`gif` is treated as `false` (back-compat with
-  pre-prefetch clients).
+  path. All are optional: omitting `lowmem`/`gif`/`convert`/`bright` is
+  treated as `false`, and omitting `width`/`height` means no server-side
+  downscale (source resolution) — a client that fetches at native
+  resolution shouldn't send them at all.
 - `gif` opts a decoder-poor client (the PSP kiosk) back into animated
   **GIF**. Under `convert`/`lowmem`, animated posts are delivered as mp4
   (see the `/get` notes below); a client that can't decode mp4 and can't
@@ -547,28 +549,36 @@ with `sessionIds: ["win1", ..., "win10"]`).
   `GET /get?id=<id>&convert=&bright=&width=&height=&lowmem=`. Server
   returns JPEG (q95) on the `convert` path; `lowmem=1` re-encodes
   non-JXL sources to JPEG q85 for kiosks without WebP hardware decode.
-  Clients SHOULD also pass `&deviceId=<their deviceId>` so the server's
-  `/history` page can group the request under their display; omitting it
-  files the request under `others`.
+  `width`/`height` are optional: omit them (or `0`) to receive the source
+  resolution; supply them to fit-inside-downscale. Clients SHOULD also
+  pass `&deviceId=<their deviceId>` so the server's `/history` page can
+  group the request under their display; omitting it files it under `others`.
 - **Animated posts** (animated JXL / APNG) are content-negotiated by the
   same query params, and the response `Content-Type` is authoritative —
   the post's `ext` stays `jxl`, so clients must key rendering off the
   fetched MIME type, not the ext:
   - `convert=1` or `lowmem=1` → **`video/mp4`** (H.264), a short looping
     720p30 clip — the same encode budget as the video posts. Render it
-    through a looping `<video>` (or mpv) exactly like a video post. Falls
-    back to WebP/GIF when the server has no usable H.264 encoder.
+    through a looping `<video>` (or mpv) exactly like a video post.
+  - `vcodec=h264` → **`video/mp4`** (H.264) at the source resolution and
+    frame rate (cap with `vmaxh`/`vmaxfps`; `0` = no cap). For clients
+    that render H.264 as an animated image (Spatialstash's `<img>`).
   - `gif=1` → **`image/gif`** (256-color, per-frame timing preserved).
     The opt-out for clients that can't decode mp4 (PSP kiosk).
-  - neither flag → **`image/webp`** (animated).
-  A single fetch either way, so a decoder-poor client can pass `gif=1`
-  on every request without knowing in advance whether a post is animated.
+  - none of the above → **`image/webp`** (animated).
+  Any of the mp4 paths fall back to WebP/GIF when the server has no
+  usable H.264 encoder. A single fetch either way, so a client can pass
+  its preferred flag on every request without knowing in advance whether
+  a post is animated.
 - `ext` can also be `mp4` or `webm` — those entries are videos, and they
   carry `durationMs` (the indexed clip length; absent when the library
   indexed 0). `/get` streams them straight from disk (`convert`,
   `bright`, `lowmem`, `width`, `height` are ignored) with
   `Accept-Ranges: bytes` and single-range support; `vcodec=h264`
-  requests a hardware-decodable H.264 ≤1080p ≤30fps variant. Clients
+  requests a hardware-decodable H.264 variant, capped by `vmaxh`/`vmaxfps`
+  (height/fps; default 1080/30, `0` = source resolution / frame rate).
+  Encoded via VideoToolbox when available, else libx264 `-preset ultrafast`.
+  Clients
   should render with `<video autoplay muted playsInline>` pointed at the
   `/get` URL directly — do **not** fetch-to-blob and reuse, the clip
   may be ~100 MB and is likely to be cut off mid-loop by the next

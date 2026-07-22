@@ -375,7 +375,7 @@ async function applyDimAndConvertToJpeg(imageBuffer, dim, width, height) {
     }
 
     return sharp(imageBuffer)
-        .resize(width, height, { fit: 'inside', withoutEnlargement: true })
+        .resize(width || null, height || null, { fit: 'inside', withoutEnlargement: true })
         .flatten({ background: '#000000' })
         .linear(dim, 0)
         .jpeg({ quality: 95, mozjpeg: true })
@@ -445,8 +445,11 @@ async function convertFromJxl(imageData, width, height, bright = false) {
 // the JPEG default white. `?lowmem=1` lowers quality further to keep
 // the kiosk's per-image blob memory down on the prefetch side.
 async function convertBufferToJpeg(imageBuffer, width, height, quality = 95) {
+  // width/height of 0 (or falsy) → no resize: sharp treats null dimensions as
+  // "leave this axis alone", so `resize(null, null)` is a pass-through and the
+  // source resolution is preserved.
   return sharp(imageBuffer, { animated: false })
-    .resize(width, height, { fit: 'inside', withoutEnlargement: true })
+    .resize(width || null, height || null, { fit: 'inside', withoutEnlargement: true })
     .flatten({ background: '#000000' })
     .jpeg({ quality, mozjpeg: true })
     .toBuffer();
@@ -698,7 +701,7 @@ function lookupPostPath(postId) {
 
 // Encode the variant requested by /get (or the prefetcher). Pure async —
 // no req/res. Returns { buffer, mime, ext } or throws.
-async function computeVariant({ id, convert, bright, width, height, lowmem, wallpaper, gif }) {
+async function computeVariant({ id, convert, bright, width, height, lowmem, wallpaper, gif, h264, vmaxh, vmaxfps }) {
   const row = await lookupPostPath(id);
   if (!row) {
     const err = new Error('Post not found');
@@ -737,13 +740,18 @@ async function computeVariant({ id, convert, bright, width, height, lowmem, wall
       // posts / JPEG for stills, transparently.
       finalBuffer = await convertToAnimatedGif(data, width, height);
       finalMimeType = 'image/gif';
-    } else if (convert || lowmem) {
+    } else if (convert || lowmem || h264) {
       // Animated posts are delivered as video to every client that can decode
-      // it — a short looping 720p30 mp4, the same encode budget as the video
-      // posts (see lib/videoTranscode.js). convert (the web kiosk, which can't
-      // decode JXL at all) and lowmem (Pi-class decoders) share it.
+      // it — an H.264 mp4, sharing the video-post encode path (see
+      // lib/videoTranscode.js). lowmem (Pi-class decoders) and convert (the web
+      // kiosk, which can't decode JXL at all) cap it at 720p30; `vcodec=h264`
+      // (Spatialstash, which renders it via an <img>) takes the source
+      // resolution/frame rate unless vmaxh/vmaxfps say otherwise.
+      const caps = (!lowmem && !convert && h264)
+        ? { maxHeight: vmaxh, maxFps: vmaxfps }
+        : { maxHeight: 720, maxFps: 30 };
       const apng = await jxlToApng(data);
-      const mp4 = await videoTranscoder.animatedToMp4(apng);
+      const mp4 = await videoTranscoder.animatedToMp4(apng, caps);
       if (mp4) {
         finalBuffer = mp4;
         finalMimeType = 'video/mp4';
@@ -788,11 +796,19 @@ function variantKeyParts(query) {
     id,
     convert: Boolean(Number(query.convert) || 0),
     bright: Boolean(Number(query.bright) || 0),
-    width: Number(query.width) || 3840,
-    height: Number(query.height) || 2160,
+    // Width/height are optional: 0 means "no resize" (deliver at the source
+    // resolution). Clients that want a server-side downscale pass them.
+    width: Math.max(0, Number(query.width) || 0),
+    height: Math.max(0, Number(query.height) || 0),
     lowmem: Boolean(Number(query.lowmem) || 0),
     wallpaper: Boolean(Number(query.wallpaper) || 0),
     gif: Boolean(Number(query.gif) || 0),
+    // `vcodec=h264` on an animated post asks for H.264 mp4 (a client that
+    // renders video-as-image, e.g. Spatialstash). vmaxh/vmaxfps cap the encode
+    // (0 = source resolution / frame rate); absent → 0.
+    h264: query.vcodec === 'h264',
+    vmaxh: Math.max(0, Number(query.vmaxh) || 0),
+    vmaxfps: Math.max(0, Number(query.vmaxfps) || 0),
   };
 }
 
@@ -916,21 +932,25 @@ async function processRequestV2(req, res) {
       }
       // vcodec=h264: serve/build the hardware-decodable variant. Cache hits
       // stream like any file (Range-capable); a miss pipes ffmpeg's output
-      // live. Sources already in H.264 within the height cap, a missing
-      // ffmpeg, or a saturated transcoder all fall through to the raw file.
-      // `vmaxh` caps the output height (default 1080; Pi-class kiosks send
-      // 720 — see lib/videoTranscode.js for why resolution is the throttle).
+      // live. Sources already in H.264 within the caps, a missing ffmpeg, or a
+      // saturated transcoder all fall through to the raw file. `vmaxh`/`vmaxfps`
+      // cap output height/frame rate; `0` means no cap (Pi kiosks send 720/30,
+      // Spatialstash sends 0/0 for the source geometry). Absent vmaxh keeps the
+      // legacy 1080 default; absent vmaxfps keeps 30.
       if (req.query.vcodec === 'h264' && await videoTranscoder.available()) {
-        const vmaxh = Math.min(1080, Math.max(240, Number(req.query.vmaxh) || 1080));
-        const cached = videoTranscoder.cachedFile(parts.id, vmaxh);
+        const vmaxh = req.query.vmaxh === '0'
+          ? 0 : Math.min(4320, Math.max(240, Number(req.query.vmaxh) || 1080));
+        const vmaxfps = req.query.vmaxfps === '0'
+          ? 0 : Math.max(1, Number(req.query.vmaxfps) || 30);
+        const cached = videoTranscoder.cachedFile(parts.id, vmaxh, vmaxfps);
         if (cached) {
           streamVideo(req, res, cached, 'video/mp4', parts.id, 'mp4');
           return;
         }
-        if (await videoTranscoder.sourceNeedsTranscode(parts.id, filePath, vmaxh)
+        if (await videoTranscoder.sourceNeedsTranscode(parts.id, filePath, vmaxh, vmaxfps)
             && videoTranscoder.hasFreeSlot()) {
           if (cancelled || res.headersSent) return;
-          await videoTranscoder.stream(req, res, parts.id, filePath, vmaxh);
+          await videoTranscoder.stream(req, res, parts.id, filePath, vmaxh, vmaxfps);
           return;
         }
       }

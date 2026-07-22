@@ -213,17 +213,23 @@ the deadline) is the canary for the wake-advance class of bug.
   PNGs); `lowmem=1` re-encodes non-JXL sources too. Don't reintroduce
   WebP output without a Pi 3 reproducibility check.
 - **Animated posts are served as video, not an animated image.** Animated
-  JXL/APNG under `convert=1` or `lowmem=1` is transcoded to H.264 mp4
-  (djxl → APNG → ffmpeg, `lib/videoTranscode.js` `animatedToMp4`;
-  `lowmem` caps at 720p30). The response `Content-Type` is the only
-  signal — the post's `ext` stays `jxl` — so clients switch to a `<video>`
-  by sniffing the fetched MIME type (web kiosk: `blob.type`; native-kiosk:
-  the `Content-Type` header → mpv). `gif=1` is the opt-out that keeps the
-  old animated-GIF path for decoder-poor clients (PSP); with no flag the
-  fallback is animated WebP. mp4 falls back to WebP/GIF when the server
-  has no usable H.264 encoder. The variant cache and prefetch key on `gif`
-  like any other param — `imageCache.keyOf` must include it or a `gif=1`
-  request collides with the mp4 variant.
+  JXL/APNG is transcoded to H.264 mp4 (djxl → APNG → ffmpeg,
+  `lib/videoTranscode.js` `animatedToMp4`, sharing `encodeArgs` with the
+  video-post path). Trigger + caps by client:
+  - `convert=1` / `lowmem=1` → mp4 **720p30** (web + Pi kiosks).
+  - `vcodec=h264` → mp4 at **source res/fps** (cap via `vmaxh`/`vmaxfps`,
+    `0` = no cap) — for clients that render H.264 as an animated image.
+  - `gif=1` → animated **GIF** (PSP); no flag → animated **WebP**.
+  The response `Content-Type` is the only signal — the post's `ext` stays
+  `jxl` — so clients switch renderer by sniffing the fetched MIME type
+  (web kiosk: `blob.type`; native-kiosk: `Content-Type` → mpv). mp4 falls
+  back to WebP/GIF when there's no usable H.264 encoder. `imageCache.keyOf`
+  must include `gif`/`h264`/`vmaxh`/`vmaxfps` or these variants collide.
+- **All H.264 output (video + animated) is capped by `vmaxh`/`vmaxfps`**
+  (`0` = source), encoded via VideoToolbox when available, else libx264
+  `-preset ultrafast`. The video-transcode cache keys on both caps
+  (`${id}.h264.${h}p.${fps}fps.mp4`). `width`/`height` on `/get` are
+  optional — `0`/absent means no resize (source resolution).
 - **`bright` is direct RGB multiply, not alpha.** The old alpha-modulation
   path was equivalent (alpha-over-black ≡ RGB×α) but JPEG-incompatible.
   `applyDimAndConvertToJpeg` uses `.linear(dim, 0)`. No contrast bump —

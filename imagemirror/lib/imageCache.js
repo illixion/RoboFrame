@@ -28,7 +28,13 @@ function keyOf(parts) {
     const gif = parts.gif ? 1 : 0;
     const width = Number(parts.width) || 0;
     const height = Number(parts.height) || 0;
-    return `${id}|c${convert}|b${bright}|l${lowmem}|wp${wallpaper}|g${gif}|w${width}|h${height}`;
+    // h264/vmaxh/vmaxfps drive the animated-post mp4 variant; keying on them
+    // keeps Spatialstash's original-resolution H.264 from colliding with a
+    // kiosk's 720p30 mp4 (or a plain WebP) for the same id.
+    const h264 = parts.h264 ? 1 : 0;
+    const vmaxh = Number(parts.vmaxh) || 0;
+    const vmaxfps = Number(parts.vmaxfps) || 0;
+    return `${id}|c${convert}|b${bright}|l${lowmem}|wp${wallpaper}|g${gif}|w${width}|h${height}|x${h264}|vh${vmaxh}|vf${vmaxfps}`;
 }
 
 function createImageCache({ maxBytes = 256 * 1024 * 1024 } = {}) {

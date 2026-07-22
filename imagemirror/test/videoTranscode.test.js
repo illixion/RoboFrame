@@ -70,34 +70,48 @@ test('animatedToMp4 encodes an APNG to fMP4, capped to 720p30', { skip: !hasFfmp
 
     const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
     if (!await t.available()) return; // no H.264 encoder in this ffmpeg
-    const mp4 = await t.animatedToMp4(fs.readFileSync(apngPath));
-    assert.ok(Buffer.isBuffer(mp4) && mp4.length > 0, 'produced an mp4 buffer');
-    assert.equal(mp4.slice(4, 8).toString('ascii'), 'ftyp', 'starts with an mp4 ftyp box');
 
-    const probePath = path.join(dir, 'out.mp4');
-    fs.writeFileSync(probePath, mp4);
-    const info = execFileSync('ffprobe', [
-        '-v', 'error', '-select_streams', 'v:0',
-        '-show_entries', 'stream=height,avg_frame_rate', '-of', 'csv=p=0', probePath,
-    ]).toString().trim();
-    const [height, rate] = info.split(',');
-    assert.ok(Number(height) <= 720, `height capped to 720, got ${height}`);
-    const [num, den] = rate.split('/').map(Number);
-    assert.ok(num / den <= 31, `frame rate capped to ~30fps, got ${rate}`);
+    const probe = (mp4, label) => {
+        assert.ok(Buffer.isBuffer(mp4) && mp4.length > 0, `${label}: produced an mp4 buffer`);
+        assert.equal(mp4.slice(4, 8).toString('ascii'), 'ftyp', `${label}: starts with an mp4 ftyp box`);
+        const probePath = path.join(dir, `out-${label}.mp4`);
+        fs.writeFileSync(probePath, mp4);
+        const info = execFileSync('ffprobe', [
+            '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=height,avg_frame_rate', '-of', 'csv=p=0', probePath,
+        ]).toString().trim().split(',');
+        const [num, den] = info[1].split('/').map(Number);
+        return { height: Number(info[0]), fps: num / den };
+    };
+
+    // Capped (kiosk profile): 720p30.
+    const capped = probe(await t.animatedToMp4(fs.readFileSync(apngPath), { maxHeight: 720, maxFps: 30 }), 'capped');
+    assert.ok(capped.height <= 720, `height capped to 720, got ${capped.height}`);
+    assert.ok(capped.fps <= 31, `frame rate capped to ~30fps, got ${capped.fps}`);
+
+    // Uncapped (Spatialstash profile): source resolution + frame rate.
+    const orig = probe(await t.animatedToMp4(fs.readFileSync(apngPath), { maxHeight: 0, maxFps: 0 }), 'orig');
+    assert.equal(orig.height, 1440, `uncapped keeps source height, got ${orig.height}`);
+    assert.ok(orig.fps > 31, `uncapped keeps source frame rate, got ${orig.fps}`);
 });
 
-test('cachedFile misses then hits, keyed by height', () => {
+test('cachedFile misses then hits, keyed by height and fps', () => {
     const dir = tmpDir();
     const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
-    assert.equal(t.cachedFile(42), null); // default height 1080
-    fs.writeFileSync(path.join(dir, '42.h264.1080p.mp4'), 'x');
-    assert.equal(t.cachedFile(42), path.join(dir, '42.h264.1080p.mp4'));
+    assert.equal(t.cachedFile(42), null); // default 1080p30
+    fs.writeFileSync(path.join(dir, '42.h264.1080p.30fps.mp4'), 'x');
+    assert.equal(t.cachedFile(42), path.join(dir, '42.h264.1080p.30fps.mp4'));
     // A different height cap is a distinct cache entry, not a hit.
     assert.equal(t.cachedFile(42, 720), null);
-    fs.writeFileSync(path.join(dir, '42.h264.720p.mp4'), 'y');
-    assert.equal(t.cachedFile(42, 720), path.join(dir, '42.h264.720p.mp4'));
-    // Legacy pre-height entries are ignored so they re-encode at current settings.
+    fs.writeFileSync(path.join(dir, '42.h264.720p.30fps.mp4'), 'y');
+    assert.equal(t.cachedFile(42, 720), path.join(dir, '42.h264.720p.30fps.mp4'));
+    // A different fps cap is also distinct (720p30 vs 720p original/0fps).
+    assert.equal(t.cachedFile(42, 720, 0), null);
+    fs.writeFileSync(path.join(dir, '42.h264.720p.0fps.mp4'), 'w');
+    assert.equal(t.cachedFile(42, 720, 0), path.join(dir, '42.h264.720p.0fps.mp4'));
+    // Legacy pre-fps entries are ignored so they re-encode at current settings.
     fs.writeFileSync(path.join(dir, '99.h264.mp4'), 'z');
+    fs.writeFileSync(path.join(dir, '99.h264.1080p.mp4'), 'z');
     assert.equal(t.cachedFile(99), null);
 });
 
@@ -114,6 +128,27 @@ test('prune drops oldest entries beyond the byte cap', async () => {
     await new Promise((r) => setTimeout(r, 200));
     const left = fs.readdirSync(dir).sort();
     assert.deepEqual(left, ['1.h264.mp4', '2.h264.mp4']);
+});
+
+test('0/0 caps serve any H.264 source raw; an fps cap forces a transcode', { skip: !hasFfmpeg() }, async () => {
+    const dir = tmpDir();
+    const src = path.join(dir, 'h264_1080_60.mp4');
+    let made = true;
+    try {
+        execFileSync('ffmpeg', [
+            '-hide_banner', '-loglevel', 'error',
+            '-f', 'lavfi', '-i', 'testsrc=duration=0.5:size=1920x1080:rate=60',
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', src,
+        ], { stdio: 'ignore' });
+    } catch {
+        made = false; // ffmpeg built without libx264 — nothing to assert
+    }
+    if (!made) return;
+    const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
+    // Original caps (0/0): a 1080p60 H.264 source is taken raw, no transcode.
+    assert.equal(await t.sourceNeedsTranscode(11, src, 0, 0), false);
+    // No height cap but a 30fps cap still forces a resample of the 60fps source.
+    assert.equal(await t.sourceNeedsTranscode(11, src, 0, 30), true);
 });
 
 test('hasFreeSlot respects maxConcurrent', () => {
