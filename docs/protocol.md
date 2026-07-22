@@ -121,6 +121,7 @@ Joins this session to the channel for `deviceId`. Send on every
   "bright": false,
   "convert": false,
   "lowmem": false,
+  "gif": false,
   "modTags": ["rating:s", "-blood"]
 }}
 ```
@@ -143,13 +144,19 @@ Joins this session to the channel for `deviceId`. Send on every
   mixing a landscape and a portrait window still gets a usable filter
   instead of none. Re-send `slideshowConfig` with a new `ratio` to
   trigger a queue refill (e.g. after a window resize).
-- `bright`, `convert`, `lowmem`, `width`, `height` are the variant
+- `bright`, `convert`, `lowmem`, `gif`, `width`, `height` are the variant
   fingerprint the server uses for background pre-conversion of upcoming
   images. They must match the corresponding `/get?…` query parameters
   this session will use, otherwise the prefetched bytes will be the
   wrong variant and every cycle pays the conversion cost on the hot
-  path. Omitting `lowmem` is treated as `false` (back-compat with
+  path. Omitting `lowmem`/`gif` is treated as `false` (back-compat with
   pre-prefetch clients).
+- `gif` opts a decoder-poor client (the PSP kiosk) back into animated
+  **GIF**. Under `convert`/`lowmem`, animated posts are delivered as mp4
+  (see the `/get` notes below); a client that can't decode mp4 and can't
+  tell a post is animated before fetching sends `gif:true` on every
+  request, and the server returns GIF for animated posts / JPEG for
+  stills, transparently.
 
 ### `imageReady` (required for slideshow sessions, session-scoped)
 Tell the server the channel's current image is fully on screen.
@@ -538,12 +545,24 @@ with `sessionIds: ["win1", ..., "win10"]`).
   `null` when no merge is active.
 - `current` / `next` / `upcoming` are id+ext only — fetch with
   `GET /get?id=<id>&convert=&bright=&width=&height=&lowmem=`. Server
-  returns JPEG (q95) on the `convert` path and APNG for animated PNG
-  posts; `lowmem=1` re-encodes non-JXL sources to JPEG q85 for kiosks
-  without WebP hardware decode. Clients SHOULD also pass
-  `&deviceId=<their deviceId>` so the server's `/history` page can group
-  the request under their display; omitting it files the request under
-  `others`.
+  returns JPEG (q95) on the `convert` path; `lowmem=1` re-encodes
+  non-JXL sources to JPEG q85 for kiosks without WebP hardware decode.
+  Clients SHOULD also pass `&deviceId=<their deviceId>` so the server's
+  `/history` page can group the request under their display; omitting it
+  files the request under `others`.
+- **Animated posts** (animated JXL / APNG) are content-negotiated by the
+  same query params, and the response `Content-Type` is authoritative —
+  the post's `ext` stays `jxl`, so clients must key rendering off the
+  fetched MIME type, not the ext:
+  - `convert=1` or `lowmem=1` → **`video/mp4`** (H.264), a short looping
+    720p30 clip — the same encode budget as the video posts. Render it
+    through a looping `<video>` (or mpv) exactly like a video post. Falls
+    back to WebP/GIF when the server has no usable H.264 encoder.
+  - `gif=1` → **`image/gif`** (256-color, per-frame timing preserved).
+    The opt-out for clients that can't decode mp4 (PSP kiosk).
+  - neither flag → **`image/webp`** (animated).
+  A single fetch either way, so a decoder-poor client can pass `gif=1`
+  on every request without knowing in advance whether a post is animated.
 - `ext` can also be `mp4` or `webm` — those entries are videos, and they
   carry `durationMs` (the indexed clip length; absent when the library
   indexed 0). `/get` streams them straight from disk (`convert`,

@@ -43,6 +43,49 @@ test('unusable ffmpeg -> unavailable, never throws', async () => {
     assert.equal(await t.available(), false);
 });
 
+test('animatedToMp4 returns null when no encoder is available', async () => {
+    const t = createVideoTranscoder({
+        cachePath: tmpDir(),
+        ffmpegPath: '/nonexistent/ffmpeg',
+        log: quietLog,
+    });
+    assert.equal(await t.animatedToMp4(Buffer.from('not really apng')), null);
+});
+
+test('animatedToMp4 encodes an APNG to fMP4, capped to 720p30', { skip: !hasFfmpeg() }, async () => {
+    const dir = tmpDir();
+    // A tall, fast animated PNG so the 720p/30fps caps actually bite.
+    const apngPath = path.join(dir, 'src.apng');
+    let made = true;
+    try {
+        execFileSync('ffmpeg', [
+            '-hide_banner', '-loglevel', 'error',
+            '-f', 'lavfi', '-i', 'testsrc=duration=0.5:size=1080x1440:rate=60',
+            '-f', 'apng', '-plays', '0', apngPath,
+        ], { stdio: 'ignore' });
+    } catch {
+        made = false; // ffmpeg built without the apng muxer — nothing to assert
+    }
+    if (!made) return;
+
+    const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
+    if (!await t.available()) return; // no H.264 encoder in this ffmpeg
+    const mp4 = await t.animatedToMp4(fs.readFileSync(apngPath));
+    assert.ok(Buffer.isBuffer(mp4) && mp4.length > 0, 'produced an mp4 buffer');
+    assert.equal(mp4.slice(4, 8).toString('ascii'), 'ftyp', 'starts with an mp4 ftyp box');
+
+    const probePath = path.join(dir, 'out.mp4');
+    fs.writeFileSync(probePath, mp4);
+    const info = execFileSync('ffprobe', [
+        '-v', 'error', '-select_streams', 'v:0',
+        '-show_entries', 'stream=height,avg_frame_rate', '-of', 'csv=p=0', probePath,
+    ]).toString().trim();
+    const [height, rate] = info.split(',');
+    assert.ok(Number(height) <= 720, `height capped to 720, got ${height}`);
+    const [num, den] = rate.split('/').map(Number);
+    assert.ok(num / den <= 31, `frame rate capped to ~30fps, got ${rate}`);
+});
+
 test('cachedFile misses then hits, keyed by height', () => {
     const dir = tmpDir();
     const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
@@ -169,7 +212,7 @@ test('end-to-end: 60fps H.264 source is transcoded and capped to 30fps', { skip:
     assert.ok(Math.abs(num / den - 30) < 1, `output frame rate is ~30fps, got ${rate}`);
 });
 
-test('end-to-end: 60fps source keeps 60fps when capped to 720p', { skip: !hasFfmpeg() }, async () => {
+test('end-to-end: 60fps source is capped to 30fps even at 720p', { skip: !hasFfmpeg() }, async () => {
     const dir = tmpDir();
     const src = path.join(dir, 'src720_60.mp4');
     let made = true;
@@ -184,12 +227,12 @@ test('end-to-end: 60fps source keeps 60fps when capped to 720p', { skip: !hasFfm
     }
     if (!made) return;
     const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
-    // A 720p60 H.264 source fits the raw path at the 720 cap (60fps is within
-    // budget there) but not at 1080 (30fps budget).
-    assert.equal(await t.sourceNeedsTranscode(7, src, 720), false);
+    // 30fps is the budget at every height now, so a 720p60 source no longer
+    // fits the raw path — it's resampled to 30fps like the 1080p case.
+    assert.equal(await t.sourceNeedsTranscode(7, src, 720), true);
     assert.equal(await t.sourceNeedsTranscode(7, src, 1080), true);
 
-    // Transcoding a non-H.264 60fps source at 720p preserves 60fps.
+    // Transcoding a non-H.264 60fps source at 720p resamples to 30fps.
     const m4 = path.join(dir, 'src720_60.m4v');
     execFileSync('ffmpeg', [
         '-hide_banner', '-loglevel', 'error',
@@ -209,5 +252,5 @@ test('end-to-end: 60fps source keeps 60fps when capped to 720p', { skip: !hasFfm
         '-show_entries', 'stream=avg_frame_rate', '-of', 'csv=p=0', cached,
     ]).toString().trim();
     const [num, den] = rate.split('/').map(Number);
-    assert.ok(Math.abs(num / den - 60) < 1, `output frame rate is ~60fps, got ${rate}`);
+    assert.ok(Math.abs(num / den - 30) < 1, `output frame rate is ~30fps, got ${rate}`);
 });

@@ -152,7 +152,7 @@ function trimCache(keepIds = new Set()) {
     }
 }
 
-function addToCache(post, objectUrl) {
+function addToCache(post, objectUrl, isVideo) {
     if (!post || !post.id || !objectUrl) return;
     const existing = mediaCache.get(post.id);
     if (existing && existing.objectUrl && existing.objectUrl !== objectUrl) {
@@ -163,7 +163,9 @@ function addToCache(post, objectUrl) {
         ext: post.ext,
         url: post.url,
         objectUrl,
-        isVideo: isVideoExt(post.ext),
+        // An animated post is delivered as mp4 even though its ext stays `jxl`,
+        // so trust the fetched blob's MIME type over the ext when it's known.
+        isVideo: isVideo != null ? isVideo : isVideoExt(post.ext),
         lastUsedAt: Date.now(),
     });
 }
@@ -202,7 +204,12 @@ function runPrefetchWorker() {
             })
             .then((blob) => {
                 const objectUrl = URL.createObjectURL(blob);
-                addToCache(nextPost, objectUrl);
+                // Animated posts come back as video/mp4 even though the post's
+                // ext is still `jxl` — render those through the <video> layer.
+                const isVideo = typeof blob.type === 'string'
+                    ? blob.type.startsWith('video/')
+                    : isVideoExt(nextPost.ext);
+                addToCache(nextPost, objectUrl, isVideo);
             })
             .catch((error) => {
                 if (error?.name !== 'AbortError') {

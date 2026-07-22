@@ -207,18 +207,14 @@ function splitApngFrames(buf) {
 }
 
 /**
- * Convert an animated JXL to animated WebP. djxl emits APNG (its only
- * animated output format); we split that into standalone PNG frames in
- * memory and let sharp join them into an animated WebP. Encoding rides on
- * sharp's bundled libvips/libwebp — the same stack already rebuilt by
- * scripts/fix-sharp-libvips.sh — so there's no separate ffmpeg/libwebp
- * binary to keep in step with it. libvips' PNG loader doesn't decode APNG
- * animation itself, hence the explicit per-frame split.
+ * Decode an animated JXL to APNG (djxl's only animated output format).
+ * Shared by every animated variant path — the WebP/GIF splitters and the
+ * mp4 encoder all start from this intermediate.
  * @param {Buffer} imageData - Raw JXL bytes.
- * @returns {Promise<Buffer>}
+ * @returns {Promise<Buffer>} APNG bytes.
  */
-async function convertToAnimatedWebP(imageData) {
-  const apngBuf = await new Promise((resolve, reject) => {
+function jxlToApng(imageData) {
+  return new Promise((resolve, reject) => {
     const chunks = [];
     let err = '';
     const djxl = spawn(DJXL_PATH, ['-', '-', '--output_format', 'apng']);
@@ -232,6 +228,21 @@ async function convertToAnimatedWebP(imageData) {
     djxl.stdin.on('error', () => {});
     djxl.stdin.end(imageData);
   });
+}
+
+/**
+ * Convert an animated JXL to animated WebP. djxl emits APNG; we split that
+ * into standalone PNG frames in memory and let sharp join them into an
+ * animated WebP. Encoding rides on sharp's bundled libvips/libwebp — the
+ * same stack already rebuilt by scripts/fix-sharp-libvips.sh — so there's
+ * no separate ffmpeg/libwebp binary to keep in step with it. libvips' PNG
+ * loader doesn't decode APNG animation itself, hence the explicit per-frame
+ * split. This is the no-flag fallback; convert/lowmem serve mp4 instead.
+ * @param {Buffer} imageData - Raw JXL bytes.
+ * @returns {Promise<Buffer>}
+ */
+async function convertToAnimatedWebP(imageData) {
+  const apngBuf = await jxlToApng(imageData);
 
   const frames = splitApngFrames(apngBuf);
   // APNG per-frame delay is delayNum/delayDen seconds (delayDen == 0 is spec
@@ -248,26 +259,15 @@ async function convertToAnimatedWebP(imageData) {
  * the join and the result is GIF: this is the `lowmem=1` animated variant for
  * clients that can't decode WebP at all (PSP kiosk) or only in software
  * (Pi-class boards). 256 colors is the price of universal decodability.
+ * Reached via `gif=1` — the opt-in that keeps decoder-poor clients on GIF
+ * now that plain lowmem serves animated posts as mp4.
  * @param {Buffer} imageData - Raw JXL bytes.
  * @param {number} [width] - Max output width (fit inside, no enlargement).
  * @param {number} [height] - Max output height.
  * @returns {Promise<Buffer>}
  */
 async function convertToAnimatedGif(imageData, width, height) {
-  const apngBuf = await new Promise((resolve, reject) => {
-    const chunks = [];
-    let err = '';
-    const djxl = spawn(DJXL_PATH, ['-', '-', '--output_format', 'apng']);
-    djxl.stdout.on('data', (c) => chunks.push(c));
-    djxl.stderr.on('data', (c) => { err += c.toString(); });
-    djxl.on('error', (e) => reject(new Error(`djxl spawn failed: ${e.message}`)));
-    djxl.on('close', (code) => {
-      if (code !== 0) return reject(new Error(`djxl exit ${code}: ${err.trim()}`));
-      resolve(Buffer.concat(chunks));
-    });
-    djxl.stdin.on('error', () => {});
-    djxl.stdin.end(imageData);
-  });
+  const apngBuf = await jxlToApng(imageData);
 
   const frames = splitApngFrames(apngBuf);
   const delay = frames.map((f) => Math.round(((f.delayNum || 1) / (f.delayDen || 100)) * 1000));
@@ -679,7 +679,7 @@ const EXT_MIME = {
 const VIDEO_EXTS = new Set(['webm', 'mp4']);
 const MIME_EXT = {
   'image/webp': 'webp', 'image/jpeg': 'jpg', 'image/png': 'png',
-  'image/apng': 'apng', 'image/gif': 'gif',
+  'image/apng': 'apng', 'image/gif': 'gif', 'video/mp4': 'mp4',
 };
 
 function lookupPostPath(postId) {
@@ -698,7 +698,7 @@ function lookupPostPath(postId) {
 
 // Encode the variant requested by /get (or the prefetcher). Pure async —
 // no req/res. Returns { buffer, mime, ext } or throws.
-async function computeVariant({ id, convert, bright, width, height, lowmem, wallpaper }) {
+async function computeVariant({ id, convert, bright, width, height, lowmem, wallpaper, gif }) {
   const row = await lookupPostPath(id);
   if (!row) {
     const err = new Error('Post not found');
@@ -730,9 +730,34 @@ async function computeVariant({ id, convert, bright, width, height, lowmem, wall
   const srcExt = path.extname(filePath).slice(1).toLowerCase();
 
   if (animatedMode) {
-    if (lowmem) {
+    if (gif) {
+      // Decoder-poor clients (PSP kiosk) opt back into GIF: they can't play
+      // mp4 and can't know a post is animated before fetching, so `gif=1`
+      // rides along on every request and the server returns GIF for animated
+      // posts / JPEG for stills, transparently.
       finalBuffer = await convertToAnimatedGif(data, width, height);
       finalMimeType = 'image/gif';
+    } else if (convert || lowmem) {
+      // Animated posts are delivered as video to every client that can decode
+      // it — a short looping 720p30 mp4, the same encode budget as the video
+      // posts (see lib/videoTranscode.js). convert (the web kiosk, which can't
+      // decode JXL at all) and lowmem (Pi-class decoders) share it.
+      const apng = await jxlToApng(data);
+      const mp4 = await videoTranscoder.animatedToMp4(apng);
+      if (mp4) {
+        finalBuffer = mp4;
+        finalMimeType = 'video/mp4';
+      } else {
+        // No usable ffmpeg encoder — fall back to the pre-mp4 animated
+        // variants so the post still renders somewhere.
+        if (lowmem) {
+          finalBuffer = await convertToAnimatedGif(data, width, height);
+          finalMimeType = 'image/gif';
+        } else {
+          finalBuffer = await convertToAnimatedWebP(data);
+          finalMimeType = 'image/webp';
+        }
+      }
     } else {
       finalBuffer = await convertToAnimatedWebP(data);
       finalMimeType = 'image/webp';
@@ -767,6 +792,7 @@ function variantKeyParts(query) {
     height: Number(query.height) || 2160,
     lowmem: Boolean(Number(query.lowmem) || 0),
     wallpaper: Boolean(Number(query.wallpaper) || 0),
+    gif: Boolean(Number(query.gif) || 0),
   };
 }
 
@@ -1324,7 +1350,7 @@ app.get('/search', async (req, res) => {
 //          least-seen-first and bumps the view count, so repeated calls
 //          shuffle through the library without replacement — better spread
 //          for a scheduled wallpaper.
-//   convert/bright/width/height/lowmem  passthrough to the variant pipeline
+//   convert/bright/width/height/lowmem/gif  passthrough to the variant pipeline
 //   wallpaper=1 compose onto a width×height canvas (see /get) — for setting a
 //          device wallpaper / lock screen of a fixed resolution
 //   json=1 return { id, ext } instead of the image bytes

@@ -802,10 +802,13 @@ static int fetchImage(Slot *slot, long want_id, int replay) {
 
     /* History replays skip the server-side /history record so browsing
      * back doesn't spam duplicate entries. The vcodec/fps/vmaxsec params
-     * only bite on video posts — image variants ignore them. */
+     * only bite on video posts — image variants ignore them. `gif=1` keeps
+     * animated posts coming back as GIF (which we decode via giflib): plain
+     * lowmem now serves animated JXL as mp4, which the PSP can't decode, and
+     * we can't tell a post is animated before fetching it. */
     char path[768];
     snprintf(path, sizeof(path),
-             "/get?id=%ld&token=%s&width=%d&height=%d&lowmem=%d&deviceId=%s"
+             "/get?id=%ld&token=%s&width=%d&height=%d&lowmem=%d&gif=1&deviceId=%s"
              "&vcodec=mjpeg&fps=%d&vmaxsec=%d%s",
              id, cfg.token, SCR_W, SCR_H, cfg.lowmem, cfg.device_id,
              VIDEO_FPS, VIDEO_MAX_SEC, replay ? "&record=0" : "");
@@ -1056,7 +1059,7 @@ static int wsThread(SceSize args, void *argp) {
                  "{\"sessionId\":\"" SESSION_ID "\",\"action\":\"slideshowConfig\","
                  "\"payload\":{\"deviceId\":\"%s\",\"interval\":%d,"
                  "\"ratio\":1.765,\"width\":%d,\"height\":%d,"
-                 "\"lowmem\":%s}}",
+                 "\"lowmem\":%s,\"gif\":true}}",
                  cfg.device_id, cfg.dwell_sec * 1000, SCR_W, SCR_H,
                  cfg.lowmem ? "true" : "false");
         if (wsSendText(s, cfgmsg) < 0) { wsClose(s); continue; }

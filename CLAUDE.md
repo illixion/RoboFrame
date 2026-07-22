@@ -212,6 +212,18 @@ the deadline) is the canary for the wake-advance class of bug.
   `convert` path emits JPEG q95 with a black flatten (covers alpha
   PNGs); `lowmem=1` re-encodes non-JXL sources too. Don't reintroduce
   WebP output without a Pi 3 reproducibility check.
+- **Animated posts are served as video, not an animated image.** Animated
+  JXL/APNG under `convert=1` or `lowmem=1` is transcoded to H.264 mp4
+  (djxl → APNG → ffmpeg, `lib/videoTranscode.js` `animatedToMp4`;
+  `lowmem` caps at 720p30). The response `Content-Type` is the only
+  signal — the post's `ext` stays `jxl` — so clients switch to a `<video>`
+  by sniffing the fetched MIME type (web kiosk: `blob.type`; native-kiosk:
+  the `Content-Type` header → mpv). `gif=1` is the opt-out that keeps the
+  old animated-GIF path for decoder-poor clients (PSP); with no flag the
+  fallback is animated WebP. mp4 falls back to WebP/GIF when the server
+  has no usable H.264 encoder. The variant cache and prefetch key on `gif`
+  like any other param — `imageCache.keyOf` must include it or a `gif=1`
+  request collides with the mp4 variant.
 - **`bright` is direct RGB multiply, not alpha.** The old alpha-modulation
   path was equivalent (alpha-over-black ≡ RGB×α) but JPEG-incompatible.
   `applyDimAndConvertToJpeg` uses `.linear(dim, 0)`. No contrast bump —

@@ -301,6 +301,36 @@ class Connection:
 
 # ---------- image fetch ----------------------------------------------------
 
+class AnimatedClip:
+    """A slideshow post the server delivered as mp4 rather than a still.
+
+    Animated JXL posts are transcoded to H.264 by /get under convert/lowmem
+    (see imagemirror/lib/videoTranscode.js). pygame can't blit video frames,
+    so the clip is staged to a temp file on disk and the render path hands it
+    to mpv exactly like a video post — no extra machinery, just a different
+    source for the same slideshow-video player.
+    """
+
+    _dir = tempfile.gettempdir()
+
+    def __init__(self, pid, path):
+        self.id = pid
+        self.path = path
+
+    @classmethod
+    def write(cls, pid, data):
+        path = os.path.join(cls._dir, f"roboframe-anim-{pid}.mp4")
+        with open(path, "wb") as f:
+            f.write(data)
+        return cls(pid, path)
+
+    def unlink(self):
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+
 class Fetcher:
     """Bounded background image fetcher.
 
@@ -343,7 +373,9 @@ class Fetcher:
         with self.cache_lock:
             for k in list(self.cache.keys()):
                 if k not in keep_ids:
-                    del self.cache[k]
+                    v = self.cache.pop(k)
+                    if isinstance(v, AnimatedClip):
+                        v.unlink()
 
     def _build_url(self, post):
         w, h = self.screen_size
@@ -368,35 +400,42 @@ class Fetcher:
         while True:
             post = self.q.get()
             pid = post["id"]
-            surf = None
+            result = None
             try:
                 url = self._build_url(post)
                 r = SESSION.get(url, timeout=20)
                 r.raise_for_status()
-                img = Image.open(io.BytesIO(r.content))
-                img.load()
-                # The server's /get uses `fit: inside, withoutEnlargement:
-                # true`, so it returns the source unchanged when it's
-                # already smaller than the requested box. Fit-inside the
-                # screen ourselves — upscale small images, downscale large.
-                sw, sh = self.screen_size
-                scale = min(sw / img.width, sh / img.height)
-                if scale != 1.0:
-                    new_size = (max(1, int(img.width * scale)),
-                                max(1, int(img.height * scale)))
-                    img = img.resize(new_size, Image.LANCZOS)
-                if img.mode != "RGB":
-                    img = img.convert("RGB")
-                surf = pygame.image.fromstring(img.tobytes(), img.size, "RGB")
+                ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                if ctype.startswith("video/"):
+                    # An animated post — the server converts animated JXL to
+                    # mp4 under convert/lowmem. Stage it for mpv; the render
+                    # path plays it like any slideshow video.
+                    result = AnimatedClip.write(pid, r.content)
+                else:
+                    img = Image.open(io.BytesIO(r.content))
+                    img.load()
+                    # The server's /get uses `fit: inside, withoutEnlargement:
+                    # true`, so it returns the source unchanged when it's
+                    # already smaller than the requested box. Fit-inside the
+                    # screen ourselves — upscale small images, downscale large.
+                    sw, sh = self.screen_size
+                    scale = min(sw / img.width, sh / img.height)
+                    if scale != 1.0:
+                        new_size = (max(1, int(img.width * scale)),
+                                    max(1, int(img.height * scale)))
+                        img = img.resize(new_size, Image.LANCZOS)
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    result = pygame.image.fromstring(img.tobytes(), img.size, "RGB")
             except Exception as e:
                 log.warning("fetch %s failed: %s", pid, e)
             finally:
                 with self.in_flight_lock:
                     self.in_flight.discard(pid)
-            if surf is not None:
+            if result is not None:
                 with self.cache_lock:
-                    self.cache[pid] = surf
-            self.ready_q.put((pid, surf))
+                    self.cache[pid] = result
+            self.ready_q.put((pid, result))
 
 
 # ---------- keyboard capture ----------------------------------------------
@@ -843,9 +882,15 @@ class Kiosk:
         if cur_video:
             self._play_slideshow_video(cur)
         else:
-            # A photo (or nothing) is current — tear down any playing video
-            # so mpv stops covering the framebuffer, then fetch the image.
-            self._stop_slideshow_video()
+            # A photo (or nothing) is current — tear down any playing video so
+            # mpv stops covering the framebuffer, then fetch the image. An
+            # animated post that's already playing as a clip (same id) stays
+            # put: a stateless re-broadcast of the current frame must not
+            # restart it. Whether the fetched post turns out to be a still or
+            # an animated clip is only known once the bytes arrive.
+            if not (self.slideshow_video
+                    and self.slideshow_video.get("id") == cur.get("id")):
+                self._stop_slideshow_video()
             if cur.get("id"):
                 self.fetcher.request(cur)
 
@@ -886,7 +931,7 @@ class Kiosk:
             self.fetcher.request(post)
             s = self.fetcher.get(post["id"])
             if s is not None:
-                self._render(post["id"], s)
+                self._present(post["id"], s)
 
     def _seed_history_from_server(self):
         # One-shot pre-population of the previous stack from the server's
@@ -1204,7 +1249,11 @@ class Kiosk:
         # where mpv opens its own window.
         return [f"--wid={self._wid}"] if getattr(self, "_wid", None) else []
 
-    def _play_slideshow_video(self, post):
+    def _play_slideshow_video(self, post, src=None):
+        # `src`, when given, is a local file path (an animated post staged as
+        # mp4) played instead of the streamed /get URL. Everything else — the
+        # generation fencing, duration probe, overlay socket, teardown — is
+        # identical to a video post.
         pid = post.get("id")
         if not pid:
             return
@@ -1233,7 +1282,7 @@ class Kiosk:
                 self._send_image_ready(pid)
             return
 
-        url = self._build_video_url(post)
+        url = src if src else self._build_video_url(post)
         ipc_path = os.path.join(tempfile.gettempdir(),
                                 f"roboframe-mpv-{os.getpid()}-{gen}.sock")
         try:
@@ -1937,22 +1986,41 @@ class Kiosk:
         rendered = False
         try:
             while True:
-                pid, surf = self.fetcher.ready_q.get_nowait()
-                # surface itself is already in the cache; ready_q is just a
+                pid, item = self.fetcher.ready_q.get_nowait()
+                # the result is already in the cache; ready_q is just a
                 # wake-up signal for the main thread.
-                if surf is None:
+                if item is None:
                     continue
                 if pid == cur_id and pid != self.current_id and not self._is_off():
-                    self._render(pid, surf)
+                    self._present(pid, item)
                     rendered = True
         except queue.Empty:
             pass
-        # On re-apply (e.g. wake) the surface may already be cached when we
+        # On re-apply (e.g. wake) the result may already be cached when we
         # got the playback frame — render proactively.
         if not rendered and cur_id and cur_id != self.current_id and not self._is_off():
             s = self.fetcher.get(cur_id)
             if s is not None:
-                self._render(cur_id, s)
+                self._present(cur_id, s)
+
+    def _post_for(self, pid):
+        """Resolve the playback post for `pid` so an animated clip can be
+        played with its server-supplied metadata (durationMs). Falls back to
+        a bare {id} — a clip with unknown length simply loops."""
+        if self.nav_override and self.nav_override.get("id") == pid:
+            return self.nav_override
+        cur = (self.last_playback or {}).get("current") or {}
+        if cur.get("id") == pid:
+            return cur
+        return {"id": pid}
+
+    def _present(self, pid, item):
+        """Route a fetched result: a still surface renders through pygame; an
+        animated clip (mp4) plays through the same mpv path as a video post."""
+        if isinstance(item, AnimatedClip):
+            self._play_slideshow_video(self._post_for(pid), src=item.path)
+        else:
+            self._render(pid, item)
 
     SAVE_ID_LAG = 1.5  # seconds; see save_id docstring above.
 

@@ -8,22 +8,19 @@ function makeBuffer(bytes) {
     return Buffer.alloc(bytes, 0xab);
 }
 
-test('keyOf folds animated variants to a single key', () => {
-    const a = keyOf({ id: 7, animated: true, convert: true, width: 1920, height: 1080 });
-    const b = keyOf({ id: 7, animated: true });
-    assert.equal(a, b);
-    assert.notEqual(a, keyOf({ id: 7 }));
-});
-
 test('keyOf is variant-aware', () => {
     const base = { id: 1, convert: true, bright: false, width: 1920, height: 1080, lowmem: false };
     const k1 = keyOf(base);
     const k2 = keyOf({ ...base, lowmem: true });
     const k3 = keyOf({ ...base, width: 3840 });
     const k4 = keyOf({ ...base, wallpaper: true });
+    const k5 = keyOf({ ...base, gif: true });
     assert.notEqual(k1, k2);
     assert.notEqual(k1, k3);
     assert.notEqual(k1, k4);
+    // gif=1 (GIF for decoder-poor clients) must not collide with the mp4
+    // variant convert/lowmem produce for the same id and dimensions.
+    assert.notEqual(k1, k5);
 });
 
 test('LRU eviction respects maxBytes', async () => {

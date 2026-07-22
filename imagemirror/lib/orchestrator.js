@@ -697,10 +697,11 @@ function createOrchestrator({
                     convert: !!p.convert,
                     bright: !!p.bright,
                     lowmem: !!p.lowmem,
+                    gif: !!p.gif,
                     width: Number(p.width) || 3840,
                     height: Number(p.height) || 2160,
                 };
-                const sig = `c${v.convert ? 1 : 0}b${v.bright ? 1 : 0}l${v.lowmem ? 1 : 0}w${v.width}h${v.height}`;
+                const sig = `c${v.convert ? 1 : 0}b${v.bright ? 1 : 0}l${v.lowmem ? 1 : 0}g${v.gif ? 1 : 0}w${v.width}h${v.height}`;
                 if (seen.has(sig)) continue;
                 seen.add(sig);
                 variantList.push(v);
@@ -801,6 +802,7 @@ function createOrchestrator({
             bright: !!payload.bright,
             convert: !!payload.convert,
             lowmem: !!payload.lowmem,
+            gif: !!payload.gif,
         };
         // Only treat ratio as "changed" if this is a re-register of an
         // existing session whose ratio is actually different. On first

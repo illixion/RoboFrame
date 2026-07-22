@@ -14,8 +14,7 @@
 // H.264 at or below that height and within the fps budget are detected via
 // ffprobe and served raw — the client's hardware decoder handles them as-is.
 // Anything taller, faster, or in another codec is downscaled/downsampled to
-// fit. The fps budget scales with the height cap: 60fps is allowed at <=720p,
-// 30fps at 1080p (see fpsBudget).
+// fit. Every transcode is capped at 30fps (see fpsBudget).
 //
 // The height cap is the real throttle for Pi-class kiosks. A Pi 3's
 // bcm2835-codec decodes 1080p30 at ~realtime with no margin — the memory
@@ -25,10 +24,15 @@
 // native-kiosk asks for `vmaxh=720`. The cap keys the cache, so different
 // clients can request different heights without colliding.
 //
-// Everything degrades to raw streaming: ffmpeg missing, encoder probe
-// failure, or all transcode slots busy simply mean the caller falls back to
-// the untranscoded file (the client software-decodes, as it did before this
-// feature existed).
+// The same encode path serves animated posts: an animated JXL, converted to
+// APNG by the caller, rides through `animatedToMp4` → `encodeArgs` to a short
+// looping 720p30 mp4, so the slideshow's animated content and its video posts
+// share one code path and one budget.
+//
+// Everything degrades to raw streaming (or WebP/GIF for the animated path):
+// ffmpeg missing, encoder probe failure, or all transcode slots busy simply
+// mean the caller falls back to the untranscoded file (the client
+// software-decodes, as it did before this feature existed).
 
 const fs = require('fs');
 const path = require('path');
@@ -64,18 +68,18 @@ function createVideoTranscoder({
   let tempCounter = 0;
   const sourceInfoCache = new Map(); // post id -> { codec, height, fps } | null
 
-  // The fps ceiling scales with the height cap: a Pi-class decoder sustains
-  // 720p60 with room to spare (~13% of realtime measured) but only 1080p30, so
-  // 60fps is allowed only when the output is <=720p. The tolerances (31/61)
-  // keep 29.97/59.94 NTSC sources on their native cadence — an exact 30/60
-  // check would resample them. `target` is what a faster source resamples to.
-  function fpsBudget(maxHeight) {
-    return maxHeight <= 720 ? { cap: 61, target: 60 } : { cap: 31, target: 30 };
+  // Every mp4 this server emits is capped at 30fps — for both the video posts
+  // and the animated path. Pi-class decoders stutter past 720p30 on real
+  // content, and 30fps keeps the whole pipeline on one budget. The 31
+  // tolerance keeps 29.97 NTSC sources on their native cadence (an exact 30
+  // check would resample them); `target` is what a faster source resamples to.
+  function fpsBudget() {
+    return { cap: 31, target: 30 };
   }
 
   function fitsRaw(info, maxHeight) {
     return Boolean(info && info.codec === 'h264' && info.height <= maxHeight
-      && info.fps > 0 && info.fps <= fpsBudget(maxHeight).cap);
+      && info.fps > 0 && info.fps <= fpsBudget().cap);
   }
 
   // Probe once which H.264 encoder this ffmpeg build offers. VideoToolbox
@@ -154,12 +158,16 @@ function createVideoTranscoder({
     return !fitsRaw(await probeSource(id, filePath), maxHeight);
   }
 
-  function encodeArgs(encoder, filePath, fpsTarget, maxHeight) {
+  // Shared H.264 → fragmented-mp4 arg builder for both the video-post stream
+  // and the animated-post buffer. `inputFormat` forces the demuxer (the
+  // animated path passes 'apng' since a .apng file is probed as a still PNG);
+  // `audio` is false for the silent animated path.
+  function encodeArgs(encoder, filePath, fpsTarget, maxHeight, { inputFormat = null, audio = true } = {}) {
     // Fit within maxHeight (16:9 width cap) without ever upscaling;
     // force_divisible_by keeps yuv420p happy on odd source dimensions. `\,` is
     // lavfi escaping, not shell — these args go through spawn() untouched. A
     // truthy fpsTarget resamples an over-budget (or unreadable-rate) source;
-    // 0 leaves the native cadence alone (24/25/30, and 50/60 at <=720p).
+    // 0 leaves the native cadence alone (24/25/30).
     const maxW = Math.round((maxHeight * 16) / 9);
     const scale = `scale=min(iw\\,${maxW}):min(ih\\,${maxHeight})`
       + ':force_original_aspect_ratio=decrease:force_divisible_by=2'
@@ -173,11 +181,12 @@ function createVideoTranscoder({
       : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '19', '-maxrate', '16M', '-bufsize', '24M'];
     return [
       '-hide_banner', '-loglevel', 'error',
+      ...(inputFormat ? ['-f', inputFormat] : []),
       '-i', filePath,
       '-vf', scale,
       ...video,
       '-pix_fmt', 'yuv420p', '-g', '60',
-      '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
+      ...(audio ? ['-c:a', 'aac', '-b:a', '128k', '-ac', '2'] : ['-an']),
       // Fragmented MP4: playable from the first bytes, no seekable output
       // needed while the encode is still running.
       '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
@@ -194,7 +203,7 @@ function createVideoTranscoder({
     const encoder = await detectEncoder();
     if (!encoder) throw new Error('transcoder unavailable');
     const info = await probeSource(id, filePath);
-    const { cap, target } = fpsBudget(maxHeight);
+    const { cap, target } = fpsBudget();
     const fpsTarget = (info && info.fps > 0 && info.fps <= cap) ? 0 : target;
     active += 1;
 
@@ -284,6 +293,49 @@ function createVideoTranscoder({
     return job;
   }
 
+  // Animated-still → short looping 720p30 H.264 mp4, sharing encodeArgs with
+  // the video-post path. Animated JXL posts are delivered as video to every
+  // client that can decode it (the web kiosk's <video>, native-kiosk's mpv);
+  // this is the encode step. The caller passes the APNG it already produced
+  // from the source via djxl — ffmpeg's apng demuxer reads it, but only from
+  // a seekable file (it errors "Function not implemented" on a pipe), so the
+  // APNG is staged to a temp file first. The mp4 still streams out over pipe:1
+  // (fragmented, no seekable output needed) and is collected into a buffer:
+  // the clips are small, cached in the image variant cache, and served with a
+  // Content-Length like any image variant. Returns null when no H.264 encoder
+  // is available — the caller falls back to the pre-mp4 WebP/GIF variants.
+  async function animatedToMp4(apng) {
+    const encoder = await detectEncoder();
+    if (!encoder) return null;
+
+    await fs.promises.mkdir(cachePath, { recursive: true });
+    const tempPath = path.join(cachePath, `.${process.pid}.${tempCounter++}.apng`);
+    await fs.promises.writeFile(tempPath, apng);
+
+    try {
+      return await new Promise((resolve) => {
+        const chunks = [];
+        let ffErr = '';
+        const ff = spawn(ffmpegPath,
+          encodeArgs(encoder, tempPath, fpsBudget().target, 720, { inputFormat: 'apng', audio: false }),
+          { stdio: ['ignore', 'pipe', 'pipe'] });
+        ff.stdout.on('data', (c) => chunks.push(c));
+        ff.stderr.on('data', (c) => { ffErr += c; });
+        ff.on('error', (err) => {
+          log.error(`animated mp4 spawn failed: ${err.message}`);
+          resolve(null);
+        });
+        ff.on('close', (code) => {
+          if (code === 0 && chunks.length) return resolve(Buffer.concat(chunks));
+          log.error(`animated mp4 transcode failed (ffmpeg exit ${code}): ${ffErr.trim().slice(0, 500)}`);
+          resolve(null);
+        });
+      });
+    } finally {
+      fs.unlink(tempPath, () => {});
+    }
+  }
+
   // Drop the oldest cache entries beyond maxCacheBytes. Runs after each
   // commit; mtime order approximates LRU well enough for a slideshow.
   function prune() {
@@ -308,7 +360,7 @@ function createVideoTranscoder({
     });
   }
 
-  return { available, hasFreeSlot, cachedFile, sourceNeedsTranscode, stream, mjpeg, prune };
+  return { available, hasFreeSlot, cachedFile, sourceNeedsTranscode, stream, mjpeg, animatedToMp4, prune };
 }
 
 module.exports = { createVideoTranscoder };
