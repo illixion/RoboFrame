@@ -905,7 +905,8 @@ async function processRequestV2(req, res) {
       // requests per view — only the opening request (no Range, or one that
       // starts at byte 0) counts, so mid-file seeks don't re-bump the entry.
       const range = req.headers.range;
-      if (req.query.record !== '0' && (!range || /^bytes=0-/.test(range))) {
+      if (req.query.record !== '0' && req.query.vcodec !== 'hlsseg'
+          && (!range || /^bytes=0-/.test(range))) {
         history.addEntry({
           id: parts.id,
           ext: srcExt,
@@ -928,6 +929,58 @@ async function processRequestV2(req, res) {
         if (cancelled || res.headersSent) return;
         if (file) streamVideo(req, res, file, 'video/x-motion-jpeg', parts.id, 'mjpeg');
         else res.status(503).send('mjpeg transcode unavailable');
+        return;
+      }
+      // vcodec=hls: HLS fMP4 for Safari/WebKit `<video>` (Spatialstash's
+      // streaming fallback). Safari won't play an unbounded chunked mp4, but
+      // plays HLS starting on segment 0 while the rest still encodes. The
+      // playlist's segment URIs are rewritten to authenticated
+      // `/get?vcodec=hlsseg` URLs so segment fetches carry the token.
+      if (req.query.vcodec === 'hls' && await videoTranscoder.available()) {
+        const vmaxh = req.query.vmaxh === '0'
+          ? 0 : Math.min(4320, Math.max(240, Number(req.query.vmaxh) || 1080));
+        const vmaxfps = req.query.vmaxfps === '0'
+          ? 0 : Math.max(1, Number(req.query.vmaxfps) || 30);
+        const dir = await videoTranscoder.hls(parts.id, filePath, vmaxh, vmaxfps);
+        if (cancelled || res.headersSent) return;
+        if (dir) {
+          try {
+            const raw = await fs.promises.readFile(path.join(dir, 'index.m3u8'), 'utf8');
+            const token = req.query.token || req.headers['x-roboframe-token'] || '';
+            const base = `/get?id=${parts.id}&vcodec=hlsseg&vmaxh=${vmaxh}&vmaxfps=${vmaxfps}`
+              + `&token=${encodeURIComponent(token)}&seg=`;
+            const rewritten = raw.split('\n').map((line) => {
+              if (line.startsWith('#EXT-X-MAP:URI=')) {
+                return line.replace(/URI="([^"]+)"/, (_, f) => `URI="${base}${encodeURIComponent(f)}"`);
+              }
+              if (line && !line.startsWith('#')) return `${base}${encodeURIComponent(line.trim())}`;
+              return line;
+            }).join('\n');
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+            // A completed (ENDLIST) playlist is a stable VOD; a growing one must
+            // be re-fetched so the player picks up new segments.
+            res.setHeader('Cache-Control', raw.includes('#EXT-X-ENDLIST') ? 'public, max-age=3600' : 'no-cache');
+            res.send(rewritten);
+            return;
+          } catch { /* fall through to raw on read error */ }
+        }
+      }
+      // vcodec=hlsseg: one HLS segment (init.mp4 / seg_NNN.m4s) from the
+      // variant's cache dir, Range-capable. The name is validated to block
+      // path traversal.
+      if (req.query.vcodec === 'hlsseg') {
+        const vmaxh = req.query.vmaxh === '0'
+          ? 0 : Math.min(4320, Math.max(240, Number(req.query.vmaxh) || 1080));
+        const vmaxfps = req.query.vmaxfps === '0'
+          ? 0 : Math.max(1, Number(req.query.vmaxfps) || 30);
+        const seg = String(req.query.seg || '');
+        if (!/^(init\.mp4|seg_\d+\.m4s)$/.test(seg)) {
+          res.status(400).send('bad segment');
+          return;
+        }
+        const segPath = path.join(videoTranscoder.hlsDir(parts.id, vmaxh, vmaxfps), seg);
+        if (fs.existsSync(segPath)) streamVideo(req, res, segPath, 'video/mp4', parts.id, 'mp4');
+        else res.status(404).send('segment not found');
         return;
       }
       // vcodec=h264: serve/build the hardware-decodable variant. Cache hits

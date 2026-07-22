@@ -289,3 +289,54 @@ test('end-to-end: 60fps source is capped to 30fps even at 720p', { skip: !hasFfm
     const [num, den] = rate.split('/').map(Number);
     assert.ok(Math.abs(num / den - 30) < 1, `output frame rate is ~30fps, got ${rate}`);
 });
+
+test('end-to-end: hls() produces a playable fMP4 playlist + segments, ENDLIST on finish', { skip: !hasFfmpeg() }, async () => {
+    const dir = tmpDir();
+    // mpeg4 source (not H.264) so a transcode is genuinely required.
+    const src = path.join(dir, 'srchls.mp4');
+    execFileSync('ffmpeg', [
+        '-hide_banner', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', 'testsrc=duration=2:size=320x240:rate=30',
+        '-c:v', 'mpeg4', src,
+    ]);
+
+    const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
+    if (!await t.available()) return; // no H.264 encoder in this ffmpeg build
+
+    const hlsPath = await t.hls(7, src, 0, 0);
+    assert.ok(hlsPath, 'hls returned a dir');
+    assert.equal(hlsPath, t.hlsDir(7, 0, 0));
+
+    // The startable set exists as soon as hls() resolves.
+    assert.ok(fs.existsSync(path.join(hlsPath, 'index.m3u8')), 'playlist exists');
+    assert.ok(fs.existsSync(path.join(hlsPath, 'init.mp4')), 'init segment exists');
+    assert.ok(fs.existsSync(path.join(hlsPath, 'seg_000.m4s')), 'first segment exists');
+
+    const m3u8 = fs.readFileSync(path.join(hlsPath, 'index.m3u8'), 'utf8');
+    assert.ok(m3u8.includes('#EXTM3U'), 'valid playlist header');
+    assert.ok(m3u8.includes('#EXT-X-MAP:URI="init.mp4"'), 'declares the fMP4 init segment');
+    assert.ok(m3u8.includes('.m4s'), 'references media segments');
+    assert.ok(fs.readFileSync(path.join(hlsPath, 'init.mp4')).includes(Buffer.from('ftyp')), 'init is fMP4');
+
+    // The `event` playlist gets ENDLIST once ffmpeg finishes — the VOD-replay marker.
+    for (let i = 0; i < 100; i++) {
+        if (fs.readFileSync(path.join(hlsPath, 'index.m3u8'), 'utf8').includes('#EXT-X-ENDLIST')) break;
+        await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(
+        fs.readFileSync(path.join(hlsPath, 'index.m3u8'), 'utf8').includes('#EXT-X-ENDLIST'),
+        'playlist completes with ENDLIST',
+    );
+
+    // A second call with the same caps reuses the existing dir (cache hit).
+    assert.equal(await t.hls(7, src, 0, 0), hlsPath);
+});
+
+test('hls() returns null when no encoder is available', async () => {
+    const t = createVideoTranscoder({
+        cachePath: tmpDir(),
+        ffmpegPath: '/nonexistent/ffmpeg',
+        log: quietLog,
+    });
+    assert.equal(await t.hls(1, '/nope.mp4', 0, 0), null);
+});

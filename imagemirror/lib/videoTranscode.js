@@ -47,6 +47,8 @@ const { spawn } = require('child_process');
 // out of the size budget like any other. `0` in either slot means "no cap"
 // (source resolution / frame rate).
 const CACHE_RE = /\.h264(?:\.\d+p)?(?:\.\d+fps)?\.mp4$|\.mjpeg$/;
+// HLS variant cache directories: `${id}.hls.${maxHeight}p.${maxFps}fps`.
+const HLS_DIR_RE = /\.hls\.\d+p\.\d+fps$/;
 
 function cacheName(id, maxHeight, maxFps) {
   return `${id}.h264.${maxHeight}p.${maxFps}fps.mp4`;
@@ -165,13 +167,14 @@ function createVideoTranscoder({
   // and the animated-post buffer. `inputFormat` forces the demuxer (the
   // animated path passes 'apng' since a .apng file is probed as a still PNG);
   // `audio` is false for the silent animated path.
-  function encodeArgs(encoder, filePath, fpsTarget, maxHeight, { inputFormat = null, audio = true } = {}) {
-    // maxHeight<=0 → no cap: keep the source resolution, forcing only even
-    // dimensions for yuv420p. Otherwise fit within maxHeight (16:9 width cap)
-    // without ever upscaling; force_divisible_by keeps yuv420p happy on odd
-    // source dimensions. `\,` is lavfi escaping, not shell — these args go
-    // through spawn() untouched. A truthy fpsTarget resamples an over-budget
-    // (or unreadable-rate) source; 0 leaves the native cadence alone.
+  // Downscale filter shared by the mp4 and HLS encoders. maxHeight<=0 → no cap:
+  // keep the source resolution, forcing only even dimensions for yuv420p.
+  // Otherwise fit within maxHeight (16:9 width cap) without ever upscaling;
+  // force_divisible_by keeps yuv420p happy on odd source dimensions. `\,` is
+  // lavfi escaping, not shell — these args go through spawn() untouched. A
+  // truthy fpsTarget resamples an over-budget (or unreadable-rate) source; 0
+  // leaves the native cadence alone.
+  function scaleFilter(maxHeight, fpsTarget) {
     let scale;
     if (maxHeight > 0) {
       const maxW = Math.round((maxHeight * 16) / 9);
@@ -181,14 +184,23 @@ function createVideoTranscoder({
       scale = 'scale=trunc(iw/2)*2:trunc(ih/2)*2';
     }
     if (fpsTarget) scale += `,fps=${fpsTarget}`;
-    // VideoToolbox (hardware) when available; libx264 -preset ultrafast is the
-    // portable fallback — fast enough to keep up with original-resolution
-    // transcodes on a CPU encoder. Bitrate is generous on purpose: on a wired
-    // LAN the extra bits buy sharpness at no real cost, and VideoToolbox
-    // spends far less than the target on low-motion clips anyway.
-    const video = encoder === 'h264_videotoolbox'
+    return scale;
+  }
+
+  // VideoToolbox (hardware) when available; libx264 -preset ultrafast is the
+  // portable fallback — fast enough to keep up with original-resolution
+  // transcodes on a CPU encoder. Bitrate is generous on purpose: on a wired
+  // LAN the extra bits buy sharpness at no real cost, and VideoToolbox spends
+  // far less than the target on low-motion clips anyway.
+  function videoCodecArgs(encoder) {
+    return encoder === 'h264_videotoolbox'
       ? ['-c:v', 'h264_videotoolbox', '-b:v', '12M', '-maxrate', '16M', '-bufsize', '24M']
       : ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '19', '-maxrate', '16M', '-bufsize', '24M'];
+  }
+
+  function encodeArgs(encoder, filePath, fpsTarget, maxHeight, { inputFormat = null, audio = true } = {}) {
+    const scale = scaleFilter(maxHeight, fpsTarget);
+    const video = videoCodecArgs(encoder);
     return [
       '-hide_banner', '-loglevel', 'error',
       ...(inputFormat ? ['-f', inputFormat] : []),
@@ -350,6 +362,79 @@ function createVideoTranscoder({
     }
   }
 
+  function hlsDir(id, maxHeight, maxFps) {
+    return path.join(cachePath, `${id}.hls.${maxHeight}p.${maxFps}fps`);
+  }
+
+  // HLS variant for Safari/WebKit clients (Spatialstash's `<video>`). Safari
+  // refuses to play an on-the-fly transcode piped as a single unbounded mp4
+  // (no Content-Length → it never produces media metadata), but plays HLS
+  // fMP4 fine, starting on segment 0 while later segments are still encoding —
+  // so this is the only way to *stream* a cold transcode to Safari. ffmpeg
+  // writes the growing playlist + segments to a per-(id,caps) cache dir; the
+  // route serves them (rewriting segment URIs to authenticated `/get` URLs).
+  // `event` playlist type appends segments live and writes ENDLIST on a clean
+  // finish, so a completed dir replays as a plain VOD. Resolves to the dir
+  // once it's startable (playlist + init + first segment exist), or null when
+  // no encoder is free/available — the caller then falls back to the raw file.
+  const hlsStarts = new Map(); // dir -> Promise<dir|null>
+  async function hls(id, filePath, maxHeight = 0, maxFps = 0) {
+    const encoder = await detectEncoder();
+    if (!encoder) return null;
+    const dir = hlsDir(id, maxHeight, maxFps);
+    const playlist = path.join(dir, 'index.m3u8');
+
+    // An existing playlist (a completed VOD, or a still-running job's growing
+    // list) is usable immediately.
+    if (fs.existsSync(playlist)) return dir;
+    if (hlsStarts.has(dir)) return hlsStarts.get(dir);
+    if (!hasFreeSlot()) return null;
+
+    const start = (async () => {
+      const info = await probeSource(id, filePath);
+      const fpsTarget = maxFps <= 0 ? 0
+        : ((info && info.fps > 0 && info.fps <= maxFps + 1) ? 0 : maxFps);
+      await fs.promises.mkdir(dir, { recursive: true });
+      active += 1;
+      const ff = spawn(ffmpegPath, [
+        '-hide_banner', '-loglevel', 'error', '-i', filePath,
+        '-vf', scaleFilter(maxHeight, fpsTarget),
+        ...videoCodecArgs(encoder),
+        '-pix_fmt', 'yuv420p', '-g', '60',
+        '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
+        // ~2s segments (g=60 → keyframe every 2s at 30fps) so segment 0 is
+        // ready fast; independent_segments lets the player start anywhere.
+        '-f', 'hls', '-hls_time', '2', '-hls_playlist_type', 'event',
+        '-hls_flags', 'independent_segments', '-hls_segment_type', 'fmp4',
+        '-hls_fmp4_init_filename', 'init.mp4',
+        '-hls_segment_filename', path.join(dir, 'seg_%03d.m4s'),
+        playlist,
+      ], { stdio: ['ignore', 'ignore', 'pipe'] });
+      let ffErr = '';
+      ff.stderr.on('data', (d) => { ffErr += d; });
+      ff.on('error', (err) => log.error(`hls spawn failed for ${id}: ${err.message}`));
+      ff.on('close', (code) => {
+        active -= 1;
+        if (code === 0) prune();
+        else log.error(`hls transcode failed for ${id} (ffmpeg exit ${code}): ${ffErr.trim().slice(0, 500)}`);
+      });
+
+      // Startable once the playlist, init segment, and first media segment
+      // exist. Poll briefly; give up (→ null, caller serves raw) if ffmpeg
+      // dies first or it takes too long.
+      const init = path.join(dir, 'init.mp4');
+      const seg0 = path.join(dir, 'seg_000.m4s');
+      for (let i = 0; i < 300; i++) {
+        if (fs.existsSync(playlist) && fs.existsSync(init) && fs.existsSync(seg0)) return dir;
+        if (ff.exitCode !== null && ff.exitCode !== 0) return null;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return fs.existsSync(playlist) ? dir : null;
+    })().finally(() => hlsStarts.delete(dir));
+    hlsStarts.set(dir, start);
+    return start;
+  }
+
   // Drop the oldest cache entries beyond maxCacheBytes. Runs after each
   // commit; mtime order approximates LRU well enough for a slideshow.
   function prune() {
@@ -357,10 +442,23 @@ function createVideoTranscoder({
       if (err) return;
       const entries = [];
       for (const name of names) {
-        if (!CACHE_RE.test(name)) continue;
+        const full = path.join(cachePath, name);
         try {
-          const st = fs.statSync(path.join(cachePath, name));
-          entries.push({ name, size: st.size, mtime: st.mtimeMs });
+          if (HLS_DIR_RE.test(name)) {
+            // Age an HLS variant as a single unit: total bytes, newest mtime.
+            const files = fs.readdirSync(full);
+            let size = 0;
+            let mtime = 0;
+            for (const f of files) {
+              const fst = fs.statSync(path.join(full, f));
+              size += fst.size;
+              if (fst.mtimeMs > mtime) mtime = fst.mtimeMs;
+            }
+            entries.push({ name, size, mtime, dir: true });
+          } else if (CACHE_RE.test(name)) {
+            const st = fs.statSync(full);
+            entries.push({ name, size: st.size, mtime: st.mtimeMs, dir: false });
+          }
         } catch { /* raced a concurrent prune */ }
       }
       entries.sort((a, b) => b.mtime - a.mtime);
@@ -368,13 +466,18 @@ function createVideoTranscoder({
       for (const e of entries) {
         total += e.size;
         if (total > maxCacheBytes) {
-          fs.unlink(path.join(cachePath, e.name), () => {});
+          const full = path.join(cachePath, e.name);
+          if (e.dir) fs.rm(full, { recursive: true, force: true }, () => {});
+          else fs.unlink(full, () => {});
         }
       }
     });
   }
 
-  return { available, hasFreeSlot, cachedFile, sourceNeedsTranscode, stream, mjpeg, animatedToMp4, prune };
+  return {
+    available, hasFreeSlot, cachedFile, sourceNeedsTranscode, stream,
+    mjpeg, animatedToMp4, hls, hlsDir, prune,
+  };
 }
 
 module.exports = { createVideoTranscoder };

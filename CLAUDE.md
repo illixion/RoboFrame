@@ -230,6 +230,18 @@ the deadline) is the canary for the wake-advance class of bug.
   `-preset ultrafast`. The video-transcode cache keys on both caps
   (`${id}.h264.${h}p.${fps}fps.mp4`). `width`/`height` on `/get` are
   optional — `0`/absent means no resize (source resolution).
+- **`vcodec=hls` streams a video post as HLS fMP4** for Safari/WebKit
+  `<video>` (Spatialstash's streaming fallback). Safari won't play an
+  unbounded chunked mp4 (no `Content-Length` → no media metadata), but plays
+  HLS starting on segment 0 while the rest still encodes — the only way to
+  *stream* a cold transcode to Safari. ffmpeg writes a growing `event`
+  playlist + fMP4 segments to a per-`(id,vmaxh,vmaxfps)` cache dir
+  (`${id}.hls.${h}p.${fps}fps/`, pruned as one unit); `ENDLIST` on a clean
+  finish makes it replay as VOD. `/get?vcodec=hls` returns the playlist with
+  segment URIs rewritten to authenticated `/get?vcodec=hlsseg&seg=…` URLs;
+  `vcodec=hlsseg` serves one Range-capable segment (name validated against
+  path traversal). Spatialstash reaches this only after `<img src=`raw`>` and
+  `<video src=`raw`>` both fail — see its 3-tier video escalation.
 - **`bright` is direct RGB multiply, not alpha.** The old alpha-modulation
   path was equivalent (alpha-over-black ≡ RGB×α) but JPEG-incompatible.
   `applyDimAndConvertToJpeg` uses `.linear(dim, 0)`. No contrast bump —
