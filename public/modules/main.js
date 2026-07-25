@@ -14,10 +14,13 @@ window.getPost = async function getPost(id) {
 };
 
 // Debug helper: `await searchPosts('cats order:id limit:5')` runs the query
-// through the server's search layer.
-window.searchPosts = async function searchPosts(q, limit) {
+// through the server's search layer. A `cursor` float in [0, 1) starts the
+// page at an arbitrary point in the random deck — `searchPosts('cats', 9,
+// Math.random())` is a random grid of nine.
+window.searchPosts = async function searchPosts(q, limit, cursor) {
     let url = `/search?q=${encodeURIComponent(q || '')}`;
     if (limit) url += `&limit=${encodeURIComponent(limit)}`;
+    if (Number.isFinite(cursor)) url += `&cursor=${encodeURIComponent(cursor)}`;
     const res = await fetch(api(url));
     if (!res.ok) throw new Error(`searchPosts ${res.status}: ${await res.text()}`);
     return res.json();

@@ -166,7 +166,14 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
         }
     }
 
-    async function runSearch({ q = '', cursor = null, limit } = {}) {
+    // `wrap` tops a short page up from the head of the deck. A one-shot client
+    // that seeds `cursor` with a random float lands near the deck's end a
+    // fraction of the time proportional to (limit / match count) — on a narrow
+    // query that's most calls — and would otherwise get a short or empty page
+    // where it asked for `limit` posts. Opt-in because the orchestrator reads a
+    // short page as "deck exhausted" to end its refill loop; wrapping there
+    // would make the queue never finish.
+    async function runSearch({ q = '', cursor = null, limit, wrap = false } = {}) {
         const parsed = parseQuery(q);
         const { limit: parsedLimit, orderBy } = parsed;
         const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : parsedLimit;
@@ -179,8 +186,24 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
             : buildDeterministicPageSql({ table: set.table, orderBy, cursor, limit: effectiveLimit });
         const rows = await allAsync(sql);
 
+        let wrapped = false;
+        if (wrap && isRandom && cursor && rows.length < effectiveLimit) {
+            const seen = new Set(rows.map((r) => String(r._id)));
+            const head = await allAsync(buildRandomPageSql({
+                table: set.table, cursor: null, limit: effectiveLimit,
+            }));
+            for (const row of head) {
+                if (rows.length >= effectiveLimit) break;
+                if (seen.has(String(row._id))) continue;
+                rows.push(row);
+                wrapped = true;
+            }
+        }
+
+        // A wrapped page has already crossed the deck's end, so there's no
+        // meaningful position to continue from — paging it would circle.
         let nextCursor = null;
-        if (rows.length === effectiveLimit) {
+        if (!wrapped && rows.length === effectiveLimit) {
             if (isRandom) {
                 const last = rows[rows.length - 1];
                 nextCursor = {

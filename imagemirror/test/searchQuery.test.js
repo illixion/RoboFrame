@@ -229,6 +229,62 @@ test('random-mode cursor advances on a full page (BigInt display_count)', async 
     assert.match(page2, /r\.display_count > 2 OR \(r\.display_count = 2 AND r\.random_rank > 0\.30000000000000004\)/);
 });
 
+// /search turns `?cursor=<float>` into one object carrying both cursor
+// shapes, so the same bare float has to seed the deck in random order and
+// act as a row offset in a deterministic one.
+test("the route's bare-float cursor serves both order modes", async () => {
+    const db = stubDb({ rows: [{ _id: 1n, display_count: 0n, random_rank: 0.9 }] });
+    const search = createSearch({ db });
+    const cursor = { dc: 0, rank: 0.4137, offset: 0 };
+
+    await search.runSearch({ q: 'cats', cursor, limit: 3 });
+    assert.match(db.pages()[0], /r\.display_count = 0 AND r\.random_rank > 0\.4137/);
+
+    await search.runSearch({ q: 'cats order:id', cursor: { ...cursor, offset: 12 }, limit: 3 });
+    const deterministic = db.pages()[1];
+    assert.match(deterministic, /OFFSET 12/);
+    assert.doesNotMatch(deterministic, /0\.4137/);
+});
+
+// A random cursor lands near the deck's end sometimes; /search asks for a
+// wrap so the caller still gets `limit` rows. The orchestrator must not get
+// this — it reads a short page as the end of the deck.
+test('wrap tops a short cursored page up from the deck head, without duplicates', async () => {
+    const db = stubDb({ rows: [{ _id: 1n, display_count: 0n, random_rank: 0.99 }] });
+    const search = createSearch({ db });
+    const { results, nextCursor } = await search.runSearch({
+        q: 'cats', cursor: { dc: 0, rank: 0.98 }, limit: 3, wrap: true,
+    });
+
+    // The stub replays the same row for the top-up query, so it dedupes away:
+    // what matters is that the head query ran and nothing repeated.
+    assert.deepEqual(results.map((r) => Number(r._id)), [1]);
+    assert.equal(nextCursor, null, 'a wrapped page has no continuation');
+    const pages = db.pages();
+    assert.equal(pages.length, 2, 'a second, head-of-deck page query ran');
+    assert.match(pages[0], /r\.random_rank > 0\.98/);
+    assert.doesNotMatch(pages[1], /random_rank > /, 'the top-up starts at the head');
+});
+
+test('wrap is inert without a cursor, on a full page, and in deterministic order', async () => {
+    const rows = Array.from({ length: 3 }, (_, i) => ({
+        _id: BigInt(i + 1), display_count: 0n, random_rank: 0.1 * (i + 1),
+    }));
+    const search = createSearch({ db: stubDb({ rows }) });
+
+    // Page 1 (no cursor): a short page here is a genuinely exhausted deck.
+    const bare = await search.runSearch({ q: 'cats', limit: 9, wrap: true });
+    assert.equal(bare.results.length, 3);
+
+    // A full page needs no top-up, so its cursor still round-trips.
+    const full = await search.runSearch({ q: 'cats', cursor: { dc: 0, rank: 0.05 }, limit: 3, wrap: true });
+    assert.deepEqual(full.nextCursor, { dc: 0, rank: 0.30000000000000004 });
+
+    // Deterministic order has no deck to wrap around.
+    const det = await search.runSearch({ q: 'cats order:id', cursor: { offset: 90 }, limit: 9, wrap: true });
+    assert.equal(det.results.length, 3);
+});
+
 test('a short page ends pagination', async () => {
     const db = stubDb({ rows: [{ _id: 1n, display_count: 0n, random_rank: 0.5 }] });
     const search = createSearch({ db });

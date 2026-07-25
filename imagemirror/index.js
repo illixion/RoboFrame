@@ -1397,8 +1397,21 @@ app.get('/count', async (req, res) => {
   }
 });
 
-// Debugging helper: run a query string through the same search layer the
-// orchestrator uses. `?q=` is the query, `?limit=` optional override.
+// Run a query string through the same search layer the orchestrator uses.
+//
+//   q=      raw query (see lib/parseQuery.js for the syntax)
+//   limit=  page size override
+//   cursor= paging position. In the default random order this is a bare float
+//           in [0, 1) — a starting offset into the frozen random_ranks deck,
+//           the same seeding trick each orchestrator channel uses so two
+//           displays coming up together don't both get the deck's head. A
+//           fresh random float per call is how a one-shot client (e.g. an iOS
+//           Shortcut building a grid) gets an arbitrary window of N distinct
+//           posts in one request. For `order:id|score|score_asc` it's the
+//           row offset instead. Feed `nextCursor` back for the next page.
+//
+// Unlike /random this deliberately ignores the blocklist and never bumps
+// display_count: it's a plain view of the library, not a slideshow pick.
 app.get('/search', async (req, res) => {
   if (!searchRef) return res.status(503).send('Search not ready');
   const q = String(req.query.q || '');
@@ -1406,8 +1419,18 @@ app.get('/search', async (req, res) => {
   // parseQuery already defaults to 40 and honors `limit:N` inside `q`; only
   // pass an override when the caller set `?limit=` explicitly.
   const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined;
+  // The random-order cursor is really {dc, rank}; a bare float names a point
+  // in the dc=0 tier, which is the whole deck until the slideshow has shown
+  // anything, and the tail-plus-higher-tiers filter carries the rest.
+  // Deterministic orders read `offset` off the same object.
+  const cursorRaw = Number(req.query.cursor);
+  const cursor = Number.isFinite(cursorRaw)
+    ? { dc: 0, rank: cursorRaw, offset: Math.max(0, Math.floor(cursorRaw)) }
+    : null;
   try {
-    const value = await searchRef.runSearch({ q, limit });
+    // Wrap a short page around the deck's end so a client seeding `cursor`
+    // with a random float always gets a full page (see runSearch).
+    const value = await searchRef.runSearch({ q, limit, cursor, wrap: true });
     res.type('application/json').send(JSON.stringify(value, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)));
   } catch (err) {
     console.error(`search error: ${err.message}`);
