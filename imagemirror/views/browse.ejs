@@ -42,7 +42,7 @@
         text-transform:uppercase;color:var(--muted);white-space:nowrap}
       .wordmark b{color:var(--amber);font-weight:600}
 
-      .query{flex:1 1 420px;min-width:260px;display:flex;align-items:center;gap:10px;
+      .query{flex:1 1 300px;min-width:220px;display:flex;align-items:center;gap:10px;
         background:var(--panel);border:1px solid var(--rule);border-radius:2px;
         padding:0 10px;height:40px}
       .query:focus-within{border-color:var(--amber-dim)}
@@ -57,6 +57,21 @@
       .tool:hover{color:var(--text);border-color:#3b414b}
       .tool.primary{background:var(--amber);border-color:var(--amber);color:#160d00;font-weight:700}
       .tool.primary:hover{background:#ffbe5c}
+
+      /* Tag-list presets. The <select> stays native — its popup is the one
+         widget that can spill past the masthead and show a long list of tags
+         on one line without a scroll trap of our own making. */
+      .preset{position:relative;display:none}
+      .preset.ready{display:block}
+      /* Lowercase and unspaced, unlike its sibling buttons: the closed control
+         shows the head of an actual query, and a query is typed as it reads. */
+      .preset select{appearance:none;max-width:210px;padding-right:32px;
+        font-size:12px;letter-spacing:0;text-transform:none;
+        text-overflow:ellipsis;background:var(--panel)}
+      .preset select option{font-family:var(--mono);background:var(--panel);color:var(--text)}
+      .preset::after{content:"";position:absolute;right:13px;top:50%;
+        margin-top:-2px;border:4px solid transparent;border-top-color:var(--muted);
+        pointer-events:none}
 
       /* Sheet position: a hairline that fills as you walk deeper into the deck. */
       .position{height:2px;background:var(--rule-soft)}
@@ -179,6 +194,11 @@
                  placeholder="tag  -tag  ~tag  rating:s  score:>=50  order:id" />
         </form>
         <button class="tool primary" id="run" type="submit" form="queryForm">Search</button>
+        <span class="preset" id="presetWrap">
+          <select class="tool" id="presets" aria-label="Tag list presets">
+            <option value="">Tag lists</option>
+          </select>
+        </span>
         <button class="tool" id="jump" type="button" title="Start from a random point in the deck">Random window</button>
         <button class="tool" id="help" type="button" aria-expanded="false" aria-controls="syntax">Syntax</button>
       </div>
@@ -640,6 +660,7 @@
         countEl.textContent = 'Searching…';
         positionEl.style.width = '0';
         pushQuery(input.value.trim());
+        syncPreset();
         loadCount();
         loadPage();
       }
@@ -655,6 +676,62 @@
       document.getElementById('jump').addEventListener('click', () => {
         search({ dc: 0, rank: Math.random() });
       });
+
+      // ---- tag-list presets -----------------------------------------------
+      // The server-side tag lists the frames cycle through (data.json's
+      // `tagLists`, as the kiosks read them off the WS `tagLists` frame). Each
+      // one drops into the query box verbatim, so a preset is a starting point
+      // to edit rather than a mode to be in — hence the reset back to the
+      // placeholder as soon as the query diverges.
+      const presetWrap = document.getElementById('presetWrap');
+      const presets = document.getElementById('presets');
+
+      async function loadPresets() {
+        let lists;
+        try {
+          const resp = await fetch(endpoint('rpc/tags.json', tokenParam.slice(1)));
+          if (!resp.ok) throw new Error('tags ' + resp.status);
+          lists = await resp.json();
+        } catch (err) {
+          console.error(err);
+          return;
+        }
+        const queries = (Array.isArray(lists) ? lists : [])
+          .map((list) => (Array.isArray(list) ? list : String(list || '').split(/\s+/)))
+          .map((list) => list.filter(Boolean).join(' '))
+          .filter(Boolean);
+        // No lists configured: leave the control out rather than offer an
+        // empty menu.
+        if (!queries.length) return;
+        queries.forEach((query, i) => {
+          const option = document.createElement('option');
+          option.value = query;
+          option.textContent = (i + 1) + ' · ' + query;
+          // The closed control only has room for the head of the query; the
+          // tooltip carries the rest.
+          option.title = query;
+          presets.appendChild(option);
+        });
+        presetWrap.classList.add('ready');
+        syncPreset();
+      }
+
+      // Show the preset as selected only while the query still matches it.
+      function syncPreset() {
+        if (!presetWrap.classList.contains('ready')) return;
+        const current = input.value.trim();
+        presets.value = Array.prototype.some.call(presets.options, (o) => o.value === current)
+          ? current
+          : '';
+        presets.title = presets.value || 'Search a tag list the frames use';
+      }
+
+      presets.addEventListener('change', () => {
+        if (!presets.value) return;
+        input.value = presets.value;
+        search();
+      });
+      input.addEventListener('input', syncPreset);
 
       const helpBtn = document.getElementById('help');
       const syntaxEl = document.getElementById('syntax');
@@ -679,6 +756,7 @@
 
       hintEl.innerHTML = 'Press <code>/</code> to search · click a frame for detail · arrows walk the sheet';
       input.value = queryFromUrl();
+      loadPresets();
       search();
     </script>
   </body>
