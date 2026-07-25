@@ -70,7 +70,10 @@
         text-transform:uppercase;color:var(--muted)}
       .status .count{color:var(--text)}
       .status .hint{text-transform:none;letter-spacing:.02em}
-      .status a{color:var(--muted)}
+      /* Sibling page, carrying the same token so the link lands authenticated. */
+      .status a{margin-left:auto;color:var(--muted);text-decoration:none;
+        border-bottom:1px solid var(--rule)}
+      .status a:hover{color:var(--amber);border-bottom-color:var(--amber-dim)}
 
       .syntax{max-width:1900px;margin:0 auto;padding:0 18px}
       .syntax dl{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));
@@ -185,6 +188,7 @@
     <div class="status">
       <span class="count" id="count">Loading library…</span>
       <span class="hint" id="hint"></span>
+      <a href="history?token=<%= encodeURIComponent(token || '') %><%= Number(lowmem) === 1 ? '&lowmem=1' : '' %>">Recent requests &rarr;</a>
     </div>
 
     <div class="syntax">

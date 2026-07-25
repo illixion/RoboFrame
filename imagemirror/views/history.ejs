@@ -21,7 +21,11 @@
       }
       html,body{height:100%;margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text)}
       .container{padding:16px;box-sizing:border-box}
-      h1{margin:0 0 12px}
+      .head{display:flex;flex-wrap:wrap;gap:12px;align-items:baseline;margin:0 0 12px}
+      h1{margin:0}
+      /* Sibling page, carrying the same token so the link lands authenticated. */
+      .head a{color:var(--muted);font-size:14px;text-decoration:none;border-bottom:1px solid var(--border)}
+      .head a:hover{color:var(--text);border-bottom-color:var(--text)}
 
       .display{margin:0 0 28px}
       .display h2{margin:0 0 10px;font-size:18px;display:flex;align-items:baseline;gap:8px}
@@ -88,7 +92,10 @@
   </head>
   <body>
     <div class="container">
-      <h1>Request History</h1>
+      <div class="head">
+        <h1>Request History</h1>
+        <a href="browse?token=<%= encodeURIComponent(token || '') %><%= Number(lowmem) === 1 ? '&lowmem=1' : '' %>">Browse the library &rarr;</a>
+      </div>
 
       <% if (!groups || groups.length === 0) { %>
         <p>No recent requests</p>
