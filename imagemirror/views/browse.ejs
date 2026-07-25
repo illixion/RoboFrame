@@ -147,8 +147,11 @@
       @media (max-width:820px){
         .viewer.open{grid-template-columns:1fr;grid-template-rows:1fr auto}
       }
+      /* zoom-out on the empty part of the stage: the bare backdrop dismisses. */
       .stage{position:relative;display:flex;align-items:center;justify-content:center;
-        min-height:0;padding:14px}
+        min-height:0;padding:14px;cursor:zoom-out}
+      .stage img,.stage video,.stage .step{cursor:default}
+      .stage .step{cursor:pointer}
       .stage img,.stage video{max-width:100%;max-height:100%;object-fit:contain}
       .stage [hidden]{display:none}
       .step{position:absolute;top:50%;transform:translateY(-50%);width:44px;height:64px;
@@ -641,6 +644,12 @@
           report();
           closeViewer();
         });
+      });
+
+      // Backdrop dismissal: only the stage's own empty area, so a click on the
+      // frame itself, on a video's controls, or on a step arrow stays put.
+      document.querySelector('.stage').addEventListener('click', (ev) => {
+        if (ev.target === ev.currentTarget) closeViewer();
       });
 
       document.getElementById('actClose').addEventListener('click', closeViewer);
