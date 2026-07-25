@@ -23,8 +23,12 @@ Spatialstash is a separate app that implements the same protocol in Swift, it is
   - `lib/mqtt-bridge.js` — HA MQTT discovery (light, motion, ALS,
     webcam) + inbound RPC topic.
   - `lib/searchQuery.js` + `lib/parseQuery.js` — DuckDB query layer.
-  - `index.js` — Express routes (`/get`, `/save`, `/history`,
+  - `index.js` — Express routes (`/get`, `/save`, `/history`, `/browse`,
     `/addtohistory`, `/rpc/send`, `/rpc/deviceDC`, `/rpc/tags.json`).
+  - `views/` — the two server-rendered pages: `history.ejs` (recent
+    requests per display) and `browse.ejs` (library search over a
+    contact-sheet grid; all its data comes from `/search`, `/count`
+    and `/get`, so the route only forwards the caller's token).
 - `public/modules/` — kiosk frontend (vanilla ES modules). `slideshow.js`
   applies `playback` frames; `ws-client.js` is the dispatcher;
   `visibility.js` gates the local render layer (does not advance).
@@ -210,7 +214,10 @@ the deadline) is the canary for the wake-advance class of bug.
   hardware JPEG decode (via MMAL) but no WebP path — software-decoding
   WebP at 1080p saturates the ARM cores and freezes the kiosk. The
   `convert` path emits JPEG q95 with a black flatten (covers alpha
-  PNGs); `lowmem=1` re-encodes non-JXL sources too. Don't reintroduce
+  PNGs); `lowmem=1` re-encodes non-JXL sources too. `convert` is
+  format-agnostic — djxl runs only for a `.jxl` source, everything else
+  goes straight to sharp — so a library of JPEG/PNG originals works on
+  the same path the kiosks use. Don't reintroduce
   WebP output without a Pi 3 reproducibility check.
 - **Animated posts are served as video, not an animated image.** Animated
   JXL/APNG is transcoded to H.264 mp4 (djxl → APNG → ffmpeg,

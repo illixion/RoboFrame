@@ -54,7 +54,7 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 
 app.use(cookieParser());
 
-app.use(['/get', '/save', '/history', '/history.json', '/addtohistory', '/post', '/search', '/random', '/count', '/custom_page', '/rpc/tags.json'], requireToken);
+app.use(['/get', '/save', '/history', '/history.json', '/addtohistory', '/post', '/search', '/random', '/count', '/browse', '/custom_page', '/rpc/tags.json'], requireToken);
 
 // Folder of user-supplied HTML files surfaced by /custom_page (P key
 // "custom page" mode on the kiosk). Per-install, gitignored — see README.
@@ -418,17 +418,21 @@ async function pickAmbientDim(pngBuffer) {
 }
 
 /**
- * Decode a JPEG-XL image and emit JPEG (q95, black-flattened). When
- * `bright` is set, also dim the image for ambient/night-light viewing.
+ * Emit a display JPEG (q95, black-flattened) from any still source. JXL is
+ * decoded through djxl first — sharp has no JXL decoder; every other format
+ * sharp reads directly, so a library of JPEG/PNG/WebP originals runs the same
+ * `convert=1` path the kiosks use. When `bright` is set, also dim the image
+ * for ambient/night-light viewing.
  *
- * @param {Buffer} imageData - Raw JXL bytes.
+ * @param {Buffer} imageData - Raw source bytes.
  * @param {number} width
  * @param {number} height
  * @param {boolean} bright - Apply ambient dim.
+ * @param {boolean} isJxl - Source is JPEG-XL.
  * @returns {Promise<Buffer>}
  */
-async function convertFromJxl(imageData, width, height, bright = false) {
-  const pngBuffer = await decodeJxlToPng(imageData);
+async function convertToDisplayJpeg(imageData, width, height, bright = false, isJxl = true) {
+  const pngBuffer = isJxl ? await decodeJxlToPng(imageData) : imageData;
   try {
     if (bright) {
       return await applyDimAndConvertToJpeg(pngBuffer, await pickAmbientDim(pngBuffer), width, height);
@@ -783,7 +787,7 @@ async function computeVariant({ id, convert, bright, width, height, lowmem, wall
     finalBuffer = await composeWallpaper(src, width, height, { bright, quality: lowmem ? 85 : 95 });
     finalMimeType = 'image/jpeg';
   } else if (convert) {
-    finalBuffer = await convertFromJxl(data, width, height, bright);
+    finalBuffer = await convertToDisplayJpeg(data, width, height, bright, isJxl);
     finalMimeType = 'image/jpeg';
   } else if (lowmem) {
     finalBuffer = await convertBufferToJpeg(data, width, height, 85);
@@ -1340,6 +1344,16 @@ app.get('/history', (req, res) => {
   res.render('history', { groups, visible: HISTORY_VISIBLE, token, lowmem });
 });
 
+// Library browser — a search box over a contact-sheet grid. All the work is
+// client-side against /search, /count and /get; this route only hands the page
+// the token it was called with so its own fetches stay authenticated.
+const BROWSE_PAGE = 60;
+app.get('/browse', (req, res) => {
+  const token = req.query.token || req.headers['x-roboframe-token'] || '';
+  const lowmem = Number(req.query.lowmem) === 1 ? 1 : 0;
+  res.render('browse', { token, lowmem, pageSize: BROWSE_PAGE });
+});
+
 // JSON variant of /history for non-browser clients (e.g. the Spatial Stash
 // visionOS app) that want to render their own history UI. Returns the same
 // rolling window as /history, with id + ext per entry so clients can tell
@@ -1397,6 +1411,29 @@ app.get('/count', async (req, res) => {
   }
 });
 
+// Paging position for /search, in the two shapes runSearch understands.
+//
+//   "dc,rank"  the random deck's (display_count, random_rank) tuple — what
+//              `nextCursor` carries in the default random order, so a client
+//              walking a multi-page result feeds it straight back.
+//   "N"        a bare number: the row offset for `order:id|score|score_asc`,
+//              and in random order a point in the dc=0 tier — the seeding
+//              trick a one-shot client uses to land on an arbitrary window.
+function parseSearchCursor(raw) {
+  if (raw === undefined || raw === null || raw === '') return null;
+  const str = String(raw);
+  if (str.includes(',')) {
+    const [dcStr, rankStr] = str.split(',');
+    const dc = Number(dcStr);
+    const rank = Number(rankStr);
+    if (!Number.isFinite(dc) || !Number.isFinite(rank)) return null;
+    return { dc: Math.max(0, Math.floor(dc)), rank, offset: 0 };
+  }
+  const n = Number(str);
+  if (!Number.isFinite(n)) return null;
+  return { dc: 0, rank: n, offset: Math.max(0, Math.floor(n)) };
+}
+
 // Run a query string through the same search layer the orchestrator uses.
 //
 //   q=      raw query (see lib/parseQuery.js for the syntax)
@@ -1408,7 +1445,9 @@ app.get('/count', async (req, res) => {
 //           fresh random float per call is how a one-shot client (e.g. an iOS
 //           Shortcut building a grid) gets an arbitrary window of N distinct
 //           posts in one request. For `order:id|score|score_asc` it's the
-//           row offset instead. Feed `nextCursor` back for the next page.
+//           row offset instead. Feed `nextCursor` back for the next page as
+//           `dc,rank` (random order) or a bare offset (deterministic order) —
+//           see parseSearchCursor.
 //
 // Unlike /random this deliberately ignores the blocklist and never bumps
 // display_count: it's a plain view of the library, not a slideshow pick.
@@ -1419,14 +1458,7 @@ app.get('/search', async (req, res) => {
   // parseQuery already defaults to 40 and honors `limit:N` inside `q`; only
   // pass an override when the caller set `?limit=` explicitly.
   const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined;
-  // The random-order cursor is really {dc, rank}; a bare float names a point
-  // in the dc=0 tier, which is the whole deck until the slideshow has shown
-  // anything, and the tail-plus-higher-tiers filter carries the rest.
-  // Deterministic orders read `offset` off the same object.
-  const cursorRaw = Number(req.query.cursor);
-  const cursor = Number.isFinite(cursorRaw)
-    ? { dc: 0, rank: cursorRaw, offset: Math.max(0, Math.floor(cursorRaw)) }
-    : null;
+  const cursor = parseSearchCursor(req.query.cursor);
   try {
     // Wrap a short page around the deck's end so a client seeding `cursor`
     // with a random float always gets a full page (see runSearch).
