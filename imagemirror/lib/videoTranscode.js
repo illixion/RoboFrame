@@ -46,7 +46,7 @@ const { spawn } = require('child_process');
 // `${id}.h264.720p.mp4` files (pre-fps cache) and MJPEG variants so they age
 // out of the size budget like any other. `0` in either slot means "no cap"
 // (source resolution / frame rate).
-const CACHE_RE = /\.h264(?:\.\d+p)?(?:\.\d+fps)?\.mp4$|\.mjpeg$/;
+const CACHE_RE = /\.h264(?:\.\d+p)?(?:\.\d+fps)?\.mp4$|\.mjpeg$|\.poster\.jpg$/;
 // HLS variant cache directories: `${id}.hls.${maxHeight}p.${maxFps}fps`.
 const HLS_DIR_RE = /\.hls\.\d+p\.\d+fps$/;
 
@@ -56,6 +56,10 @@ function cacheName(id, maxHeight, maxFps) {
 
 function mjpegName(id, { w, h, fps, sec }) {
   return `${id}.${w}x${h}.${fps}fps.${sec}s.mjpeg`;
+}
+
+function posterName(id) {
+  return `${id}.poster.jpg`;
 }
 
 function createVideoTranscoder({
@@ -317,6 +321,48 @@ function createVideoTranscoder({
     return job;
   }
 
+  // First-frame JPEG for a video post — a contact-sheet thumbnail a client can
+  // fetch like any image, rather than relying on a `<video>` element's own
+  // network/decode pipeline. That pipeline is a browser-controlled black box:
+  // Chrome (and others) defer or suspend it on a backgrounded tab, so a
+  // gallery of `<video preload="metadata">` posters can silently never load
+  // while plain `fetch()`-based image thumbnails on the same page load fine.
+  // Built once and cached like the mjpeg variant — cheap enough (a single
+  // decoded frame, no encoder probe needed) that every video post gets one on
+  // first request. No height cap: the caller resizes same as any other
+  // thumbnail via the ordinary sharp path once this hits computeVariant.
+  const posterInflight = new Map();
+  function poster(id, filePath) {
+    const finalPath = path.join(cachePath, posterName(id));
+    if (fs.existsSync(finalPath)) return Promise.resolve(finalPath);
+    if (posterInflight.has(finalPath)) return posterInflight.get(finalPath);
+    const job = fs.promises.mkdir(cachePath, { recursive: true }).then(() => new Promise((resolve) => {
+      const tempPath = path.join(cachePath, `.${id}.${process.pid}.${tempCounter++}.poster.jpg`);
+      const ff = spawn(ffmpegPath, [
+        '-hide_banner', '-loglevel', 'error',
+        '-i', filePath, '-frames:v', '1', '-q:v', '3',
+        '-y', tempPath,
+      ], { stdio: ['ignore', 'ignore', 'pipe'] });
+      let ffErr = '';
+      ff.stderr.on('data', (d) => { ffErr += d; });
+      ff.on('error', () => resolve(null));
+      ff.on('close', (code) => {
+        if (code === 0) {
+          fs.rename(tempPath, finalPath, (err) => {
+            if (err) { log.error(`poster commit failed for ${id}: ${err.message}`); resolve(null); }
+            else { prune(); resolve(finalPath); }
+          });
+        } else {
+          fs.unlink(tempPath, () => {});
+          log.error(`poster extraction failed for ${id} (ffmpeg exit ${code}): ${ffErr.trim().slice(0, 500)}`);
+          resolve(null);
+        }
+      });
+    })).finally(() => posterInflight.delete(finalPath));
+    posterInflight.set(finalPath, job);
+    return job;
+  }
+
   // Animated-still → short looping H.264 mp4, sharing encodeArgs with the
   // video-post path. Animated JXL posts are delivered as video to every client
   // that can decode it (the web kiosk's <video>, native-kiosk's mpv,
@@ -476,7 +522,7 @@ function createVideoTranscoder({
 
   return {
     available, hasFreeSlot, cachedFile, sourceNeedsTranscode, stream,
-    mjpeg, animatedToMp4, hls, hlsDir, prune,
+    mjpeg, poster, animatedToMp4, hls, hlsDir, prune,
   };
 }
 

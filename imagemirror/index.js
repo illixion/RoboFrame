@@ -916,6 +916,30 @@ async function processRequestV2(req, res) {
         res.status(500).send('An error occurred while sending the file.');
         return;
       }
+      // `poster=1`: a first-frame JPEG instead of the video itself — a
+      // contact-sheet thumbnail a client can fetch with plain fetch()+blob,
+      // the same as any image, rather than through a `<video>` element's own
+      // network pipeline (which browsers throttle or suspend on a
+      // backgrounded tab, independent of whatever's actually visible on
+      // screen). Never recorded in /history — it's a thumbnail fetch, not a
+      // view. width/height resize same as a normal thumbnail; omitted means
+      // the cached frame's native size.
+      if (req.query.poster === '1') {
+        const posterPath = await videoTranscoder.poster(parts.id, filePath);
+        if (cancelled || res.headersSent) return;
+        if (!posterPath) {
+          res.status(503).send('Poster unavailable');
+          return;
+        }
+        const width = Number(req.query.width) || 0;
+        const height = Number(req.query.height) || 0;
+        const raw = await fs.promises.readFile(posterPath);
+        const jpeg = (width || height) ? await convertBufferToJpeg(raw, width, height, 85) : raw;
+        if (cancelled || res.headersSent) return;
+        res.type('image/jpeg').send(jpeg);
+        return;
+      }
+
       // Record videos in /history like images. Playback issues many Range
       // requests per view — only the opening request (no Range, or one that
       // starts at byte 0) counts, so mid-file seeks don't re-bump the entry.

@@ -95,6 +95,33 @@ test('animatedToMp4 encodes an APNG to fMP4, capped to 720p30', { skip: !hasFfmp
     assert.ok(orig.fps > 31, `uncapped keeps source frame rate, got ${orig.fps}`);
 });
 
+test('poster() extracts a first-frame JPEG and caches it', { skip: !hasFfmpeg() }, async () => {
+    const dir = tmpDir();
+    const src = path.join(dir, 'src.mp4');
+    execFileSync('ffmpeg', [
+        '-hide_banner', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', 'color=c=red:s=320x240:d=1',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', src,
+    ], { stdio: 'ignore' });
+
+    const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
+    const posterPath = await t.poster(42, src);
+    assert.ok(posterPath, 'returns a path');
+    const jpeg = fs.readFileSync(posterPath);
+    assert.ok(jpeg.length > 0, 'wrote a non-empty file');
+    assert.equal(jpeg.slice(0, 2).toString('hex'), 'ffd8', 'starts with a JPEG SOI marker');
+
+    // Second call is a cache hit: no new ffmpeg process, same path.
+    const cached = await t.poster(42, src);
+    assert.equal(cached, posterPath);
+});
+
+test('poster() resolves null when ffmpeg is missing', async () => {
+    const t = createVideoTranscoder({ cachePath: tmpDir(), ffmpegPath: '/nonexistent/ffmpeg', log: quietLog });
+    const result = await t.poster(1, '/nonexistent/source.mp4');
+    assert.equal(result, null);
+});
+
 test('cachedFile misses then hits, keyed by height and fps', () => {
     const dir = tmpDir();
     const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
@@ -128,6 +155,18 @@ test('prune drops oldest entries beyond the byte cap', async () => {
     await new Promise((r) => setTimeout(r, 200));
     const left = fs.readdirSync(dir).sort();
     assert.deepEqual(left, ['1.h264.mp4', '2.h264.mp4']);
+});
+
+test('prune ages out poster files like any other cache entry', async () => {
+    const dir = tmpDir();
+    const t = createVideoTranscoder({ cachePath: dir, maxCacheBytes: 150, log: quietLog });
+    fs.writeFileSync(path.join(dir, '1.poster.jpg'), Buffer.alloc(100));
+    fs.utimesSync(path.join(dir, '1.poster.jpg'), new Date(1000000), new Date(1000000));
+    fs.writeFileSync(path.join(dir, '2.poster.jpg'), Buffer.alloc(100));
+    fs.utimesSync(path.join(dir, '2.poster.jpg'), new Date(2000000), new Date(2000000));
+    t.prune();
+    await new Promise((r) => setTimeout(r, 200));
+    assert.deepEqual(fs.readdirSync(dir), ['2.poster.jpg']);
 });
 
 test('0/0 caps serve any H.264 source raw; an fps cap forces a transcode', { skip: !hasFfmpeg() }, async () => {

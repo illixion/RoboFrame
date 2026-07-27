@@ -189,9 +189,13 @@ the deadline) is the canary for the wake-advance class of bug.
   while a client pages: every frame the displays advance bumps a post into a
   higher tier — back ahead of the cursor — so it comes round again on a later
   page. A wrapped final page tops itself up from the deck's head for the same
-  reason. Clients that accumulate pages (the `/browse` sheet) dedup by id;
-  don't "fix" it by freezing the order, which is what makes the orchestrator's
-  queue refill least-seen-first.
+  reason. Don't "fix" it by freezing the order globally — that's what makes
+  the orchestrator's queue refill least-seen-first. `/browse` instead sends
+  every query with an implicit `order:id` (unless the box already names an
+  `order:`), which pages by flat row offset and never reads `display_count` at
+  all — a genuine DB view, immune to whatever the frames are doing. It still
+  dedups arrivals by id as a belt-and-suspenders backstop for whatever order a
+  user explicitly types in.
 - **Two token tiers.** `accessToken` (kiosk tier) ≠ `rpcToken`
   (privileged tier). They must differ. `rpcsend` over WebSocket and
   HTTP `/rpc/send` both require the rpc tier.

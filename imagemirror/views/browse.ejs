@@ -209,7 +209,7 @@
             <option value="">Tag lists</option>
           </select>
         </span>
-        <button class="tool" id="jump" type="button" title="Start from a random point in the deck">Random window</button>
+        <button class="tool" id="jump" type="button" title="Start from a random point in the listing">Random window</button>
         <button class="tool" id="help" type="button" aria-expanded="false" aria-controls="syntax">Syntax</button>
       </div>
       <div class="position"><i id="position"></i></div>
@@ -231,7 +231,7 @@
         <div><dt>score:&gt;=50</dt><dd>&lt; &lt;= &gt; &gt;= != on numbers</dd></div>
         <div><dt>ratio:1.7..1.8</dt><dd>numeric range</dd></div>
         <div><dt>image_width:&gt;=2000</dt><dd>pixel dimensions</dd></div>
-        <div><dt>order:id</dt><dd>id, score, score_asc, random</dd></div>
+        <div><dt>order:id</dt><dd>default here — id, score, score_asc, random</dd></div>
         <div><dt>limit:80</dt><dd>frames per page</dd></div>
       </dl>
     </div>
@@ -303,8 +303,17 @@
       }
 
       // ---- media URLs -----------------------------------------------------
-      const thumbUrl = (post) => endpoint('get', 'id=' + post.id
-        + '&convert=1&bright=0&width=640&height=640&record=0&lowmem=' + LOWMEM + tokenParam);
+      // A video's thumbnail is a server-extracted first-frame JPEG, fetched
+      // the same way as an image thumbnail — not a `<video>` element pointed
+      // at the stream. A `<video>`'s own network/decode pipeline is a
+      // browser-controlled black box that gets throttled or suspended on a
+      // backgrounded tab independent of what's on screen, which silently
+      // starved the grid of any poster for every video post that scrolled
+      // into view while the tab wasn't focused.
+      const thumbUrl = (post) => VIDEO_EXT.test(post.ext)
+        ? endpoint('get', 'id=' + post.id + '&poster=1&width=640&height=640&record=0' + tokenParam)
+        : endpoint('get', 'id=' + post.id
+          + '&convert=1&bright=0&width=640&height=640&record=0&lowmem=' + LOWMEM + tokenParam);
       const fullUrl = (post) => endpoint('get', 'id=' + post.id
         + '&convert=1&bright=0&record=0&lowmem=' + LOWMEM + tokenParam);
       // The untouched source bytes. `rawanimated=1` keeps the server from
@@ -318,8 +327,24 @@
       const streamUrl = (post) => endpoint('get', 'id=' + post.id + '&record=0' + tokenParam);
 
       // ---- fetching -------------------------------------------------------
+      // /search defaults to the slideshow's shuffled deck, ordered by
+      // (display_count, random_rank) — display_count moves under a paging
+      // client as the frames advance, so browsing here would silently reorder
+      // out from under itself depending on what's showing elsewhere. This is
+      // a plain view of the library, not a slideshow pick, so every query
+      // gets a stable `order:id` unless the box already names one — id order
+      // never touches display_count and pages by a flat row offset. "Random
+      // window" still gives a random starting point (see jump below); it's
+      // just not the shared, display_count-coupled deck.
+      const HAS_ORDER = /(?:^|\s)order:/i;
+      const effectiveQuery = () => {
+        const raw = input.value.trim();
+        return HAS_ORDER.test(raw) ? raw : (raw ? raw + ' order:id' : 'order:id');
+      };
+
       // The server's random-order cursor is a (display_count, random_rank)
-      // pair; deterministic orders page by row offset.
+      // pair; deterministic orders (including our forced order:id default)
+      // page by row offset.
       const encodeCursor = (c) => (c && Number.isFinite(c.rank))
         ? c.dc + ',' + c.rank
         : String(c && c.offset || 0);
@@ -346,7 +371,7 @@
         run.failed = false;
         const token = run.token;
         report();
-        const parts = ['q=' + encodeURIComponent(input.value.trim()), 'limit=' + PAGE];
+        const parts = ['q=' + encodeURIComponent(effectiveQuery()), 'limit=' + PAGE];
         if (run.cursor) parts.push('cursor=' + encodeURIComponent(encodeCursor(run.cursor)));
         try {
           const resp = await fetch(endpoint('search', parts.join('&') + tokenParam));
@@ -406,16 +431,23 @@
         if (nearEnd()) loadPage();
       }
 
+      async function fetchCount() {
+        try {
+          const resp = await fetch(endpoint('count', 'q=' + encodeURIComponent(effectiveQuery()) + tokenParam));
+          if (!resp.ok) return null;
+          const data = await resp.json();
+          return Number(data.count) || 0;
+        } catch (_) {
+          return null; // count is a nicety; the grid stands without it
+        }
+      }
+
       async function loadCount() {
         const token = run.token;
-        try {
-          const resp = await fetch(endpoint('count', 'q=' + encodeURIComponent(input.value.trim()) + tokenParam));
-          if (!resp.ok) return;
-          const data = await resp.json();
-          if (token !== run.token) return;
-          run.total = Number(data.count) || 0;
-          report();
-        } catch (_) { /* count is a nicety; the grid stands without it */ }
+        const count = await fetchCount();
+        if (count === null || token !== run.token) return;
+        run.total = count;
+        report();
       }
 
       function report() {
@@ -558,26 +590,15 @@
         const pending = frame.querySelector('.pending');
         const fail = () => { if (pending) { pending.textContent = 'no preview'; pending.classList.add('failed'); } };
 
-        if (VIDEO_EXT.test(post.ext)) {
-          // Seek a metadata-only <video> to its first frame: enough of a poster
-          // without pulling the clip.
-          const video = document.createElement('video');
-          video.muted = true; video.playsInline = true; video.preload = 'metadata';
-          const reveal = () => { video.classList.add('shown'); if (pending) pending.remove(); };
-          video.onloadedmetadata = () => { try { video.currentTime = 0.1; } catch (_) {} };
-          video.onloadeddata = reveal;
-          video.onseeked = reveal;
-          video.onerror = fail;
-          video.src = streamUrl(post);
-          frame.appendChild(video);
-          return;
-        }
-
         try {
           const resp = await fetch(thumbUrl(post));
           if (!resp.ok) throw new Error('thumb ' + resp.status);
           const blob = await resp.blob();
           const url = URL.createObjectURL(blob);
+          // An animated post's `convert=1` thumbnail comes back as mp4 (the
+          // server's animated variant) rather than the poster path above,
+          // which only applies to genuine video-ext posts — so this still
+          // has to sniff the response type, not the post's ext.
           if (blob.type.startsWith('video/')) {
             const video = document.createElement('video');
             video.muted = true; video.loop = true; video.playsInline = true; video.autoplay = true;
@@ -846,10 +867,14 @@
         search();
       });
 
-      // The deck order is fixed for the life of the server, so "random window"
-      // means starting from an arbitrary point in it rather than reshuffling.
-      document.getElementById('jump').addEventListener('click', () => {
-        search({ dc: 0, rank: Math.random() });
+      // Listing is id-ordered and paged by flat offset (see effectiveQuery
+      // above), so "random window" means a random starting offset rather than
+      // a reshuffle — bounded so a full page still fits before the end.
+      document.getElementById('jump').addEventListener('click', async () => {
+        const total = run.total ?? await fetchCount();
+        const max = Math.max(0, (total || 0) - PAGE);
+        const offset = max > 0 ? Math.floor(Math.random() * (max + 1)) : 0;
+        search({ offset });
       });
 
       // ---- tag-list presets -----------------------------------------------
