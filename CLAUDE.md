@@ -184,6 +184,14 @@ the deadline) is the canary for the wake-advance class of bug.
   go through a read-modify-write to avoid clobbering a concurrent
   hand-edit; the watcher rebroadcasts the affected slice on change.
   Don't add an in-memory cache.
+- **`/search`'s random-order paging is not a stable snapshot.** The cursor is
+  the deck's `(display_count, random_rank)` tuple, and `display_count` moves
+  while a client pages: every frame the displays advance bumps a post into a
+  higher tier — back ahead of the cursor — so it comes round again on a later
+  page. A wrapped final page tops itself up from the deck's head for the same
+  reason. Clients that accumulate pages (the `/browse` sheet) dedup by id;
+  don't "fix" it by freezing the order, which is what makes the orchestrator's
+  queue refill least-seen-first.
 - **Two token tiers.** `accessToken` (kiosk tier) ≠ `rpcToken`
   (privileged tier). They must differ. `rpcsend` over WebSocket and
   HTTP `/rpc/send` both require the rpc tier.

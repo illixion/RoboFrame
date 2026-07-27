@@ -136,9 +136,9 @@
 
       .empty,.failure{padding:80px 18px;text-align:center;color:var(--muted)}
       .empty code,.failure code{font-family:var(--mono);color:var(--amber)}
-      .sentinel{height:1px}
-      .more{padding:26px 18px 60px;text-align:center;font-family:var(--mono);
-        font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:#4c525b}
+      .more{padding:26px 18px 60px;display:flex;flex-direction:column;align-items:center;
+        gap:12px;font-family:var(--mono);font-size:11px;letter-spacing:.2em;
+        text-transform:uppercase;color:#4c525b}
 
       /* ---- viewer -------------------------------------------------------- */
       .viewer{position:fixed;inset:0;z-index:100;background:rgba(6,7,8,0.97);
@@ -175,7 +175,14 @@
       .tag{background:transparent;border:1px solid var(--rule);border-radius:2px;
         padding:3px 7px;font-family:var(--mono);font-size:11px;color:var(--muted);cursor:pointer}
       .tag:hover{color:var(--amber);border-color:var(--amber-dim)}
+      /* Which bytes the stage is actually showing — the source file or the
+         server's JPEG/mp4 stand-in. */
+      .source{font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:#6b727c}
+      .source b{color:var(--amber);font-weight:600}
       .rail .acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:auto}
+      /* The download link is a button in every way except being an <a>. */
+      .rail a.tool{display:flex;align-items:center;justify-content:center;
+        text-decoration:none}
       .rail .tool{flex:1 1 auto;text-align:center}
       .rail .tool.danger:hover{color:var(--danger);border-color:var(--danger)}
       .said{font-family:var(--mono);font-size:11px;letter-spacing:.1em;color:var(--amber);
@@ -231,7 +238,6 @@
 
     <main class="sheet">
       <div class="grid" id="grid"></div>
-      <div class="sentinel" id="sentinel"></div>
       <div class="more" id="more"></div>
     </main>
 
@@ -245,9 +251,11 @@
       <aside class="rail">
         <h2 id="railId">—</h2>
         <dl class="facts" id="facts"></dl>
+        <div class="source" id="source"></div>
         <div class="tags" id="tags"></div>
         <div class="said" id="said"></div>
         <div class="acts">
+          <a class="tool" id="actDownload" download>Download</a>
           <button class="tool" id="actSave" type="button">Save</button>
           <button class="tool danger" id="actBlock" type="button">Block</button>
           <button class="tool" id="actClose" type="button">Close</button>
@@ -278,7 +286,13 @@
       // One search run: the posts fetched so far plus where the server said to
       // continue from. `token` guards against a stale page landing after the
       // query changed.
-      let run = { token: 0, posts: [], cursor: null, done: false, loading: false, total: null };
+      let run = {
+        token: 0, posts: [], seen: new Set(), cursor: null,
+        done: false, loading: false, failed: false, total: null,
+      };
+
+      // How close to the end of the page counts as "asking for more".
+      const REACH = 900;
 
       // ---- URL <-> query --------------------------------------------------
       const queryFromUrl = () => new URLSearchParams(location.search).get('q') || '';
@@ -293,6 +307,12 @@
         + '&convert=1&bright=0&width=640&height=640&record=0&lowmem=' + LOWMEM + tokenParam);
       const fullUrl = (post) => endpoint('get', 'id=' + post.id
         + '&convert=1&bright=0&record=0&lowmem=' + LOWMEM + tokenParam);
+      // The untouched source bytes. `rawanimated=1` keeps the server from
+      // converting an animated post to WebP/mp4 on the way out, so this is the
+      // real file for every post — what a browser with its own JXL decoder
+      // should get, and what the download button hands over.
+      const rawUrl = (post) => endpoint('get', 'id=' + post.id
+        + '&rawanimated=1&record=0' + tokenParam);
       // Video posts bypass the image pipeline: /get streams the file with Range
       // support, so a metadata-only preload pulls just the head.
       const streamUrl = (post) => endpoint('get', 'id=' + post.id + '&record=0' + tokenParam);
@@ -323,8 +343,9 @@
       async function loadPage() {
         if (run.loading || run.done) return;
         run.loading = true;
+        run.failed = false;
         const token = run.token;
-        moreEl.textContent = 'Loading…';
+        report();
         const parts = ['q=' + encodeURIComponent(input.value.trim()), 'limit=' + PAGE];
         if (run.cursor) parts.push('cursor=' + encodeURIComponent(encodeCursor(run.cursor)));
         try {
@@ -332,28 +353,57 @@
           if (!resp.ok) throw new Error('search ' + resp.status);
           const data = await resp.json();
           if (token !== run.token) return;
-          const posts = (data.results || []).map(normalize);
+          const page = (data.results || []).map(normalize);
+          // The deck's paging key is (display_count, random_rank), and
+          // display_count moves under us — every frame the displays advance
+          // bumps a post into a higher tier, i.e. back ahead of our cursor. A
+          // wrapped last page tops itself up from the deck's head for the same
+          // reason. Both hand back rows we already have, so the sheet keeps its
+          // own set and shows each post once.
+          const posts = page.filter((post) => !run.seen.has(post.id));
+          posts.forEach((post) => run.seen.add(post.id));
           run.posts.push.apply(run.posts, posts);
           run.cursor = data.nextCursor || null;
-          run.done = !run.cursor || posts.length === 0;
+          run.done = !run.cursor || page.length === 0;
           posts.forEach(addTile);
           layout();
-          report();
         } catch (err) {
           if (token !== run.token) return;
           console.error(err);
-          run.done = true;
-          moreEl.textContent = '';
+          // A failed page leaves the run resumable: the cursor is untouched, so
+          // Load more retries the same page rather than skipping it.
+          run.failed = true;
           if (!run.posts.length) {
             grid.innerHTML = '';
             const p = document.createElement('p');
             p.className = 'failure';
-            p.innerHTML = 'Search failed. Check the query syntax, then run it again.';
+            p.textContent = 'Search failed. Check the query syntax, then run it again.';
             grid.after(p);
           }
         } finally {
-          if (token === run.token) run.loading = false;
+          if (token === run.token) {
+            run.loading = false;
+            report();
+            // A page whose tiles don't reach past the fold has to pull the next
+            // one itself — waiting for a scroll that never comes is how the
+            // sheet used to stall on its first page.
+            if (!run.failed) setTimeout(maybeLoadMore, 0);
+          }
         }
+      }
+
+      // Paging trigger. Deliberately a measurement rather than an
+      // IntersectionObserver on a sentinel: an observer only reports *changes*,
+      // so a sentinel that was already in view when a page landed never fires
+      // again and paging dies until something else calls loadPage.
+      function nearEnd() {
+        const doc = document.documentElement;
+        return doc.scrollHeight - (window.scrollY + window.innerHeight) < REACH;
+      }
+
+      function maybeLoadMore() {
+        if (run.loading || run.done || run.failed) return;
+        if (nearEnd()) loadPage();
       }
 
       async function loadCount() {
@@ -379,10 +429,38 @@
         positionEl.style.width = run.total
           ? Math.min(100, (shown / run.total) * 100) + '%'
           : '0';
-        moreEl.textContent = run.done
-          ? (shown ? 'End of deck' : '')
-          : '';
+        renderMore();
         if (!shown && run.done) showEmpty();
+      }
+
+      // The tail of the sheet: a status word while paging runs by itself, and a
+      // button whenever there's a page left to fetch — the way out when the
+      // automatic trigger doesn't fire on a given browser, and the retry after
+      // a failed page.
+      function renderMore() {
+        moreEl.innerHTML = '';
+        if (run.loading) {
+          moreEl.append(note('Loading…'));
+          return;
+        }
+        if (run.done) {
+          if (run.posts.length) moreEl.append(note('End of deck'));
+          return;
+        }
+        if (run.failed) moreEl.append(note('That page didn’t load.'));
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'tool';
+        button.textContent = run.failed ? 'Try again' : 'Load more';
+        button.addEventListener('click', loadPage);
+        moreEl.append(button);
+      }
+
+      function note(text) {
+        const span = document.createElement('span');
+        span.className = 'word';
+        span.textContent = text;
+        return span;
       }
 
       function showEmpty() {
@@ -446,7 +524,7 @@
           tile.style.gridRowEnd = 'span ' + Math.max(1, Math.ceil((height + GAP) / (ROW + GAP)));
         }
       }
-      window.addEventListener('resize', layout);
+      window.addEventListener('resize', () => { layout(); maybeLoadMore(); });
 
       // ---- lazy media, at most four fetches in flight ---------------------
       // Animated posts come back from /get as mp4 (the kiosk pipeline's
@@ -528,6 +606,7 @@
       const railId = document.getElementById('railId');
       const facts = document.getElementById('facts');
       const tagsEl = document.getElementById('tags');
+      const sourceEl = document.getElementById('source');
       const said = document.getElementById('said');
       let openId = null;
 
@@ -569,30 +648,112 @@
           tagsEl.appendChild(b);
         });
 
-        if (VIDEO_EXT.test(post.ext)) {
-          stageImg.hidden = true; stageImg.removeAttribute('src');
-          stageVideo.hidden = false;
-          stageVideo.src = streamUrl(post);
-          stageVideo.play().catch(() => {});
-        } else {
-          stageVideo.hidden = true; stageVideo.pause();
-          stageVideo.removeAttribute('src'); stageVideo.load();
-          stageImg.hidden = false;
-          stageImg.alt = 'Frame ' + post.id;
-          stageImg.src = fullUrl(post);
-        }
+        const download = document.getElementById('actDownload');
+        download.href = rawUrl(post);
+        download.setAttribute('download', post.id + (post.ext ? '.' + post.ext : ''));
+        download.title = 'Save the original ' + (post.ext ? '.' + post.ext + ' ' : '') + 'file';
+
+        showOnStage(post);
         viewer.classList.add('open');
         viewer.setAttribute('aria-hidden', 'false');
       }
 
-      function closeViewer() {
-        openId = null;
-        viewer.classList.remove('open');
-        viewer.setAttribute('aria-hidden', 'true');
+      // Stage loading. The source file goes to the browser first: a browser that
+      // decodes JXL (or AVIF, or whatever the library holds) shows the real
+      // pixels and the server never runs djxl. Only a decode failure falls back
+      // to the converted variant — which is also the path that carries animated
+      // posts, since those come back as mp4 rather than an image.
+      let stageGeneration = 0;
+
+      function showOnStage(post) {
+        const generation = ++stageGeneration;
+        clearStage();
+        if (VIDEO_EXT.test(post.ext)) {
+          stageVideo.hidden = false;
+          stageVideo.src = streamUrl(post);
+          stageVideo.play().catch(() => {});
+          setSource('Streaming the source', post.ext);
+          return;
+        }
+        stageImg.hidden = false;
+        stageImg.alt = 'Frame ' + post.id;
+        setSource('Loading…', '');
+        stageImg.onload = () => {
+          if (generation !== stageGeneration) return;
+          setSource('Showing the source', post.ext);
+        };
+        stageImg.onerror = () => {
+          if (generation !== stageGeneration) return;
+          showConverted(post, generation);
+        };
+        stageImg.src = rawUrl(post);
+      }
+
+      async function showConverted(post, generation) {
+        setSource('Converting…', '');
+        let blob;
+        try {
+          const resp = await fetch(fullUrl(post));
+          if (!resp.ok) throw new Error('convert ' + resp.status);
+          blob = await resp.blob();
+        } catch (err) {
+          console.error(err);
+          if (generation === stageGeneration) setSource('This frame wouldn’t load', '');
+          return;
+        }
+        if (generation !== stageGeneration) return;
+        const url = URL.createObjectURL(blob);
+        // An animated post converts to mp4, so the response type — not the
+        // post's ext — decides the element.
+        if (blob.type.startsWith('video/')) {
+          stageImg.hidden = true;
+          stageImg.onload = stageImg.onerror = null;
+          stageImg.removeAttribute('src');
+          stageVideo.hidden = false;
+          stageVideo.muted = true;
+          stageVideo.src = url;
+          stageVideo.play().catch(() => {});
+          setSource('Showing a converted copy', blob.type.split('/')[1] || '');
+        } else {
+          const kind = blob.type.split('/')[1] || '';
+          // Replace the raw attempt's handlers — its onload would otherwise fire
+          // for these bytes and label the converted copy as the source.
+          stageImg.onload = () => {
+            if (generation === stageGeneration) setSource('Showing a converted copy', kind);
+          };
+          stageImg.onerror = () => {
+            if (generation === stageGeneration) setSource('This frame wouldn’t load', '');
+          };
+          stageImg.src = url;
+        }
+      }
+
+      function setSource(text, ext) {
+        sourceEl.textContent = text;
+        if (!ext) return;
+        sourceEl.append(' · ');
+        const b = document.createElement('b');
+        b.textContent = ext.toUpperCase();
+        sourceEl.append(b);
+      }
+
+      function clearStage() {
+        stageImg.onload = stageImg.onerror = null;
+        stageImg.hidden = true;
         stageImg.removeAttribute('src');
+        stageVideo.hidden = true;
         stageVideo.pause();
+        stageVideo.muted = false;
         stageVideo.removeAttribute('src');
         stageVideo.load();
+      }
+
+      function closeViewer() {
+        openId = null;
+        stageGeneration++;
+        viewer.classList.remove('open');
+        viewer.setAttribute('aria-hidden', 'true');
+        clearStage();
       }
 
       function step(delta) {
@@ -603,8 +764,13 @@
           openViewer(next.id);
           const tile = grid.querySelector('.tile[data-id="' + CSS.escape(next.id) + '"]');
           if (tile) tile.scrollIntoView({ block: 'nearest' });
-        } else if (delta > 0) {
-          loadPage();
+          return;
+        }
+        // Walked off the end of what's loaded: fetch the next page and carry on
+        // into it, so stepping never dead-ends mid-deck.
+        if (delta > 0 && !run.done) {
+          const from = openId;
+          loadPage().then(() => { if (openId === from) step(1); });
         }
       }
 
@@ -660,8 +826,8 @@
       function search(startCursor) {
         run.token++;
         run = {
-          token: run.token, posts: [], cursor: startCursor || null,
-          done: false, loading: false, total: null,
+          token: run.token, posts: [], seen: new Set(), cursor: startCursor || null,
+          done: false, loading: false, failed: false, total: null,
         };
         queue.length = 0;
         grid.innerHTML = '';
@@ -750,9 +916,15 @@
         helpBtn.setAttribute('aria-expanded', String(open));
       });
 
-      new IntersectionObserver((entries) => {
-        if (entries.some((e) => e.isIntersecting)) loadPage();
-      }, { rootMargin: '900px 0px' }).observe(document.getElementById('sentinel'));
+      // Throttled with a timer rather than requestAnimationFrame: rAF is paused
+      // in a background tab, and a tab that comes back to a half-scrolled sheet
+      // should still page.
+      let scrollPending = false;
+      window.addEventListener('scroll', () => {
+        if (scrollPending) return;
+        scrollPending = true;
+        setTimeout(() => { scrollPending = false; maybeLoadMore(); }, 60);
+      }, { passive: true });
 
       window.addEventListener('keydown', (ev) => {
         const typing = ev.target === input;
