@@ -186,6 +186,44 @@ test('two ws on different deviceIds get independent channels', async (t) => {
     assert.notEqual(c1.currentId, c2.currentId);
 });
 
+test('multiplexed sessions with different deviceIds keep independent presence and queues', async (t) => {
+    const { orch } = harness({
+        pages: [
+            { results: [{ _id: 1, file_ext: 'jpg' }, { _id: 2, file_ext: 'jpg' }, { _id: 3, file_ext: 'jpg' }, { _id: 4, file_ext: 'jpg' }, { _id: 5, file_ext: 'jpg' }], nextCursor: 0 },
+            { results: [{ _id: 10, file_ext: 'jpg' }, { _id: 11, file_ext: 'jpg' }, { _id: 12, file_ext: 'jpg' }, { _id: 13, file_ext: 'jpg' }, { _id: 14, file_ext: 'jpg' }], nextCursor: 0 },
+        ],
+    });
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    const raw = orch.raw;
+
+    raw.register(ws, 'window-a', { deviceId: 'spatialstash-window-a', interval: 60000 });
+    await tick(); await tick(); await tick();
+    raw.register(ws, 'window-b', { deviceId: 'spatialstash-window-b', interval: 60000 });
+    await tick(); await tick(); await tick();
+
+    const a = orch._channels.get('spatialstash-window-a');
+    const b = orch._channels.get('spatialstash-window-b');
+    assert.equal(orch._channels.size, 2, 'one socket still owns two independent channels');
+    assert.notEqual(a.currentId, b.currentId);
+    raw.notifyImageReady(ws, 'window-a', a.currentId);
+    raw.notifyImageReady(ws, 'window-b', b.currentId);
+
+    const aBefore = a.currentId;
+    const bBefore = b.currentId;
+    raw.notifyPresent('spatialstash-window-a', false);
+    await tick(); await tick(); await tick();
+    assert.notEqual(a.currentId, aBefore, 'absent window dark-advanced its own channel');
+    assert.equal(b.currentId, bBefore, 'sibling window on the same socket was untouched');
+
+    ws.sent.length = 0;
+    raw.notifyPresent('spatialstash-window-a', true);
+    await tick(); await tick();
+    const resumed = ws.sent.filter((m) => m.action === 'playback').pop();
+    assert.deepEqual(resumed.sessionIds, ['window-a'],
+        'return playback is routed only to the returning window session');
+});
+
 test('readiness barrier: first imageReady from any expected ws starts the dwell timer', async (t) => {
     const { orch } = harness();
     t.after(() => orch.close());

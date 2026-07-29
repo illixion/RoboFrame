@@ -830,9 +830,12 @@ exact-string match — `"screen1"` and `"screen-1"` are different
 channels. Browser kiosks read the value from the `?ws=` URL parameter;
 node-display and Spatialstash pull it from their config.
 
-For multi-window setups (e.g., two Spatialstash windows on the same
-display), use the same `deviceId` so they share a channel; for windows
-on different displays, use distinct `deviceId`s.
+For multi-window setups, each independently positioned Spatialstash
+window is a separate logical display and must use a distinct, stable
+`deviceId`, even when the windows were launched from the same saved
+profile. They can still multiplex their sessions over one WebSocket.
+Reuse a `deviceId` only when the renderers intentionally represent the
+same display and must share one queue in lockstep.
 
 ## Quick checklist for a new client
 
