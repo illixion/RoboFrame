@@ -46,8 +46,10 @@ function harness({ presence = {}, prefetchVariant } = {}) {
         prefetcher: rec.prefetcher,
         imageCache: cache,
         prefetchVariant: prefetchVariant || (async () => ({ buffer: Buffer.alloc(8), mime: 'image/jpeg', ext: 'jpg' })),
-        getPresence: (deviceId) => (deviceId in presence ? presence[deviceId] : true),
     });
+    for (const [deviceId, present] of Object.entries(presence)) {
+        orch.notifyDevicePresent(deviceId, present);
+    }
     return { orch, rec, cache };
 }
 
@@ -91,7 +93,7 @@ test('two sessions with different variants → both variants prefetched per upco
     });
     await tick(); await tick();
     const beforeSecond = ctx.rec.calls.length;
-    ctx.orch.register(ws2, 's2', {
+    ctx.orch.register(ws2, 's1', {
         deviceId: 'k3', interval: 15000, width: 800, height: 600, convert: true, lowmem: true,
     });
     await tick(); await tick();
@@ -182,11 +184,11 @@ test('notifyPresent(true) re-triggers prefetch', async (t) => {
     const ctx = harness({ presence });
     t.after(() => ctx.orch.close());
     ctx.orch.register(makeFakeWs(), 's1', { deviceId: 'kV', interval: 5000, width: 100, height: 100, convert: true });
-    ctx.orch.notifyPresent('kV', false);
+    ctx.orch.notifyDevicePresent('kV', false);
     await tick(); await tick();
     assert.equal(ctx.rec.calls.length, 0);
     presence.kV = true;
-    ctx.orch.notifyPresent('kV', true);
+    ctx.orch.notifyDevicePresent('kV', true);
     await tick(); await tick();
     assert.ok(ctx.rec.calls.length > 0, 'prefetch should run after presence on');
 });

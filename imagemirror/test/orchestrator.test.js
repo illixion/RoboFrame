@@ -53,7 +53,8 @@ function withDefaultSession(orch) {
         requestReshuffle: (ws) => orch.requestReshuffle(ws, sid(ws)),
         notifyImageReady: (ws, id, durationMs) => orch.notifyImageReady(ws, sid(ws), id, durationMs),
         claimDisplaySync: (ws, enabled) => orch.claimDisplaySync(ws, sid(ws), enabled),
-        notifyPresent: (...args) => orch.notifyPresent(...args),
+        notifyPresent: (deviceId, present) => orch.notifyDevicePresent(deviceId, present),
+        notifySessionPresent: (ws, present) => orch.notifyPresent(ws, sid(ws), present),
         setTagList: (ws, listNumber) => orch.setTagList(ws, sid(ws), listNumber),
         notifyBlockedChange: (...args) => orch.notifyBlockedChange(...args),
         requeryAll: (...args) => orch.requeryAll(...args),
@@ -147,14 +148,14 @@ test('first session creates the channel; refill broadcasts current image', async
     assert.deepEqual(last.payload.current, { id: 1, ext: 'jpg' });
 });
 
-test('two ws on the same deviceId share one channel and receive the same playback', async (t) => {
+test('two ws with the same deviceId and sessionId share one channel', async (t) => {
     const { orch } = harness();
     t.after(() => orch.close());
     const a = makeFakeWs();
     const b = makeFakeWs();
-    orch.register(a, { deviceId: 'screen1', interval: 5000 });
+    orch.raw.register(a, 'main', { deviceId: 'screen1', interval: 5000 });
     await tick(); await tick(); await tick();
-    orch.register(b, { deviceId: 'screen1', interval: 5000 });
+    orch.raw.register(b, 'main', { deviceId: 'screen1', interval: 5000 });
     await tick();
     assert.equal(orch._channels.size, 1);
     // Both ws received a playback for screen1; the post-refill broadcast
@@ -186,7 +187,7 @@ test('two ws on different deviceIds get independent channels', async (t) => {
     assert.notEqual(c1.currentId, c2.currentId);
 });
 
-test('multiplexed sessions with different deviceIds keep independent presence and queues', async (t) => {
+test('multiplexed sessions on one device keep independent presence and queues', async (t) => {
     const { orch } = harness({
         pages: [
             { results: [{ _id: 1, file_ext: 'jpg' }, { _id: 2, file_ext: 'jpg' }, { _id: 3, file_ext: 'jpg' }, { _id: 4, file_ext: 'jpg' }, { _id: 5, file_ext: 'jpg' }], nextCursor: 0 },
@@ -197,13 +198,13 @@ test('multiplexed sessions with different deviceIds keep independent presence an
     const ws = makeFakeWs();
     const raw = orch.raw;
 
-    raw.register(ws, 'window-a', { deviceId: 'spatialstash-window-a', interval: 60000 });
+    raw.register(ws, 'window-a', { deviceId: 'spatialstash', interval: 60000 });
     await tick(); await tick(); await tick();
-    raw.register(ws, 'window-b', { deviceId: 'spatialstash-window-b', interval: 60000 });
+    raw.register(ws, 'window-b', { deviceId: 'spatialstash', interval: 60000 });
     await tick(); await tick(); await tick();
 
-    const a = orch._channels.get('spatialstash-window-a');
-    const b = orch._channels.get('spatialstash-window-b');
+    const a = raw._channelFor('spatialstash', 'window-a');
+    const b = raw._channelFor('spatialstash', 'window-b');
     assert.equal(orch._channels.size, 2, 'one socket still owns two independent channels');
     assert.notEqual(a.currentId, b.currentId);
     raw.notifyImageReady(ws, 'window-a', a.currentId);
@@ -211,13 +212,13 @@ test('multiplexed sessions with different deviceIds keep independent presence an
 
     const aBefore = a.currentId;
     const bBefore = b.currentId;
-    raw.notifyPresent('spatialstash-window-a', false);
+    raw.notifyPresent(ws, 'window-a', false);
     await tick(); await tick(); await tick();
     assert.notEqual(a.currentId, aBefore, 'absent window dark-advanced its own channel');
     assert.equal(b.currentId, bBefore, 'sibling window on the same socket was untouched');
 
     ws.sent.length = 0;
-    raw.notifyPresent('spatialstash-window-a', true);
+    raw.notifyPresent(ws, 'window-a', true);
     await tick(); await tick();
     const resumed = ws.sent.filter((m) => m.action === 'playback').pop();
     assert.deepEqual(resumed.sessionIds, ['window-a'],
@@ -229,8 +230,8 @@ test('readiness barrier: first imageReady from any expected ws starts the dwell 
     t.after(() => orch.close());
     const a = makeFakeWs();
     const b = makeFakeWs();
-    orch.register(a, { deviceId: 'screen1', interval: 5000 });
-    orch.register(b, { deviceId: 'screen1', interval: 5000 });
+    orch.raw.register(a, 'shared', { deviceId: 'screen1', interval: 5000 });
+    orch.raw.register(b, 'shared', { deviceId: 'screen1', interval: 5000 });
     await tick(); await tick(); await tick();
 
     const ch = orch._channels.get('screen1');
@@ -241,7 +242,7 @@ test('readiness barrier: first imageReady from any expected ws starts the dwell 
     // First-ready wins: a single report is enough, even with another
     // expected session still outstanding. The slow/absent peer must not
     // gate the channel.
-    orch.notifyImageReady(a, ch.currentId);
+    orch.raw.notifyImageReady(a, 'shared', ch.currentId);
     assert.equal(ch.phase, 'displaying');
     assert.ok(ch.timer, 'dwell timer arms on the first imageReady');
 });
@@ -354,8 +355,8 @@ test('readiness barrier: a client leaving before reporting does not wedge the ch
     t.after(() => orch.close());
     const a = makeFakeWs();
     const b = makeFakeWs();
-    orch.register(a, { deviceId: 'screen1', interval: 5000 });
-    orch.register(b, { deviceId: 'screen1', interval: 5000 });
+    orch.raw.register(a, 'shared', { deviceId: 'screen1', interval: 5000 });
+    orch.raw.register(b, 'shared', { deviceId: 'screen1', interval: 5000 });
     await tick(); await tick(); await tick();
 
     const ch = orch._channels.get('screen1');
@@ -364,9 +365,9 @@ test('readiness barrier: a client leaving before reporting does not wedge the ch
 
     // `a` reports, `b` never does and then disconnects. The channel must
     // already be running off `a`'s report — `b` leaving can't strand it.
-    orch.notifyImageReady(a, ch.currentId);
+    orch.raw.notifyImageReady(a, 'shared', ch.currentId);
     assert.equal(ch.phase, 'displaying', 'one report is enough to advance');
-    orch.unregister(b);
+    orch.raw.unregister(b);
     assert.equal(ch.phase, 'displaying');
     assert.ok(ch.timer, 'channel keeps running after the non-reporting peer leaves');
 });
@@ -691,16 +692,16 @@ test('any session can request advance — no primary gate, no echo loop', async 
     t.after(() => orch.close());
     const a = makeFakeWs();
     const b = makeFakeWs();
-    orch.register(a, { deviceId: 'screen1', interval: 5000 });
-    orch.register(b, { deviceId: 'screen1', interval: 5000 });
+    orch.raw.register(a, 'shared', { deviceId: 'screen1', interval: 5000 });
+    orch.raw.register(b, 'shared', { deviceId: 'screen1', interval: 5000 });
     await tick(); await tick(); await tick();
-    reportAllReady(orch, 'screen1');
     const ch = orch._channels.get('screen1');
+    orch.raw.notifyImageReady(a, 'shared', ch.currentId);
     const beforeId = ch.currentId;
 
     a.sent.length = 0;
     b.sent.length = 0;
-    orch.requestAdvance(b);
+    orch.raw.requestAdvance(b, 'shared');
     await tick(); await tick(); await tick();
     assert.notEqual(ch.currentId, beforeId, 'channel advanced');
     // The advance broadcast lands on every channel session — including
@@ -809,14 +810,14 @@ test('reconnect to parked channel restores state without slideshowConfig replay'
     });
     t.after(() => orch.close());
     const a = makeFakeWs();
-    orch.register(a, { deviceId: 'screen1', interval: 5000, modTags: ['rating:s'] });
+    orch.raw.register(a, 'stable-window', { deviceId: 'screen1', interval: 5000, modTags: ['rating:s'] });
     await tick(); await tick(); await tick();
     const before = orch._state().channels[0];
     assert.equal(before.deviceId, 'screen1');
 
     // Disconnect the only session. Channel must persist — its queue,
     // mod tags, and current id are needed when the client reconnects.
-    orch.unregister(a);
+    orch.raw.unregister(a);
     const parked = orch._state().channels[0];
     assert.ok(parked, 'channel persists after last session leaves');
     assert.equal(parked.deviceId, 'screen1');
@@ -825,7 +826,7 @@ test('reconnect to parked channel restores state without slideshowConfig replay'
     // Reconnect with bare deviceId (no slideshowConfig replay needed
     // for state — `register` takes care of session re-binding).
     const a2 = makeFakeWs();
-    orch.register(a2, { deviceId: 'screen1', interval: 5000 });
+    orch.raw.register(a2, 'stable-window', { deviceId: 'screen1', interval: 5000 });
     await tick(); await tick();
     const after = orch._state().channels[0];
     assert.equal(after.sessionCount, 1, 'new session bound to surviving channel');
@@ -833,10 +834,7 @@ test('reconnect to parked channel restores state without slideshowConfig replay'
         'mod tags survived the disconnect');
 });
 
-test('multiplex: two sessions on one ws share a channel and get a single playback frame', async (t) => {
-    // Drives the raw API (sessionId as a first-class arg) since the
-    // shim is one-sessionId-per-ws. Two windows in one room sharing a
-    // device id and one connection is the canonical use case.
+test('multiplex: same-device sessions get separately routed playback frames', async (t) => {
     const { orch } = harness({
         pages: [{
             results: [
@@ -854,41 +852,39 @@ test('multiplex: two sessions on one ws share a channel and get a single playbac
     raw.register(ws, 'win2', { deviceId: 'room', interval: 5000 });
     await tick(); await tick(); await tick();
 
-    const channel = orch._channels.get('room');
-    assert.equal(channel.sessions.size, 2, 'both sessions live in the same channel');
+    const win1 = raw._channelFor('room', 'win1');
+    const win2 = raw._channelFor('room', 'win2');
+    assert.notEqual(win1, win2);
+    assert.equal(win1.sessions.size, 1);
+    assert.equal(win2.sessions.size, 1);
 
-    // Force a fresh playback broadcast by walking the readiness barrier.
     ws.sent.length = 0;
-    raw.notifyImageReady(ws, 'win1', channel.currentId);
-    raw.notifyImageReady(ws, 'win2', channel.currentId);
-    // Timer fires immediately when the barrier completes; the next advance
-    // is what we want to count broadcast frames against.
-    await tick(); await tick();
     raw.requestAdvance(ws, 'win1');
     await tick(); await tick();
 
     const playbacks = ws.sent.filter((m) => m.action === 'playback');
     assert.ok(playbacks.length >= 1, 'received at least one playback frame');
     const last = playbacks[playbacks.length - 1];
-    assert.deepEqual(last.sessionIds.sort(), ['win1', 'win2'],
-        'one frame carries both sessionIds — no duplication on the wire');
+    assert.deepEqual(last.sessionIds, ['win1'],
+        'advance is routed only to the requesting window channel');
 });
 
-test('multiplex: per-session unregister removes only that session from the channel', async (t) => {
+test('multiplex: per-session unregister parks only that session channel', async (t) => {
     const { orch } = harness();
     t.after(() => orch.close());
     const ws = makeFakeWs();
     orch.raw.register(ws, 'win1', { deviceId: 'room', interval: 5000 });
     orch.raw.register(ws, 'win2', { deviceId: 'room', interval: 5000 });
     await tick(); await tick();
-    assert.equal(orch._channels.get('room').sessions.size, 2);
+    assert.equal(orch._channels.size, 2);
 
     orch.raw.unregisterSession(ws, 'win1');
     await tick();
-    const ch = orch._channels.get('room');
-    assert.equal(ch.sessions.size, 1, 'only win1 dropped');
-    // The remaining session still belongs to win2.
-    const survivor = Array.from(ch.sessions.values())[0];
+    const removed = orch.raw._channelFor('room', 'win1');
+    const remaining = orch.raw._channelFor('room', 'win2');
+    assert.equal(removed.sessions.size, 0);
+    assert.equal(remaining.sessions.size, 1);
+    const survivor = Array.from(remaining.sessions.values())[0];
     assert.equal(survivor.sessionId, 'win2');
 });
 
@@ -1184,12 +1180,12 @@ test('channel ratio clause adopts the most-square advertiser, not the intersecti
     // channel should instead pick the squarer advertiser's range.
     const landscape = makeFakeWs();
     const squareish = makeFakeWs();
-    orch.register(landscape, { deviceId: 'screen1', interval: 5000, ratio: '1.51..2.04' });
-    orch.register(squareish, { deviceId: 'screen1', interval: 5000, ratio: '0.80..1.20' });
+    orch.raw.register(landscape, 'shared', { deviceId: 'screen1', interval: 5000, ratio: '1.51..2.04' });
+    orch.raw.register(squareish, 'shared', { deviceId: 'screen1', interval: 5000, ratio: '0.80..1.20' });
     await tick(); await tick(); await tick();
 
     queries.length = 0;
-    orch.requestReshuffle(landscape); // rebuild the query with both sessions present
+    orch.raw.requestReshuffle(landscape, 'shared'); // rebuild the query with both sessions present
     await tick(); await tick();
 
     assert.ok(queries.length >= 1, 'reshuffle should rebuild the query');
@@ -1204,12 +1200,12 @@ test('bare float ratio advert is expanded ±15% server-side; squarest wins', asy
     const landscape = makeFakeWs();
     const squareish = makeFakeWs();
     // Clients now send their raw aspect ratio; the server applies the window.
-    orch.register(landscape, { deviceId: 'screen1', interval: 5000, ratio: 1.78 });
-    orch.register(squareish, { deviceId: 'screen1', interval: 5000, ratio: 1.0 });
+    orch.raw.register(landscape, 'shared', { deviceId: 'screen1', interval: 5000, ratio: 1.78 });
+    orch.raw.register(squareish, 'shared', { deviceId: 'screen1', interval: 5000, ratio: 1.0 });
     await tick(); await tick(); await tick();
 
     queries.length = 0;
-    orch.requestReshuffle(landscape);
+    orch.raw.requestReshuffle(landscape, 'shared');
     await tick(); await tick();
 
     assert.ok(queries.length >= 1, 'reshuffle should rebuild the query');

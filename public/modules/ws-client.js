@@ -38,6 +38,7 @@ function reportPresence() {
     if (present === lastPresent) return;
     lastPresent = present;
     state.socket.send(JSON.stringify({
+        sessionId: KIOSK_SESSION_ID,
         action: 'present',
         payload: { deviceId: state.deviceID, present },
     }));

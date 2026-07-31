@@ -2,20 +2,21 @@
 //
 // Server-driven slideshow orchestrator (per-display channels).
 //
-// One channel per `deviceId`. Sessions joining a channel render the same
-// queue and advance in lockstep. A channel is created when the first session
-// for that deviceId calls `slideshowConfig` and persists for the lifetime of
-// the server process: when its last session leaves, the channel is *parked*
+// One channel per `(deviceId, sessionId)`. Reusing both values joins renderers
+// in lockstep; changing either creates an independent queue. A channel is
+// created when the first matching session calls `slideshowConfig` and persists
+// for the lifetime of the server process: when its last session leaves, it is
+// *parked*
 // — all timers (dwell, readiness, prefetch) stop, but the queue, cursor,
 // mod tags, tag list, interval, currentId, and any held merge claim survive.
-// A returning client for the same deviceId rebinds to the parked channel
-// and resumes from the same image without replaying slideshowConfig.
+// A returning client with the same deviceId and sessionId rebinds to the parked
+// channel and resumes from the same image.
 //
 // Cadence is gated on a readiness barrier: after a `playback` frame is sent,
 // the channel waits for the *first* visible session to report `imageReady
 // { id }` for the new image before starting the dwell-time interval timer.
 // First-ready wins rather than all-ready: when several clients share a
-// deviceId (a web kiosk and Spatialstash, say) the slowest must not gate the
+// channel (two renderers using the same ids, say) the slowest must not gate the
 // channel, and a client leaving mid-barrier must not wedge it. A channel with
 // only hidden sessions has nothing to wait for and promotes immediately.
 //
@@ -27,13 +28,12 @@
 // routine recovery, not a fault worth flooding the log over. This is
 // the recovery path for a client that stays on the socket but stops reporting
 // — a frozen render loop a dead-socket check would never catch. The timeout is
-// per-channel, so it keys on deviceId: one wedged display (or one of the
-// distinct deviceIds Spatialstash multiplexes over a single connection) is
+// per-channel, so it keys on `(deviceId, sessionId)`: one wedged display is
 // promoted independently without disturbing its co-tenants. The "all hidden →
 // promote immediately" short-circuit covers the case where a session
 // *reported* itself hidden; the timeout covers the ones that never report.
 //
-// Visibility for a deviceId pauses/resumes the dwell timer using a wall-clock
+// Session-scoped `present` pauses/resumes the dwell timer using a wall-clock
 // deadline (`dwellDeadline`). It never resets the deadline.
 //
 // `displaySync` merges every channel into one for the duration of the claim.
@@ -84,7 +84,6 @@ function createOrchestrator({
     prefetcher = null,
     imageCache = null,
     prefetchVariant = null,
-    getPresence = null,
     getRatioWindow = null,
     getSharedTags = null,
     getReadyTimeout = null,
@@ -119,7 +118,7 @@ function createOrchestrator({
     // or a user action on the channel) resets the streak and resumes.
     const READY_TIMEOUT_STALL_STREAK = 3;
 
-    const channels = new Map();           // deviceId → channel
+    const channels = new Map();           // encoded (deviceId, sessionId) → channel
     // Stable per-ws id used to build session keys. Stored on the ws object
     // itself — the ws is the source of truth, we don't need a separate
     // Map keeping it alive past close.
@@ -136,13 +135,11 @@ function createOrchestrator({
     const sessionsByKey = new Map();
     // ws → Set<sessionKey>; lets us drop every session for a ws on close.
     const wsSessions = new Map();
-    // Presence — "is any display on this deviceId live and showing?" — drives
-    // the slideshow (dwell, prefetch, readiness). Distinct from `visibility`,
-    // which the broker now uses purely for home-location telemetry (the HA
-    // motion sensor). The broker feeds the *resolved* aggregate here via
-    // notifyPresent: present-reports if the deviceId ever sent one, else the
-    // visibility aggregate (back-compat for clients that only send visibility).
-    const presence = new Map();           // deviceId → boolean (true if no report)
+    // Explicit renderer state is per session. Device-level presence is only a
+    // compatibility fallback for clients that still report without sessionId
+    // (and for visibility-only clients).
+    const sessionPresence = new Map();    // sessionKey → boolean
+    const devicePresence = new Map();     // deviceId → boolean
     // displaySync merge is tracked as a property of the *driver channel*,
     // not a specific ws or session. All sessions on the driver channel are
     // considered equal — any of them can release. Original claimer leaving
@@ -178,9 +175,15 @@ function createOrchestrator({
         return sharedTagsEnabled() ? sharedModTags : (channel.modTags || []);
     }
 
-    function makeChannel(deviceId) {
+    function channelKeyOf(deviceId, sessionId) {
+        return JSON.stringify([deviceId, sessionId]);
+    }
+
+    function makeChannel(channelId, deviceId, sessionId) {
         return {
+            channelId,
             deviceId,
+            sessionId,
             // sessionKey → { ws, sessionId, params, modTags } (modTags also
             // mirrored on `channel.modTags` — last-write-wins, see register).
             sessions: new Map(),
@@ -253,11 +256,11 @@ function createOrchestrator({
         };
     }
 
-    function getOrCreateChannel(deviceId) {
-        let ch = channels.get(deviceId);
+    function getOrCreateChannel(channelId, deviceId, sessionId) {
+        let ch = channels.get(channelId);
         if (!ch) {
-            ch = makeChannel(deviceId);
-            channels.set(deviceId, ch);
+            ch = makeChannel(channelId, deviceId, sessionId);
+            channels.set(channelId, ch);
         }
         return ch;
     }
@@ -266,22 +269,28 @@ function createOrchestrator({
         return mergeDriverChannel !== null;
     }
 
-    function devicePresent(deviceId) {
+    function fallbackDevicePresent(deviceId) {
         // Default to present; only an explicit `present: false` (or, for a
         // visibility-only client, `visible: false`) resolved by the broker pauses.
-        return presence.get(deviceId) !== false;
+        return devicePresence.get(deviceId) !== false;
     }
 
     function sessionPresent(sessionKey) {
         const sess = sessionsByKey.get(sessionKey);
-        return sess ? devicePresent(sess.channel.deviceId) : true;
+        if (!sess) return true;
+        if (sessionPresence.has(sessionKey)) return sessionPresence.get(sessionKey) !== false;
+        return fallbackDevicePresent(sess.channel.deviceId);
     }
 
     function channelActive(channel) {
         if (isMergeActive() && channel === mergeDriverChannel) {
-            return devicePresent(mergeDriverChannel.deviceId);
+            const targets = broadcastTargets(channel);
+            return targets.length === 0
+                ? fallbackDevicePresent(channel.deviceId)
+                : targets.some(sessionPresent);
         }
-        return devicePresent(channel.deviceId);
+        if (channel.sessions.size === 0) return fallbackDevicePresent(channel.deviceId);
+        return Array.from(channel.sessions.keys()).some(sessionPresent);
     }
 
     function snapshot(channel) {
@@ -665,12 +674,7 @@ function createOrchestrator({
         if (channel.phase === 'idle' || channel.queue.length <= 1) return;
         // No one present → nothing's rendering, don't burn CPU warming bytes
         // no one will ask for (a dark-advancing channel included).
-        if (getPresence) {
-            const driver = isMergeActive() ? mergeDriverChannel : channel;
-            if (driver && getPresence(driver.deviceId) === false) return;
-        } else if (!channelActive(channel)) {
-            return;
-        }
+        if (!channelActive(isMergeActive() ? mergeDriverChannel : channel)) return;
         // While merged, every audience channel's sessions are mirroring the
         // driver's playback — they'll all be requesting the driver-channel's
         // upcoming IDs. Walk every session, but only run from the driver's queue.
@@ -774,13 +778,14 @@ function createOrchestrator({
             console.warn('[orchestrator] slideshowConfig without deviceId; ignoring');
             return;
         }
+        const channelId = channelKeyOf(deviceId, sessionId);
         const key = sessionKeyOf(ws, sessionId);
         const existing = sessionsByKey.get(key);
-        // Move session between channels if its deviceId changed.
-        if (existing && existing.channel.deviceId !== deviceId) {
+        // Move session between channels if its stable device identity changed.
+        if (existing && existing.channel.channelId !== channelId) {
             removeSession(key);
         }
-        const channel = getOrCreateChannel(deviceId);
+        const channel = getOrCreateChannel(channelId, deviceId, sessionId);
         // Reconnect to a parked channel: queue / modTags / interval /
         // currentId / merge claim are all still here from last time.
         // Any stale dwellDeadline is invalidated below by commitCurrent's
@@ -819,9 +824,8 @@ function createOrchestrator({
         if (!wsKeys) { wsKeys = new Set(); wsSessions.set(ws, wsKeys); }
         wsKeys.add(key);
 
-        // Last-write-wins on per-channel knobs. Merging differing intervals
-        // across two displays of the same deviceId is a misconfig anyway;
-        // pick the latest joiner's value.
+        // Last-write-wins on per-channel knobs. Renderers that deliberately
+        // reuse the same deviceId + sessionId are expected to agree.
         channel.interval = sess.params.interval;
         if (sess.modTags.length) channel.modTags = sess.modTags.slice();
 
@@ -868,7 +872,9 @@ function createOrchestrator({
         const sess = sessionsByKey.get(key);
         if (!sess) return;
         const { ws, channel } = sess;
+        const wasActive = channelActive(channel);
         sessionsByKey.delete(key);
+        sessionPresence.delete(key);
         channel.sessions.delete(key);
         channel.expectedReady.delete(key);
         channel.ready.delete(key);
@@ -887,6 +893,7 @@ function createOrchestrator({
             stopDwellTimer(channel);
             stopReadyTimer(channel);
             channel.parked = true;
+            if (wasActive) darkAdvance(channel).catch(() => {});
         } else if (channel.phase === 'loading') {
             // Disconnect during the readiness barrier — re-check now that
             // the expected set is smaller.
@@ -1032,48 +1039,57 @@ function createOrchestrator({
         // phase stays 'displaying'; parked (no timer, not broadcast).
     }
 
-    // The broker feeds the resolved per-deviceId presence aggregate here
-    // (present-reports if the deviceId ever sent one, else its visibility
-    // aggregate). Presence — not visibility — drives the slideshow.
-    function notifyPresent(deviceId, present) {
-        if (typeof deviceId !== 'string' || !deviceId) return;
-        const prev = devicePresent(deviceId);
-        presence.set(deviceId, !!present);
-        if (prev === !!present) return;
-
-        // Re-evaluate every channel touched by this deviceId. While merged,
-        // only the driver channel is running, so we only have to react when
-        // the driver's deviceId presence flips.
-        const affected = isMergeActive()
-            ? (deviceId === mergeDriverChannel.deviceId ? [mergeDriverChannel] : [])
-            : Array.from(channels.values()).filter((c) => c.deviceId === deviceId
-                || broadcastTargets(c).some((k) => sessionsByKey.get(k)?.channel.deviceId === deviceId));
-
-        for (const channel of affected) {
-            markAlive(channel);
-            if (channel.phase === 'loading') {
-                channel.expectedReady = expectedReadersFor(channel);
-                for (const key of Array.from(channel.ready)) {
-                    if (!channel.expectedReady.has(key)) channel.ready.delete(key);
-                }
-                if (channel.expectedReady.size === 0) {
-                    promoteToDisplaying(channel);
-                } else {
-                    startTimerIfReady(channel);
-                }
-            } else if (channel.phase === 'displaying') {
-                if (channelActive(channel)) {
-                    // Someone returned: re-commit the (possibly dark-advanced)
-                    // current through a normal load/dwell cycle so it's
-                    // delivered, counted, and dwelled from when it's actually
-                    // shown — a fresh frame with no stale hold on re-entry.
-                    commitCurrent(channel);
-                } else {
-                    // Everyone left: one dark advance to a fresh post, then park.
-                    darkAdvance(channel).catch(() => {});
-                }
+    function applyPresenceChange(channel, wasActive, signalPresent) {
+        // A parked channel already handled its last session leaving in
+        // removeSession(). Later device-level visibility bookkeeping must not
+        // advance or recommit unattended channels.
+        if (channel.sessions.size === 0) return;
+        markAlive(channel);
+        const active = channelActive(channel);
+        if (channel.phase === 'loading') {
+            channel.expectedReady = expectedReadersFor(channel);
+            for (const key of Array.from(channel.ready)) {
+                if (!channel.expectedReady.has(key)) channel.ready.delete(key);
             }
-            if (present) schedulePrefetch(channel);
+            if (channel.expectedReady.size === 0) promoteToDisplaying(channel);
+            else startTimerIfReady(channel);
+        } else if (channel.phase === 'displaying' && active !== wasActive) {
+            if (active) {
+                // Someone returned: deliver the parked fresh post through the
+                // normal readiness/dwell path.
+                commitCurrent(channel);
+            } else {
+                // Everyone left: one dark advance to a fresh post, then park.
+                darkAdvance(channel).catch(() => {});
+            }
+        }
+        if (signalPresent) schedulePrefetch(channel);
+    }
+
+    // Session-scoped renderer state. The session must already be registered so
+    // the server can resolve the channel from (ws, sessionId).
+    function notifyPresent(ws, sessionId, present) {
+        const key = sessionKeyOf(ws, sessionId);
+        const sess = sessionsByKey.get(key);
+        if (!sess) return;
+        const channel = isMergeActive() ? mergeDriverChannel : sess.channel;
+        const wasActive = channelActive(channel);
+        sessionPresence.set(key, !!present);
+        applyPresenceChange(channel, wasActive, !!present);
+    }
+
+    // Compatibility/device fallback used by visibility-only or old clients.
+    // Explicit per-session reports take precedence for their own sessions.
+    function notifyDevicePresent(deviceId, present) {
+        if (typeof deviceId !== 'string' || !deviceId) return;
+        const affected = Array.from(channels.values()).filter((c) => c.deviceId === deviceId);
+        const targets = isMergeActive()
+            ? (affected.length > 0 ? [mergeDriverChannel] : [])
+            : affected;
+        const prior = new Map(targets.map((channel) => [channel, channelActive(channel)]));
+        devicePresence.set(deviceId, !!present);
+        for (const channel of new Set(targets)) {
+            applyPresenceChange(channel, prior.get(channel), !!present);
         }
     }
 
@@ -1211,9 +1227,19 @@ function createOrchestrator({
         }
         channels.clear();
         sessionsByKey.clear();
+        sessionPresence.clear();
+        devicePresence.clear();
         wsSessions.clear();
         mergeDriverChannel = null;
     }
+
+    const testChannels = {
+        get size() { return channels.size; },
+        get(deviceId) {
+            return channels.get(deviceId)
+                || Array.from(channels.values()).find((channel) => channel.deviceId === deviceId);
+        },
+    };
 
     return {
         register,
@@ -1229,16 +1255,19 @@ function createOrchestrator({
         getActiveTagsList: () => sharedTagsList,
         notifyImageReady,
         notifyPresent,
+        notifyDevicePresent,
         notifyBlockedChange,
         requeryAll,
         claimDisplaySync,
         close,
         // exposed for tests
-        _channels: channels,
+        _channels: testChannels,
         _state: () => ({
             mergeDriverDeviceId: mergeDriverChannel?.deviceId || null,
             channels: Array.from(channels.values()).map((c) => ({
+                channelId: c.channelId,
                 deviceId: c.deviceId,
+                sessionId: c.sessionId,
                 phase: c.phase,
                 currentId: c.currentId,
                 queue: c.queue.slice(),
@@ -1251,6 +1280,7 @@ function createOrchestrator({
                 readyRemaining: c.readyDeadline ? c.readyDeadline - Date.now() : null,
             })),
         }),
+        _channelFor: (deviceId, sessionId) => channels.get(channelKeyOf(deviceId, sessionId)),
     };
 }
 

@@ -16,7 +16,7 @@ Spatialstash is a separate app that implements the same protocol in Swift, it is
 - `imagemirror/` — the server (Express + WebSocket on `/rpc/ws`, MQTT
   bridge, optional HA WebSocket). Single process, port 3123. Reads
   `posts.duckdb` read-only.
-  - `lib/orchestrator.js` — per-deviceId channels, readiness barrier,
+  - `lib/orchestrator.js` — per-(deviceId, sessionId) channels, readiness barrier,
     displaySync merge, dwell timer pause/resume.
   - `lib/broker.js` — WebSocket auth, action dispatch, file watcher
     on `data.json`, plumbs orchestrator + MQTT bridge.
@@ -115,19 +115,20 @@ updates to track a server change, ship those too:
 
 ## Orchestrator model (one-screen summary)
 
-- **Channel per `deviceId`.** Sessions joining via `slideshowConfig`
-  share a channel iff their `deviceId` matches. Different ids = independent
-  queues / intervals / mod tags.
+- **Channel per `(deviceId, sessionId)`.** `deviceId` stays stable for MQTT,
+  display control, telemetry, and history. The server combines it with the
+  persistent session id for playback: different session ids = independent
+  queues / intervals / mod tags; matching pairs intentionally lockstep.
 - **Readiness barrier.** After each `playback` broadcast the channel
   waits for the *first* visible session's `imageReady { id }` before
   starting the dwell timer (first-ready wins, so a slow or leaving
-  co-tenant on the same deviceId can't wedge it). Hidden sessions are
+  co-tenant on the same channel can't wedge it). Hidden sessions are
   auto-ready (all-hidden → promotes immediately). A per-channel
   readiness-timeout fallback (`server.slideshow.readyTimeoutMs`, default
   15 s, `0` disables) promotes the frame anyway if no visible session
   reports within the budget — the recovery path for a client that stays
   on the socket but stops reporting (frozen render loop). It's
-  per-channel, so it keys on deviceId; the all-hidden short-circuit
+  per-channel, so it keys on `(deviceId, sessionId)`; the all-hidden short-circuit
   covers sessions that *reported* themselves hidden. After 3 consecutive
   timeouts with zero reports the channel stalls (parks on the frame, no
   blind advances / deck bumps / prefetch) — the steady state for a
@@ -294,4 +295,3 @@ the deadline) is the canary for the wake-advance class of bug.
 
 - Avoid reading user's configuration or data from the DuckDB to preserve data privacy, you are allowed to check schemas and metadata, but never real user data. This applies to all data storage written by this project, including the `data.json` file.
 - Any code that adds calls to external services is expressly forbidden without a clear opt-in from the user. This includes analytics, error reporting, or any third-party API calls. If you want to add such a feature, it must be behind a configuration flag that is disabled by default, and the user must explicitly enable it with a clear understanding of what data is being shared and with whom.
-

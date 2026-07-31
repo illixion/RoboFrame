@@ -42,10 +42,10 @@ A **session** is one logical slideshow audience addressed by a `sessionId`
 on a WebSocket connection. Each WS can carry many sessions — this is how
 a single Spatialstash app instance multiplexes ten remote-viewer windows
 over one TCP/TLS path. Each session calls `slideshowConfig` independently
-to join the **channel** for its `deviceId`. Two sessions on the same
-`deviceId` (whether on one ws or across many) share one channel and
-lockstep on the same image. Different `deviceId`s get independent
-channels with independent queues, intervals, and tag lists.
+to join the **channel** for its `(deviceId, sessionId)` pair. Different
+session ids on the same device get independent queues, intervals, and tag
+lists. Renderers reuse both values only when they intentionally represent
+the same display and must lockstep on one image.
 
 Channel-wide params are not per-session: `interval`, `modTags`, and the
 active tag list are last-writer-wins across the sessions sharing a
@@ -75,11 +75,14 @@ connection:
 { "sessionId": "win1", "action": "...", "payload": { ... } }
 ```
 
-Single-session clients (web kiosk, node-display) use a constant id like
-`"main"`. The id only needs to be unique *within* a connection; the
-server scopes it under the ws. Connection-wide actions (`block`,
-`visibility`, `present`, `getDisplayState`, `ping`, `report*`, `rpcsend`)
-ignore `sessionId`.
+Single-session clients use a constant id like `"main"`. Multi-window
+clients use a stable id per window (a persisted scene UUID is suitable).
+The id must remain stable across reconnects because the server uses
+`(deviceId, sessionId)` to find a parked channel. Reusing both values on
+another connection deliberately joins that same channel.
+
+Connection-wide actions (`block`, `visibility`, `getDisplayState`, `ping`,
+`report*`, `rpcsend`) ignore `sessionId`. `present` is session-scoped.
 
 A session is created the first time the server sees `slideshowConfig`
 for a `(ws, sessionId)` pair. Closing the underlying ws drops every
@@ -114,7 +117,6 @@ Joins this session to the channel for `deviceId`. Send on every
 ```json
 { "sessionId": "win1", "action": "slideshowConfig", "payload": {
   "deviceId": "screen1",
-  "automationDeviceId": "living-room-frame",
   "interval": 15000,
   "ratio": 1.778,
   "width": 1920,
@@ -128,13 +130,6 @@ Joins this session to the channel for `deviceId`. Send on every
 ```
 
 - `interval` is dwell time in ms (clamped to 2000–3600000).
-- `automationDeviceId` is optional. It gives MQTT/Home Assistant a stable
-  device identity when `deviceId` is a per-window slideshow channel. Multiple
-  channels may share one automation id; their connectivity and motion are
-  aggregated under `roboframe_<automationDeviceId>_*`. When omitted, MQTT uses
-  `deviceId` as before. If the two ids differ, the broker also removes retained
-  discovery entries for the old channel id so UUID-suffixed entities do not
-  linger in Home Assistant.
 - `modTags` is optional; when present, the orchestrator's first refill
   query already includes them — without that the initial query is
   discarded a few ms later when a separate `setModTags` arrives.
@@ -266,28 +261,27 @@ a hidden/foregrounded tab says nothing about who's in the room. Its
 occupancy comes from a co-located PIR sharing the `deviceId`; tab state
 drives only [`present`](#present).
 
-> **Back-compat:** a `deviceId` that has *never* sent a `present` report
-> still has its slideshow driven by `visibility` (legacy clients that
-> only speak visibility keep working). The moment any client reports
-> `present` for that `deviceId`, visibility stops touching its channel —
-> so co-tenants sharing a `deviceId` should migrate to `present` together.
+> **Back-compat:** a session that has not sent `present` still falls back to
+> its device's aggregate `visibility`, so visibility-only clients keep working.
+> Once that session reports `present`, its explicit value takes precedence.
 
 ### `present`
 Report whether a display on this `deviceId` is **live and showing the
 slideshow** — the signal that actually drives playback.
 
 ```json
-{ "action": "present", "payload": { "deviceId": "screen1", "present": false } }
+{ "sessionId": "win1", "action": "present",
+  "payload": { "deviceId": "screen1", "present": false } }
 ```
 
-Keyed on `deviceId` and OR-aggregated across sockets exactly like
-visibility, so **more than one display on one `deviceId`** works: the
-slideshow runs normally as long as *any* source is present. Only clients
+Keyed on `(ws, sessionId)` and routed to that session's channel. This lets
+two windows share one stable `deviceId` for MQTT/Home Assistant while
+pausing and resuming their slideshow queues independently. Only clients
 that actually *render* the slideshow send it (web frontend, native-kiosk,
 Spatialstash). A **service client** like node-display — which drives the
 physical panel and reports PIR but never renders (never sends
 `slideshowConfig`) — sends `visibility`/`reportDisplay` but **not**
-`present`; the renderer sharing its `deviceId` derives `present` from the
+`present`; renderers that have not reported explicit presence fall back to the
 panel `displayState` node-display broadcasts.
 
 When the aggregate flips to **false** (every display absent) the channel
@@ -549,8 +543,9 @@ with `sessionIds: ["win1", ..., "win10"]`).
 }}
 ```
 
-- `deviceId` is the channel this frame belongs to. While merged, every
-  client receives the driver's `deviceId` here regardless of their own.
+- `deviceId` is the stable device identity supplied by the channel's client.
+  More than one independent channel may therefore report the same value.
+  While merged, every client receives the driver's `deviceId`.
 - `mergeDriver` is the deviceId of the active displaySync claimer, or
   `null` when no merge is active.
 - `current` / `next` / `upcoming` are id+ext only — fetch with
@@ -760,18 +755,17 @@ loop, a wedged decode — the channel rides the timeout for three cycles
 your client reports again; the stall is logged once naming the device.
 Send `imageReady` exactly once per successful transition, with the exact
 `id` from the most recent `playback.current`. If your client knows its
-display is off, report `visibility {false}` instead of going silent —
-that's the supported dark-display mode and keeps the channel advancing
-on wall-clock time.
+display is off, report session-scoped `present {false}` instead of going
+silent — that's the supported dark-display mode.
 
-Hidden sessions (visibility=false on their deviceId) are auto-considered
-ready, so a dark display never stalls the barrier.
+Absent sessions (`present:false`) are auto-considered ready, so a dark
+display never stalls the barrier.
 
 ### Presence drives freshness; the client never wake-advances
 
-`present` flips control the slideshow. When every display on a `deviceId`
-goes absent the server does **one** dark advance and parks; when a display
-returns, that fresh post is committed and dwelled from when it's shown.
+`present` flips control the slideshow. When every renderer on a channel
+goes absent the server does **one** dark advance and parks; when one returns,
+that fresh post is committed and dwelled from when it's shown.
 So walk out and back in and you see a **new** image — the server chose and
 advanced it, silently, while you were away.
 
@@ -832,28 +826,22 @@ Implications for clients:
 
 ### `deviceId` discipline
 
-Pick a stable `deviceId` per logical display and use it consistently
-across every session targeting that display. The orchestrator joins on
-exact-string match — `"screen1"` and `"screen-1"` are different
-channels. Browser kiosks read the value from the `?ws=` URL parameter;
-node-display and Spatialstash pull it from their config.
+Pick a stable `deviceId` for MQTT, display control, telemetry, and history.
+Browser kiosks read it from the `?ws=` URL parameter; node-display and
+Spatialstash pull it from config. Do not append transient window UUIDs.
 
-For multi-window setups, each independently positioned Spatialstash
-window is a separate logical display and must use a distinct, stable
-`deviceId`, even when the windows were launched from the same saved
-profile. They can still multiplex their sessions over one WebSocket.
-Reuse a `deviceId` only when the renderers intentionally represent the
-same display and must share one queue in lockstep.
-
-If independent windows need distinct channel ids but should appear as one
-stable device in Home Assistant, send the same `automationDeviceId` in each
-window's `slideshowConfig`.
+The server forms the slideshow channel identity from `(deviceId, sessionId)`.
+Multi-window clients therefore reuse the configured `deviceId` and assign
+each independently positioned window a distinct, persisted `sessionId`.
+Renderers reuse both values only when they intentionally need one lockstep
+queue. During migration, a UUID-shaped session id also causes the broker to
+remove retained MQTT discovery for the former `<deviceId>-<sessionId>` format.
 
 ## Quick checklist for a new client
 
 - [ ] Connect with `?token=<ACCESS_TOKEN>` (or `RPC_TOKEN` if you need `rpcsend`).
 - [ ] On open, send `slideshowConfig { deviceId, interval, modTags?, ... }`. Re-send on every reconnect.
-- [ ] On open, send `present { deviceId, present: true }` — the slideshow-control signal — and update it on background/foreground. (Send `visibility` too if you want to drive the HA motion sensor / home-location tracking.)
+- [ ] On open, send session-scoped `present { deviceId, present: true }` — the slideshow-control signal — and update it on background/foreground. (Send connection-wide `visibility` too if you want to drive the HA motion sensor / home-location tracking.)
 - [ ] Handle `tagLists` (arrives unsolicited on connect). Read the active list index from each `playback`'s `currentList`.
 - [ ] On every `playback` frame, render `current` and prefetch `upcoming`.
 - [ ] After each successful transition, send `imageReady { id }` with the same id you just rendered.

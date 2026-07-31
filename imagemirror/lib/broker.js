@@ -96,24 +96,10 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     // visible:true the device is treated as visible. Aggregate flips drive
     // both the orchestrator pause/resume and the HA motion publish.
     const visibilityStates = {};
-    // Presence is the slideshow-control signal, kept separate from visibility
-    // (which is now purely home-location telemetry → the HA motion sensor).
-    // Same per-ws OR-aggregate shape as visibilityStates, so >1 display on one
-    // deviceId keeps the slideshow alive as long as any is present.
-    const presenceStates = {};
-    // deviceIds that have ever sent an explicit `present` report. Until a
-    // deviceId appears here its slideshow is still driven by `visibility`
-    // (back-compat for clients that only send visibility); once it reports
-    // presence, visibility no longer touches its channel.
-    const presenceReported = new Set();
     const haStates = {};                   // entity_id → last `update` message
     const deviceWs = new Map();            // deviceId → ws (most recent kiosk for that ID)
-    // ws → Map<slideshow deviceId, HA/MQTT deviceId>. A client may use a
-    // per-window slideshow channel while grouping every window under one
-    // stable home-automation device.
-    const wsDeviceIds = new WeakMap();
-    const automationDeviceIds = new Map(); // slideshow deviceId → HA/MQTT deviceId
-    const deviceRefcount = new Map();      // HA/MQTT deviceId → live logical-device claims
+    const wsDeviceIds = new WeakMap();     // ws → Set<deviceId> claimed by this ws
+    const deviceRefcount = new Map();      // deviceId → count of live ws that have claimed it
     const removedLegacyDevices = new Set();
 
     // --- Liveness heartbeat ------------------------------------------------
@@ -137,22 +123,19 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     const CONNECTED_GRACE_MS = 45000;
     const connectedOffTimers = new Map();  // deviceId → pending publishConnected(false) timer
 
-    function cancelConnectedOff(automationDeviceId) {
-        const t = connectedOffTimers.get(automationDeviceId);
-        if (t) { clearTimeout(t); connectedOffTimers.delete(automationDeviceId); }
+    function cancelConnectedOff(deviceId) {
+        const t = connectedOffTimers.get(deviceId);
+        if (t) { clearTimeout(t); connectedOffTimers.delete(deviceId); }
     }
 
-    function scheduleConnectedOff(automationDeviceId) {
-        cancelConnectedOff(automationDeviceId);
+    function scheduleConnectedOff(deviceId) {
+        cancelConnectedOff(deviceId);
         const t = setTimeout(() => {
-            connectedOffTimers.delete(automationDeviceId);
-            // Still no live socket for this automation device after the grace window.
-            if (!(deviceRefcount.get(automationDeviceId) > 0)) {
-                mqtt.publishConnected(automationDeviceId, false);
-            }
+            connectedOffTimers.delete(deviceId);
+            if (!(deviceRefcount.get(deviceId) > 0)) mqtt.publishConnected(deviceId, false);
         }, CONNECTED_GRACE_MS);
         if (typeof t.unref === 'function') t.unref();
-        connectedOffTimers.set(automationDeviceId, t);
+        connectedOffTimers.set(deviceId, t);
     }
 
     // Track every (ws, deviceId) association in one place so the close handler
@@ -174,83 +157,16 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         return agg;
     }
 
-    // OR-aggregate the per-ws `present` sources for a deviceId. Returns the new
-    // aggregate if it changed, else null. Mirrors recomputeVisibility.
-    function recomputePresence(deviceId) {
-        const state = presenceStates[deviceId];
-        if (!state) return null;
-        let agg = false;
-        for (const v of state.sources.values()) {
-            if (v.present) { agg = true; break; }
-        }
-        if (agg === state.aggregate) return null;
-        state.aggregate = agg;
-        state.lastChangedAt = Date.now();
-        return agg;
-    }
-
-    // The presence value the orchestrator should act on for a deviceId: the
-    // explicit present aggregate once any client has reported it, otherwise the
-    // visibility aggregate (legacy clients that only send visibility). Defaults
-    // to present (true) when neither has been reported.
-    function resolvedPresence(deviceId) {
-        if (presenceReported.has(deviceId)) {
-            return presenceStates[deviceId] ? presenceStates[deviceId].aggregate : false;
-        }
-        const v = visibilityStates[deviceId];
-        return v ? v.aggregate : true;
-    }
-
-    function resolvedAutomationDeviceId(deviceId) {
-        return automationDeviceIds.get(deviceId) || deviceId;
-    }
-
-    function publishResolvedMotion(deviceId) {
-        const automationDeviceId = resolvedAutomationDeviceId(deviceId);
-        let visible = false;
-        for (const [candidateId, state] of Object.entries(visibilityStates)) {
-            if (resolvedAutomationDeviceId(candidateId) === automationDeviceId && state.aggregate) {
-                visible = true;
-                break;
-            }
-        }
-        mqtt.publishMotion(automationDeviceId, visible);
-    }
-
-    function retainAutomationDevice(automationDeviceId) {
-        cancelConnectedOff(automationDeviceId);
-        const prev = deviceRefcount.get(automationDeviceId) || 0;
-        deviceRefcount.set(automationDeviceId, prev + 1);
-        if (prev === 0) mqtt.publishConnected(automationDeviceId, true);
-    }
-
-    function releaseAutomationDevice(automationDeviceId, grace = true) {
-        const prev = deviceRefcount.get(automationDeviceId) || 0;
-        if (prev <= 1) {
-            deviceRefcount.delete(automationDeviceId);
-            if (grace) scheduleConnectedOff(automationDeviceId);
-            else cancelConnectedOff(automationDeviceId);
-        } else {
-            deviceRefcount.set(automationDeviceId, prev - 1);
-        }
-    }
-
-    function attachDeviceId(ws, deviceId, automationDeviceId) {
+    function attachDeviceId(ws, deviceId) {
         if (typeof deviceId !== 'string' || !deviceId) return;
-        const explicitAutomationId = typeof automationDeviceId === 'string'
-            ? automationDeviceId.trim()
-            : '';
-        if (explicitAutomationId) automationDeviceIds.set(deviceId, explicitAutomationId);
-
-        let claims = wsDeviceIds.get(ws);
-        if (!claims) { claims = new Map(); wsDeviceIds.set(ws, claims); }
-        const previousAutomationId = claims.get(deviceId);
-        const nextAutomationId = explicitAutomationId
-            || resolvedAutomationDeviceId(deviceId);
-        if (previousAutomationId !== nextAutomationId) {
-            if (previousAutomationId) releaseAutomationDevice(previousAutomationId, false);
-            claims.set(deviceId, nextAutomationId);
-            retainAutomationDevice(nextAutomationId);
+        cancelConnectedOff(deviceId);
+        let set = wsDeviceIds.get(ws);
+        if (!set) { set = new Set(); wsDeviceIds.set(ws, set); }
+        if (!set.has(deviceId)) {
+            set.add(deviceId);
+            const prev = deviceRefcount.get(deviceId) || 0;
+            deviceRefcount.set(deviceId, prev + 1);
+            if (prev === 0) mqtt.publishConnected(deviceId, true);
         }
         deviceWs.set(deviceId, ws);
     }
@@ -440,13 +356,6 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     // The orchestrator is the single source of truth for "what's playing now".
     // It uses the broker's `broadcast` to push `playback` frames and reads tag
     // list state through the closures below.
-    // Per-deviceId presence lookup for the prefetcher: skip warming variants
-    // for displays no one is present at — the slideshow is parked/dark there
-    // and we'd just heat the LRU with stale work.
-    function getPresence(deviceId) {
-        return resolvedPresence(deviceId);
-    }
-
     const orchestrator = search ? createOrchestrator({
         search,
         // Default seed for a new channel's currentTagsList. The active index
@@ -462,7 +371,6 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         prefetcher,
         imageCache,
         prefetchVariant,
-        getPresence,
         getRatioWindow: () => ratioWindow,
         getSharedTags: () => sharedTags,
         getReadyTimeout: () => readyTimeout,
@@ -574,42 +482,34 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
             const claimed = wsDeviceIds.get(ws);
             if (claimed) {
                 wsDeviceIds.delete(ws);
-                // Drop this ws's visibility + presence contributions before
-                // announcing departure so the aggregates reflect only
-                // still-connected reporters. Visibility fans out to the motion
-                // sensor; presence (resolved with the visibility fallback)
-                // drives the slideshow — a departure that empties presence
-                // parks the channel via one dark advance.
-                for (const deviceId of claimed.keys()) {
-                    let visChanged = false;
+                // Drop this ws's visibility contribution before announcing
+                // departure so the HA motion aggregate reflects only
+                // still-connected reporters.
+                for (const deviceId of claimed) {
                     const vstate = visibilityStates[deviceId];
                     if (vstate && vstate.sources.has(ws)) {
                         vstate.sources.delete(ws);
                         const aggregate = recomputeVisibility(deviceId);
-                        if (aggregate !== null) { publishResolvedMotion(deviceId); visChanged = true; }
-                    }
-                    let presChanged = false;
-                    const pstate = presenceStates[deviceId];
-                    if (pstate && pstate.sources.has(ws)) {
-                        pstate.sources.delete(ws);
-                        if (recomputePresence(deviceId) !== null) presChanged = true;
-                    }
-                    // Presence drives the slideshow — re-notify when the resolved
-                    // value moved: presence changed (deviceId uses presence), or
-                    // visibility changed for a deviceId still on the fallback.
-                    if (orchestrator) {
-                        const moved = presenceReported.has(deviceId) ? presChanged : visChanged;
-                        if (moved) orchestrator.notifyPresent(deviceId, resolvedPresence(deviceId));
+                        if (aggregate !== null) {
+                            mqtt.publishMotion(deviceId, aggregate);
+                            if (orchestrator) orchestrator.notifyDevicePresent(deviceId, aggregate);
+                        }
                     }
                 }
-                for (const automationDeviceId of claimed.values()) {
+                for (const deviceId of claimed) {
+                    const prev = deviceRefcount.get(deviceId) || 0;
                     // Grace the OFF edge so a reconnect (or heartbeat-reaped
                     // VP that resumes) within the window doesn't flap a
                     // physical display awake. Presence/visibility above are
                     // NOT graced — freshness and motion stay prompt.
-                    releaseAutomationDevice(automationDeviceId);
+                    if (prev <= 1) {
+                        deviceRefcount.delete(deviceId);
+                        scheduleConnectedOff(deviceId);
+                    } else {
+                        deviceRefcount.set(deviceId, prev - 1);
+                    }
                 }
-                for (const deviceId of claimed.keys()) {
+                for (const deviceId of claimed) {
                     // Only announce departure if this ws was still the most
                     // recent reporter for that deviceId — otherwise a newer
                     // session has already taken over and the peer's view of
@@ -643,9 +543,9 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
             // sessionId is the per-session multiplexing key. Required for
             // every action that the orchestrator routes through a session
             // (slideshowConfig, setModTags, setTagList, requestNext,
-            // reshuffle, imageReady, displaySync). Connection-wide actions
-            // (block, visibility, getDisplayState, ping, the various report*
-            // frames, rpcsend) ignore it.
+            // reshuffle, imageReady, displaySync, present). Connection-wide
+            // actions (block, visibility, getDisplayState, ping, the various
+            // report* frames, rpcsend) ignore it.
             function requireSessionId(label) {
                 if (typeof sessionId !== 'string' || !sessionId) {
                     console.warn(`Missing sessionId on ${label} from ${clientId}; ignoring`);
@@ -697,19 +597,13 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 state.sources.set(ws, { visible, at: Date.now() });
                 const aggregate = recomputeVisibility(deviceId);
                 if (aggregate !== null) {
-                    publishResolvedMotion(deviceId);
-                    // Back-compat: only when this deviceId has no explicit
-                    // presence source does visibility still drive its channel.
-                    if (orchestrator && !presenceReported.has(deviceId)) {
-                        orchestrator.notifyPresent(deviceId, aggregate);
-                    }
+                    mqtt.publishMotion(deviceId, aggregate);
+                    if (orchestrator) orchestrator.notifyDevicePresent(deviceId, aggregate);
                 }
 
             } else if (action === 'present') {
-                // Slideshow-control signal: "is a display on this deviceId live
-                // and showing?" OR-aggregated across sources like visibility.
-                // While every source is absent the channel dark-advances one
-                // post and parks; it resumes fresh when any source returns.
+                // Slideshow-control signal for one logical session. The
+                // orchestrator resolves its channel from (ws, sessionId).
                 const deviceId = payload?.deviceId;
                 const present = payload?.present;
                 if (typeof deviceId !== 'string' || typeof present !== 'boolean') {
@@ -717,16 +611,13 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                     return;
                 }
                 attachDeviceId(ws, deviceId);
-                presenceReported.add(deviceId);
-                let pstate = presenceStates[deviceId];
-                if (!pstate) {
-                    pstate = { sources: new Map(), aggregate: false, lastChangedAt: 0 };
-                    presenceStates[deviceId] = pstate;
-                }
-                pstate.sources.set(ws, { present, at: Date.now() });
-                const paggregate = recomputePresence(deviceId);
-                if (paggregate !== null && orchestrator) {
-                    orchestrator.notifyPresent(deviceId, paggregate);
+                if (orchestrator) {
+                    if (typeof sessionId === 'string' && sessionId) {
+                        orchestrator.notifyPresent(ws, sessionId, present);
+                    } else {
+                        // Back-compat for old single-session clients.
+                        orchestrator.notifyDevicePresent(deviceId, present);
+                    }
                 }
 
             } else if (action === 'reportDisplay') {
@@ -740,7 +631,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 const deviceId = payload?.deviceId;
                 if (typeof deviceId === 'string') {
                     attachDeviceId(ws, deviceId);
-                    mqtt.publishLight(resolvedAutomationDeviceId(deviceId), {
+                    mqtt.publishLight(deviceId, {
                         state: payload.state,
                         brightness: payload.brightness,
                     });
@@ -762,7 +653,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 const value = payload?.value;
                 if (typeof deviceId === 'string' && typeof sensor === 'string') {
                     attachDeviceId(ws, deviceId);
-                    mqtt.publishSensor(resolvedAutomationDeviceId(deviceId), sensor, value);
+                    mqtt.publishSensor(deviceId, sensor, value);
                 }
 
             } else if (action === 'reportSuppress') {
@@ -771,7 +662,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 const deviceId = payload?.deviceId;
                 if (typeof deviceId === 'string') {
                     attachDeviceId(ws, deviceId);
-                    mqtt.publishSuppress(resolvedAutomationDeviceId(deviceId), payload.state);
+                    mqtt.publishSuppress(deviceId, payload.state);
                 }
 
             } else if (action === 'reportWebcam') {
@@ -780,7 +671,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 const deviceId = payload?.deviceId;
                 if (typeof deviceId === 'string') {
                     attachDeviceId(ws, deviceId);
-                    mqtt.publishWebcam(resolvedAutomationDeviceId(deviceId), { state: payload.state });
+                    mqtt.publishWebcam(deviceId, { state: payload.state });
                 }
 
             } else if (action === 'reportMetrics') {
@@ -811,16 +702,19 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 if (!requireSessionId('slideshowConfig')) return;
                 if (orchestrator) orchestrator.register(ws, sessionId, payload || {});
                 const deviceId = payload?.deviceId;
-                const automationDeviceId = payload?.automationDeviceId;
+                attachDeviceId(ws, deviceId);
+                // Spatialstash briefly encoded its persistent window UUID as a
+                // deviceId suffix. The corrected protocol uses that UUID as the
+                // sessionId, so the server can remove the retained HA discovery
+                // entries from that old format without a client-only mapping.
                 if (typeof deviceId === 'string'
-                    && typeof automationDeviceId === 'string'
-                    && automationDeviceId.trim()
-                    && automationDeviceId.trim() !== deviceId
-                    && !removedLegacyDevices.has(deviceId)) {
-                    removedLegacyDevices.add(deviceId);
-                    mqtt.removeDevice(deviceId);
+                    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(sessionId)) {
+                    const legacyDeviceId = `${deviceId}-${sessionId.toLowerCase()}`;
+                    if (!removedLegacyDevices.has(legacyDeviceId)) {
+                        removedLegacyDevices.add(legacyDeviceId);
+                        mqtt.removeDevice(legacyDeviceId);
+                    }
                 }
-                attachDeviceId(ws, deviceId, automationDeviceId);
 
             } else if (action === 'sessionEnd') {
                 // Optional teardown for one logical session without closing

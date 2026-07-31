@@ -709,8 +709,8 @@ class Kiosk:
         # far back from newest we're currently viewing; while `suppress_until`
         # is in the future incoming playback frames are dropped so the peeked
         # post holds for one interval, then live playback resumes. The server
-        # is never told to go back — one channel is shared across a deviceId,
-        # so the hold is kept per client. Mirrors the web kiosk (slideshow.js).
+        # is never told to go back — renderers sharing this deviceId + sessionId
+        # share one channel, so the hold is kept per client. Mirrors the web kiosk.
         self.history = []                # [{"id", "ext"}] chronological
         self.back_steps = 0
         self.suppress_until = 0.0        # monotonic; 0 = live
@@ -758,6 +758,7 @@ class Kiosk:
         # While every display on the deviceId is absent the server dark-
         # advances one post and parks, so a wake shows a fresh frame.
         self.conn.send({
+            "sessionId": KIOSK_SESSION_ID,
             "action": "present",
             "payload": {"deviceId": self.cfg["device_id"], "present": present},
         })

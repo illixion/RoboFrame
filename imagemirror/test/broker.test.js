@@ -19,7 +19,13 @@ let tmpDir, dataPath, server, broker, port;
 
 const ACCESS_TOKEN = 'test-access-token';
 
-function startServer({ tagLists = [], rpcToken = 'test-token', accessToken = ACCESS_TOKEN, haDisabled = true } = {}) {
+function startServer({
+    tagLists = [],
+    rpcToken = 'test-token',
+    accessToken = ACCESS_TOKEN,
+    haDisabled = true,
+    search,
+} = {}) {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rf-broker-test-'));
     dataPath = path.join(tmpDir, 'data.json');
     fs.writeFileSync(dataPath, JSON.stringify({
@@ -41,6 +47,7 @@ function startServer({ tagLists = [], rpcToken = 'test-token', accessToken = ACC
             },
         },
         dataPath,
+        search,
     });
     return new Promise((resolve) => {
         httpServer.listen(0, '127.0.0.1', () => {
@@ -147,16 +154,14 @@ test('Express does NOT 404 on /rpc/ws (real upgrade reaches the broker)', async 
     assert.equal(handshake, 101, `expected 101 Switching Protocols, got ${JSON.stringify(handshake)}`);
 });
 
-test('per-window slideshow ids share one stable MQTT device id', async (t) => {
+test('multiple slideshow sessions claim one stable MQTT device id', async (t) => {
     await startServer();
     t.after(stopServer);
 
     const connected = [];
     const motion = [];
-    const removed = [];
     broker.mqtt.publishConnected = (deviceId, state) => connected.push([deviceId, state]);
     broker.mqtt.publishMotion = (deviceId, state) => motion.push([deviceId, state]);
-    broker.mqtt.removeDevice = (deviceId) => removed.push(deviceId);
 
     const ws = openClient();
     await ws.opened;
@@ -164,40 +169,148 @@ test('per-window slideshow ids share one stable MQTT device id', async (t) => {
         sessionId: 'win1',
         action: 'slideshowConfig',
         payload: {
-            deviceId: 'living-room-11111111-1111-1111-1111-111111111111',
-            automationDeviceId: 'living-room',
+            deviceId: 'living-room',
         },
     }));
     ws.send(JSON.stringify({
         sessionId: 'win2',
         action: 'slideshowConfig',
         payload: {
-            deviceId: 'living-room-22222222-2222-2222-2222-222222222222',
-            automationDeviceId: 'living-room',
+            deviceId: 'living-room',
         },
     }));
     ws.send(JSON.stringify({
         action: 'visibility',
         payload: {
-            deviceId: 'living-room-11111111-1111-1111-1111-111111111111',
+            deviceId: 'living-room',
             visible: true,
-        },
-    }));
-    ws.send(JSON.stringify({
-        action: 'visibility',
-        payload: {
-            deviceId: 'living-room-22222222-2222-2222-2222-222222222222',
-            visible: false,
         },
     }));
 
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.deepEqual(connected, [['living-room', true]]);
     assert.deepEqual(motion, [['living-room', true]]);
+});
+
+test('UUID session removes retained discovery from the legacy suffixed device id', async (t) => {
+    await startServer();
+    t.after(stopServer);
+
+    const removed = [];
+    broker.mqtt.removeDevice = (deviceId) => removed.push(deviceId);
+    const ws = openClient();
+    await ws.opened;
+    ws.send(JSON.stringify({
+        sessionId: '11111111-1111-4111-8111-111111111111',
+        action: 'slideshowConfig',
+        payload: { deviceId: 'living-room' },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
     assert.deepEqual(removed, [
-        'living-room-11111111-1111-1111-1111-111111111111',
-        'living-room-22222222-2222-2222-2222-222222222222',
+        'living-room-11111111-1111-4111-8111-111111111111',
     ]);
+});
+
+test('same-device sessions route present to independent channels', async (t) => {
+    let nextId = 0;
+    const search = {
+        async runSearch() {
+            const base = ++nextId * 10;
+            return {
+                results: Array.from({ length: 5 }, (_, i) => ({
+                    _id: base + i,
+                    file_ext: 'jpg',
+                })),
+                nextCursor: 0,
+            };
+        },
+    };
+    await startServer({ search });
+    t.after(stopServer);
+
+    const ws = openClient();
+    await ws.opened;
+    ws.send(JSON.stringify({
+        sessionId: 'win1',
+        action: 'slideshowConfig',
+        payload: { deviceId: 'living-room', interval: 60000 },
+    }));
+    ws.send(JSON.stringify({
+        sessionId: 'win2',
+        action: 'slideshowConfig',
+        payload: { deviceId: 'living-room', interval: 60000 },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const win1 = broker.orchestrator._channelFor('living-room', 'win1');
+    const win2 = broker.orchestrator._channelFor('living-room', 'win2');
+    assert.ok(win1 && win2);
+    const win1Before = win1.currentId;
+    const win2Before = win2.currentId;
+
+    ws.send(JSON.stringify({
+        sessionId: 'win1',
+        action: 'imageReady',
+        payload: { id: win1Before },
+    }));
+    ws.send(JSON.stringify({
+        sessionId: 'win2',
+        action: 'imageReady',
+        payload: { id: win2Before },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    ws.send(JSON.stringify({
+        sessionId: 'win1',
+        action: 'present',
+        payload: { deviceId: 'living-room', present: false },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.notEqual(win1.currentId, win1Before);
+    assert.equal(win2.currentId, win2Before);
+});
+
+test('socket close dark-advances once when visibility also drops', async (t) => {
+    const search = {
+        async runSearch() {
+            return {
+                results: Array.from({ length: 5 }, (_, i) => ({
+                    _id: i + 1,
+                    file_ext: 'jpg',
+                })),
+                nextCursor: 0,
+            };
+        },
+    };
+    await startServer({ search });
+    t.after(stopServer);
+
+    const ws = openClient();
+    await ws.opened;
+    ws.send(JSON.stringify({
+        sessionId: 'main',
+        action: 'slideshowConfig',
+        payload: { deviceId: 'screen1', interval: 60000 },
+    }));
+    ws.send(JSON.stringify({
+        action: 'visibility',
+        payload: { deviceId: 'screen1', visible: true },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const channel = broker.orchestrator._channelFor('screen1', 'main');
+    const expectedFreshId = channel.queue[1].id;
+    ws.send(JSON.stringify({
+        sessionId: 'main',
+        action: 'imageReady',
+        payload: { id: channel.currentId },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    ws.close();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(channel.currentId, expectedFreshId,
+        'disconnect performs exactly one dark advance');
 });
 
 test('HTTP /rpc/tags.json returns the same tagLists as the WebSocket push', async (t) => {

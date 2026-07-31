@@ -23,8 +23,8 @@ let lastSavedPost = null;
 // display has shown, holds the chosen one for one dwell interval while
 // ignoring incoming `playback` frames, then lets the first frame after the
 // hold resume server-driven playback. The server is never told to go back
-// (all displays on a deviceId share one channel — yanking the whole channel
-// backwards for one viewer's peek is the wrong scope), so this mirrors
+// (all renderers sharing this deviceId + sessionId share one channel —
+// yanking the whole channel backwards for one viewer's peek is the wrong scope), so this mirrors
 // Spatialstash's history-jump: a local suppression window, per client.
 const HISTORY_MAX = 100;
 let history = [];               // [{ id, ext }] chronological, newest last
