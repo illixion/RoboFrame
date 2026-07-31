@@ -234,3 +234,20 @@ test('discovery is re-published on reconnect', () => {
     assert.ok(discoveryTopics.includes('ha/light/roboframe_kiosk1_backlight/config'),
         'expected discovery re-publish on reconnect');
 });
+
+test('removeDevice clears every retained discovery entry for an old device id', () => {
+    const { bridge, client } = freshBridge();
+    fireConnect(client);
+    bridge.removeDevice('screen1-uuid');
+    const removals = client.published.filter((p) => p.payload === '');
+    assert.deepEqual(removals.map((p) => p.topic), [
+        'ha/light/roboframe_screen1-uuid_backlight/config',
+        'ha/binary_sensor/roboframe_screen1-uuid_motion/config',
+        'ha/binary_sensor/roboframe_screen1-uuid_connected/config',
+        'ha/sensor/roboframe_screen1-uuid_als/config',
+        'ha/switch/roboframe_screen1-uuid_webcam/config',
+        'ha/switch/roboframe_screen1-uuid_suppress/config',
+        'ha/device_automation/roboframe_screen1-uuid_connected/config',
+        'ha/device_automation/roboframe_screen1-uuid_disconnected/config',
+    ]);
+});

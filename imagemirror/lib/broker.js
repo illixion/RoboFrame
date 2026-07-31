@@ -108,8 +108,13 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     const presenceReported = new Set();
     const haStates = {};                   // entity_id → last `update` message
     const deviceWs = new Map();            // deviceId → ws (most recent kiosk for that ID)
-    const wsDeviceIds = new WeakMap();     // ws → Set<deviceId> claimed by this ws
-    const deviceRefcount = new Map();      // deviceId → count of live ws that have claimed it
+    // ws → Map<slideshow deviceId, HA/MQTT deviceId>. A client may use a
+    // per-window slideshow channel while grouping every window under one
+    // stable home-automation device.
+    const wsDeviceIds = new WeakMap();
+    const automationDeviceIds = new Map(); // slideshow deviceId → HA/MQTT deviceId
+    const deviceRefcount = new Map();      // HA/MQTT deviceId → live logical-device claims
+    const removedLegacyDevices = new Set();
 
     // --- Liveness heartbeat ------------------------------------------------
     // visionOS (and any suspended client) can leave a socket half-open: the
@@ -132,20 +137,22 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     const CONNECTED_GRACE_MS = 45000;
     const connectedOffTimers = new Map();  // deviceId → pending publishConnected(false) timer
 
-    function cancelConnectedOff(deviceId) {
-        const t = connectedOffTimers.get(deviceId);
-        if (t) { clearTimeout(t); connectedOffTimers.delete(deviceId); }
+    function cancelConnectedOff(automationDeviceId) {
+        const t = connectedOffTimers.get(automationDeviceId);
+        if (t) { clearTimeout(t); connectedOffTimers.delete(automationDeviceId); }
     }
 
-    function scheduleConnectedOff(deviceId) {
-        cancelConnectedOff(deviceId);
+    function scheduleConnectedOff(automationDeviceId) {
+        cancelConnectedOff(automationDeviceId);
         const t = setTimeout(() => {
-            connectedOffTimers.delete(deviceId);
-            // Still no live socket for this deviceId after the grace window.
-            if (!(deviceRefcount.get(deviceId) > 0)) mqtt.publishConnected(deviceId, false);
+            connectedOffTimers.delete(automationDeviceId);
+            // Still no live socket for this automation device after the grace window.
+            if (!(deviceRefcount.get(automationDeviceId) > 0)) {
+                mqtt.publishConnected(automationDeviceId, false);
+            }
         }, CONNECTED_GRACE_MS);
         if (typeof t.unref === 'function') t.unref();
-        connectedOffTimers.set(deviceId, t);
+        connectedOffTimers.set(automationDeviceId, t);
     }
 
     // Track every (ws, deviceId) association in one place so the close handler
@@ -194,19 +201,56 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         return v ? v.aggregate : true;
     }
 
-    function attachDeviceId(ws, deviceId) {
+    function resolvedAutomationDeviceId(deviceId) {
+        return automationDeviceIds.get(deviceId) || deviceId;
+    }
+
+    function publishResolvedMotion(deviceId) {
+        const automationDeviceId = resolvedAutomationDeviceId(deviceId);
+        let visible = false;
+        for (const [candidateId, state] of Object.entries(visibilityStates)) {
+            if (resolvedAutomationDeviceId(candidateId) === automationDeviceId && state.aggregate) {
+                visible = true;
+                break;
+            }
+        }
+        mqtt.publishMotion(automationDeviceId, visible);
+    }
+
+    function retainAutomationDevice(automationDeviceId) {
+        cancelConnectedOff(automationDeviceId);
+        const prev = deviceRefcount.get(automationDeviceId) || 0;
+        deviceRefcount.set(automationDeviceId, prev + 1);
+        if (prev === 0) mqtt.publishConnected(automationDeviceId, true);
+    }
+
+    function releaseAutomationDevice(automationDeviceId, grace = true) {
+        const prev = deviceRefcount.get(automationDeviceId) || 0;
+        if (prev <= 1) {
+            deviceRefcount.delete(automationDeviceId);
+            if (grace) scheduleConnectedOff(automationDeviceId);
+            else cancelConnectedOff(automationDeviceId);
+        } else {
+            deviceRefcount.set(automationDeviceId, prev - 1);
+        }
+    }
+
+    function attachDeviceId(ws, deviceId, automationDeviceId) {
         if (typeof deviceId !== 'string' || !deviceId) return;
-        // A live socket for this deviceId again — cancel any pending
-        // connected-OFF so a reconnect within the grace window is seamless
-        // (connected never blipped, no suppress-wake flap).
-        cancelConnectedOff(deviceId);
-        let set = wsDeviceIds.get(ws);
-        if (!set) { set = new Set(); wsDeviceIds.set(ws, set); }
-        if (!set.has(deviceId)) {
-            set.add(deviceId);
-            const prev = deviceRefcount.get(deviceId) || 0;
-            deviceRefcount.set(deviceId, prev + 1);
-            if (prev === 0) mqtt.publishConnected(deviceId, true);
+        const explicitAutomationId = typeof automationDeviceId === 'string'
+            ? automationDeviceId.trim()
+            : '';
+        if (explicitAutomationId) automationDeviceIds.set(deviceId, explicitAutomationId);
+
+        let claims = wsDeviceIds.get(ws);
+        if (!claims) { claims = new Map(); wsDeviceIds.set(ws, claims); }
+        const previousAutomationId = claims.get(deviceId);
+        const nextAutomationId = explicitAutomationId
+            || resolvedAutomationDeviceId(deviceId);
+        if (previousAutomationId !== nextAutomationId) {
+            if (previousAutomationId) releaseAutomationDevice(previousAutomationId, false);
+            claims.set(deviceId, nextAutomationId);
+            retainAutomationDevice(nextAutomationId);
         }
         deviceWs.set(deviceId, ws);
     }
@@ -536,13 +580,13 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 // sensor; presence (resolved with the visibility fallback)
                 // drives the slideshow — a departure that empties presence
                 // parks the channel via one dark advance.
-                for (const deviceId of claimed) {
+                for (const deviceId of claimed.keys()) {
                     let visChanged = false;
                     const vstate = visibilityStates[deviceId];
                     if (vstate && vstate.sources.has(ws)) {
                         vstate.sources.delete(ws);
                         const aggregate = recomputeVisibility(deviceId);
-                        if (aggregate !== null) { mqtt.publishMotion(deviceId, aggregate); visChanged = true; }
+                        if (aggregate !== null) { publishResolvedMotion(deviceId); visChanged = true; }
                     }
                     let presChanged = false;
                     const pstate = presenceStates[deviceId];
@@ -558,20 +602,14 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                         if (moved) orchestrator.notifyPresent(deviceId, resolvedPresence(deviceId));
                     }
                 }
-                for (const deviceId of claimed) {
-                    const prev = deviceRefcount.get(deviceId) || 0;
-                    if (prev <= 1) {
-                        deviceRefcount.delete(deviceId);
-                        // Grace the OFF edge so a reconnect (or heartbeat-reaped
-                        // VP that resumes) within the window doesn't flap a
-                        // physical display awake. Presence/visibility above are
-                        // NOT graced — freshness and motion stay prompt.
-                        scheduleConnectedOff(deviceId);
-                    } else {
-                        deviceRefcount.set(deviceId, prev - 1);
-                    }
+                for (const automationDeviceId of claimed.values()) {
+                    // Grace the OFF edge so a reconnect (or heartbeat-reaped
+                    // VP that resumes) within the window doesn't flap a
+                    // physical display awake. Presence/visibility above are
+                    // NOT graced — freshness and motion stay prompt.
+                    releaseAutomationDevice(automationDeviceId);
                 }
-                for (const deviceId of claimed) {
+                for (const deviceId of claimed.keys()) {
                     // Only announce departure if this ws was still the most
                     // recent reporter for that deviceId — otherwise a newer
                     // session has already taken over and the peer's view of
@@ -659,7 +697,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 state.sources.set(ws, { visible, at: Date.now() });
                 const aggregate = recomputeVisibility(deviceId);
                 if (aggregate !== null) {
-                    mqtt.publishMotion(deviceId, aggregate);
+                    publishResolvedMotion(deviceId);
                     // Back-compat: only when this deviceId has no explicit
                     // presence source does visibility still drive its channel.
                     if (orchestrator && !presenceReported.has(deviceId)) {
@@ -702,7 +740,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 const deviceId = payload?.deviceId;
                 if (typeof deviceId === 'string') {
                     attachDeviceId(ws, deviceId);
-                    mqtt.publishLight(deviceId, {
+                    mqtt.publishLight(resolvedAutomationDeviceId(deviceId), {
                         state: payload.state,
                         brightness: payload.brightness,
                     });
@@ -724,7 +762,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 const value = payload?.value;
                 if (typeof deviceId === 'string' && typeof sensor === 'string') {
                     attachDeviceId(ws, deviceId);
-                    mqtt.publishSensor(deviceId, sensor, value);
+                    mqtt.publishSensor(resolvedAutomationDeviceId(deviceId), sensor, value);
                 }
 
             } else if (action === 'reportSuppress') {
@@ -733,7 +771,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 const deviceId = payload?.deviceId;
                 if (typeof deviceId === 'string') {
                     attachDeviceId(ws, deviceId);
-                    mqtt.publishSuppress(deviceId, payload.state);
+                    mqtt.publishSuppress(resolvedAutomationDeviceId(deviceId), payload.state);
                 }
 
             } else if (action === 'reportWebcam') {
@@ -742,7 +780,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 const deviceId = payload?.deviceId;
                 if (typeof deviceId === 'string') {
                     attachDeviceId(ws, deviceId);
-                    mqtt.publishWebcam(deviceId, { state: payload.state });
+                    mqtt.publishWebcam(resolvedAutomationDeviceId(deviceId), { state: payload.state });
                 }
 
             } else if (action === 'reportMetrics') {
@@ -772,7 +810,17 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
             } else if (action === 'slideshowConfig') {
                 if (!requireSessionId('slideshowConfig')) return;
                 if (orchestrator) orchestrator.register(ws, sessionId, payload || {});
-                attachDeviceId(ws, payload?.deviceId);
+                const deviceId = payload?.deviceId;
+                const automationDeviceId = payload?.automationDeviceId;
+                if (typeof deviceId === 'string'
+                    && typeof automationDeviceId === 'string'
+                    && automationDeviceId.trim()
+                    && automationDeviceId.trim() !== deviceId
+                    && !removedLegacyDevices.has(deviceId)) {
+                    removedLegacyDevices.add(deviceId);
+                    mqtt.removeDevice(deviceId);
+                }
+                attachDeviceId(ws, deviceId, automationDeviceId);
 
             } else if (action === 'sessionEnd') {
                 // Optional teardown for one logical session without closing

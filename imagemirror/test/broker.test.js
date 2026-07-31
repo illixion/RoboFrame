@@ -147,6 +147,59 @@ test('Express does NOT 404 on /rpc/ws (real upgrade reaches the broker)', async 
     assert.equal(handshake, 101, `expected 101 Switching Protocols, got ${JSON.stringify(handshake)}`);
 });
 
+test('per-window slideshow ids share one stable MQTT device id', async (t) => {
+    await startServer();
+    t.after(stopServer);
+
+    const connected = [];
+    const motion = [];
+    const removed = [];
+    broker.mqtt.publishConnected = (deviceId, state) => connected.push([deviceId, state]);
+    broker.mqtt.publishMotion = (deviceId, state) => motion.push([deviceId, state]);
+    broker.mqtt.removeDevice = (deviceId) => removed.push(deviceId);
+
+    const ws = openClient();
+    await ws.opened;
+    ws.send(JSON.stringify({
+        sessionId: 'win1',
+        action: 'slideshowConfig',
+        payload: {
+            deviceId: 'living-room-11111111-1111-1111-1111-111111111111',
+            automationDeviceId: 'living-room',
+        },
+    }));
+    ws.send(JSON.stringify({
+        sessionId: 'win2',
+        action: 'slideshowConfig',
+        payload: {
+            deviceId: 'living-room-22222222-2222-2222-2222-222222222222',
+            automationDeviceId: 'living-room',
+        },
+    }));
+    ws.send(JSON.stringify({
+        action: 'visibility',
+        payload: {
+            deviceId: 'living-room-11111111-1111-1111-1111-111111111111',
+            visible: true,
+        },
+    }));
+    ws.send(JSON.stringify({
+        action: 'visibility',
+        payload: {
+            deviceId: 'living-room-22222222-2222-2222-2222-222222222222',
+            visible: false,
+        },
+    }));
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(connected, [['living-room', true]]);
+    assert.deepEqual(motion, [['living-room', true]]);
+    assert.deepEqual(removed, [
+        'living-room-11111111-1111-1111-1111-111111111111',
+        'living-room-22222222-2222-2222-2222-222222222222',
+    ]);
+});
+
 test('HTTP /rpc/tags.json returns the same tagLists as the WebSocket push', async (t) => {
     await startServer({ tagLists: [['cats'], ['dogs', 'happy']] });
     t.after(stopServer);

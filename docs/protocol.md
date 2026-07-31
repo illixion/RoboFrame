@@ -114,6 +114,7 @@ Joins this session to the channel for `deviceId`. Send on every
 ```json
 { "sessionId": "win1", "action": "slideshowConfig", "payload": {
   "deviceId": "screen1",
+  "automationDeviceId": "living-room-frame",
   "interval": 15000,
   "ratio": 1.778,
   "width": 1920,
@@ -127,6 +128,13 @@ Joins this session to the channel for `deviceId`. Send on every
 ```
 
 - `interval` is dwell time in ms (clamped to 2000–3600000).
+- `automationDeviceId` is optional. It gives MQTT/Home Assistant a stable
+  device identity when `deviceId` is a per-window slideshow channel. Multiple
+  channels may share one automation id; their connectivity and motion are
+  aggregated under `roboframe_<automationDeviceId>_*`. When omitted, MQTT uses
+  `deviceId` as before. If the two ids differ, the broker also removes retained
+  discovery entries for the old channel id so UUID-suffixed entities do not
+  linger in Home Assistant.
 - `modTags` is optional; when present, the orchestrator's first refill
   query already includes them — without that the initial query is
   discarded a few ms later when a separate `setModTags` arrives.
@@ -836,6 +844,10 @@ window is a separate logical display and must use a distinct, stable
 profile. They can still multiplex their sessions over one WebSocket.
 Reuse a `deviceId` only when the renderers intentionally represent the
 same display and must share one queue in lockstep.
+
+If independent windows need distinct channel ids but should appear as one
+stable device in Home Assistant, send the same `automationDeviceId` in each
+window's `slideshowConfig`.
 
 ## Quick checklist for a new client
 

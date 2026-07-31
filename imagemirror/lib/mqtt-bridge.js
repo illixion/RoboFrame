@@ -51,6 +51,7 @@ function createMqttBridge({ config, broadcast }) {
             publishWebcam: noop,
             publishSuppress: noop,
             publishConnected: noop,
+            removeDevice: noop,
             close: noop,
             get connected() { return false; },
             get enabled() { return false; },
@@ -453,6 +454,24 @@ function createMqttBridge({ config, broadcast }) {
         );
     }
 
+    function removeDevice(deviceId) {
+        if (!deviceId) return;
+        registered.delete(deviceId);
+        const configs = [
+            ['light', `roboframe_${deviceId}_backlight`],
+            ['binary_sensor', `roboframe_${deviceId}_motion`],
+            ['binary_sensor', `roboframe_${deviceId}_connected`],
+            ['sensor', `roboframe_${deviceId}_als`],
+            ['switch', `roboframe_${deviceId}_webcam`],
+            ['switch', `roboframe_${deviceId}_suppress`],
+            ['device_automation', `roboframe_${deviceId}_connected`],
+            ['device_automation', `roboframe_${deviceId}_disconnected`],
+        ];
+        for (const [component, uid] of configs) {
+            publish(`${DISCOVERY_PREFIX}/${component}/${uid}/config`, '');
+        }
+    }
+
     function close() {
         if (client) {
             try {
@@ -472,6 +491,7 @@ function createMqttBridge({ config, broadcast }) {
         publishWebcam,
         publishSuppress,
         publishConnected,
+        removeDevice,
         close,
         get connected() { return connected; },
         get enabled() { return true; },
