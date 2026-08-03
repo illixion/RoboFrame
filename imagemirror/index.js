@@ -1515,7 +1515,11 @@ app.get('/search', async (req, res) => {
 //          for a scheduled wallpaper.
 //   convert/bright/width/height/lowmem/gif  passthrough to the variant pipeline
 //   wallpaper=1 compose onto a width×height canvas (see /get) — for setting a
-//          device wallpaper / lock screen of a fixed resolution
+//          device wallpaper / lock screen of a fixed resolution. Also
+//          excludes video posts (file_ext webm/mp4) — a wallpaper target
+//          can't play video, so there's no point drawing one into the pick.
+//   exclude= comma-separated tags to exclude, additive to any `-tag` terms
+//          already in `q` (e.g. `exclude=animated` to skip animated posts).
 //   json=1 return { id, ext } instead of the image bytes
 app.get('/random', async (req, res) => {
   if (!searchRef) return res.status(503).send('Search not ready');
@@ -1543,10 +1547,19 @@ app.get('/random', async (req, res) => {
   }
   if (req.query.q) parts.push(String(req.query.q));
 
+  if (req.query.exclude) {
+    for (const tag of String(req.query.exclude).split(',').map((t) => t.trim()).filter(Boolean)) {
+      parts.push(`-${tag}`);
+    }
+  }
+
   const ratio = Number(req.query.ratio);
   const wantWallpaper = Number(req.query.wallpaper) === 1;
   const canvasW = Number(req.query.width) || 0;
   const canvasH = Number(req.query.height) || 0;
+
+  // A wallpaper target can't play video — skip webm/mp4 posts by extension.
+  if (wantWallpaper) parts.push('-file_ext:webm', '-file_ext:mp4');
 
   // `wallpaper=1&ratio=1` is the fit-bias toggle: soft-prefer posts whose
   // aspect is closest to the wallpaper canvas (width/height), with no hard
