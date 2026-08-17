@@ -690,13 +690,15 @@ class Kiosk:
         self.last_playback = None        # last full playback payload
         self.interval = cfg["interval"]  # dwell (ms); tracks playback.interval
         self.current_id = None           # what's actually on screen
-        # `save_id` is what the SPACE key acts on. It lags `current_id` by
-        # 1.5s so a user pressing save just as an image switches still
-        # targets the post they were looking at — mirrors the web kiosk's
-        # state.currentPost being set ~1s after crossfade start
-        # (slideshow.js finishLoad setTimeout).
-        self.save_id = None
-        self.save_is_video = False       # is save_id a video? (poster vs. still thumb)
+        # `save_target` (id, kind) is what the SPACE key acts on. It lags
+        # `current_id` by 1.5s so a user pressing save just as an image
+        # switches still targets the post they were looking at — mirrors
+        # the web kiosk's state.currentPost being set ~1s after crossfade
+        # start (slideshow.js finishLoad setTimeout). `kind` is one of
+        # "still" | "video" | "animated" (a still image, a true mp4/webm
+        # post, or an animated source played as a clip) — it picks how the
+        # save toast fetches its preview thumbnail.
+        self.save_target = (None, "still")
         self._save_id_timer = None
         self.server_off = False          # server displayState=off
         self.force_off = False           # local 'p'-key toggle (panel off)
@@ -1268,7 +1270,7 @@ class Kiosk:
             # _maybe_restore_video_base re-applies from last_playback once
             # the effect clears.
             return
-        # Keep current_id/save_id pointed at the outgoing clip (still the
+        # Keep current_id/save_target pointed at the outgoing clip (still the
         # thing actually on screen) until the new one is confirmed playing
         # below — preserve_current stops the teardown from blanking it out
         # for the whole load window.
@@ -1276,7 +1278,10 @@ class Kiosk:
         self._slideshow_gen += 1
         gen = self._slideshow_gen
         self.base_surface = None
-        is_video_post = self._is_video(post)
+        # Every call site other than _present's AnimatedClip path (`src`)
+        # already gates on _is_video, so a non-video ext here always means
+        # an animated source played as a clip, not a true video post.
+        save_kind = "video" if self._is_video(post) else "animated"
 
         if not self._have_mpv():
             log.warning("mpv not installed — slideshow video %s can't play", pid)
@@ -1286,7 +1291,7 @@ class Kiosk:
             self.slideshow_video = {"proc": None, "id": pid,
                                     "ipc_path": None, "gen": gen}
             self.current_id = pid
-            self._roll_save_id(pid, is_video=is_video_post)
+            self._roll_save_id(pid, kind=save_kind)
             if self.connected:
                 self._send_image_ready(pid)
             return
@@ -1309,7 +1314,7 @@ class Kiosk:
         # image interval mid-playback.
         known_dur = int(post.get("durationMs") or 0)
         threading.Thread(target=self._slideshow_video_worker,
-                         args=(proc, ipc_path, pid, gen, known_dur, is_video_post),
+                         args=(proc, ipc_path, pid, gen, known_dur, save_kind),
                          daemon=True).start()
 
     def _stop_slideshow_video(self, preserve_current=False):
@@ -1348,17 +1353,17 @@ class Kiosk:
             self.current_id = None
 
     def _slideshow_video_worker(self, proc, ipc_path, pid, gen, known_dur_ms=0,
-                                is_video_post=False):
+                                save_kind="video"):
         """Off-thread: connect mpv's IPC socket, wait for it to actually be
         rendering the clip (not merely spawned), learn the clip length (from
         the server-supplied duration when present, else by querying mpv), set
         the loop policy, then report imageReady{id, durationMs} and promote
-        current_id/save_id to this clip. Fenced on `gen` so a superseded
+        current_id/save_target to this clip. Fenced on `gen` so a superseded
         clip's late report can't fire. The socket is then handed to the main
         loop, which uses it to ship the clock/sensors overlay layer into mpv
         (overlay-add) for as long as the clip plays.
 
-        current_id/save_id deliberately promote here rather than at spawn
+        current_id/save_target deliberately promote here rather than at spawn
         time (kiosk.py _play_slideshow_video): a cold transcode or a slow
         buffer can take several seconds between "mpv was told to start" and
         "a frame is actually visible," and SAVE/block pressed in that window
@@ -1407,7 +1412,7 @@ class Kiosk:
         # now.
         if sv and sv.get("gen") == gen:
             self.current_id = pid
-            self._roll_save_id(pid, is_video=is_video_post)
+            self._roll_save_id(pid, kind=save_kind)
             if self.connected and not self._is_off():
                 self._send_image_ready(pid, duration_ms)
 
@@ -2079,7 +2084,7 @@ class Kiosk:
         else:
             self._render(pid, item)
 
-    SAVE_ID_LAG = 1.5  # seconds; see save_id docstring above.
+    SAVE_ID_LAG = 1.5  # seconds; see save_target docstring above.
 
     def _render(self, pid, surf):
         self.base_surface = surf
@@ -2088,32 +2093,30 @@ class Kiosk:
         log.info("rendered %s", pid)
         if self.connected:
             self._send_image_ready(pid)
-        self._roll_save_id(pid, is_video=False)
+        self._roll_save_id(pid, kind="still")
 
-    def _roll_save_id(self, pid, is_video=False):
+    def _roll_save_id(self, pid, kind="still"):
         """Advance the SPACE-key save target to `pid` after a grace window —
         until then SPACE still targets the previously-shown post (so a save
         pressed just as the post switches hits the one being looked at).
-        Called for both images (on render) and videos (once playback is
-        actually confirmed — see _slideshow_video_worker). `is_video` tracks
-        alongside save_id so the save toast knows whether to fetch a video
-        poster or a plain image thumbnail.
+        Called for stills (on render) and videos/animated clips (once
+        playback is actually confirmed — see _slideshow_video_worker).
+        `kind` tracks alongside the id, atomically as one tuple, so the
+        save toast knows how to fetch its preview thumbnail.
         """
         if self._save_id_timer is not None:
             self._save_id_timer.cancel()
-        if self.save_id is None:
+        if self.save_target[0] is None:
             # First post of the session: no preceding one to protect.
-            self.save_id = pid
-            self.save_is_video = is_video
+            self.save_target = (pid, kind)
         else:
-            t = threading.Timer(self.SAVE_ID_LAG, self._promote_save_id, args=(pid, is_video))
+            t = threading.Timer(self.SAVE_ID_LAG, self._promote_save_id, args=(pid, kind))
             t.daemon = True
             self._save_id_timer = t
             t.start()
 
-    def _promote_save_id(self, pid, is_video=False):
-        self.save_id = pid
-        self.save_is_video = is_video
+    def _promote_save_id(self, pid, kind="still"):
+        self.save_target = (pid, kind)
 
     # -- run loop -----------------------------------------------------------
 
@@ -2163,11 +2166,11 @@ class Kiosk:
             self._set_force_off(not self.force_off)
             self.toast(f"Image {'hidden' if self.force_off else 'shown'}")
         elif k == pygame.K_SPACE:
-            pid = self.save_id
+            pid, kind = self.save_target
             if pid:
                 self.toast(f"Saving {pid}")
                 threading.Thread(target=self._save_remote,
-                                 args=(pid, self.save_is_video), daemon=True).start()
+                                 args=(pid, kind), daemon=True).start()
         elif k == pygame.K_t:
             self.conn.send({"sessionId": KIOSK_SESSION_ID, "action": "reshuffle"})
             self.toast("Reshuffling")
@@ -2183,20 +2186,29 @@ class Kiosk:
 
     TOAST_THUMB_SIZE = 72
 
-    def _fetch_save_thumb(self, pid, is_video):
+    def _fetch_save_thumb(self, pid, kind):
         """Small preview for the save-confirmation toast: a poster frame for
-        a video post, a resized still otherwise — same server endpoints (and
-        the same poster/convert split) browse.ejs uses for its grid
-        thumbnails. Best-effort; any failure just drops the thumbnail and
-        the toast falls back to text-only.
+        a true video post, a resized still for an image — same server
+        endpoints (and the same poster/convert split) browse.ejs uses for
+        its grid thumbnails. An animated source (jxl/gif/webp played as an
+        mpv clip) has no cheap preview: `/get?convert=1` transcodes the
+        *whole clip* to mp4 server-side (see CLAUDE.md's "Animated posts are
+        served as video" note) rather than returning a still, and `poster=1`
+        only fires for a true video source (imagemirror/index.js gates it on
+        VIDEO_EXTS) — so skip the fetch entirely rather than downloading a
+        multi-MB clip just to fail to decode it as an image. Best-effort
+        otherwise; any failure just drops the thumbnail and the toast falls
+        back to text-only.
         """
+        if kind == "animated":
+            return None
         try:
             params = {"id": str(pid),
                       "width": str(self.TOAST_THUMB_SIZE),
                       "height": str(self.TOAST_THUMB_SIZE),
                       "bright": "0", "record": "0",
                       "token": self.cfg["access_token"]}
-            if is_video:
+            if kind == "video":
                 params["poster"] = "1"
             else:
                 params["convert"] = "1"
@@ -2215,16 +2227,18 @@ class Kiosk:
             log.warning("save thumb fetch failed for %s: %s", pid, e)
             return None
 
-    def _save_remote(self, pid, is_video):
-        thumb = self._fetch_save_thumb(pid, is_video)
+    def _save_remote(self, pid, kind):
         try:
             r = SESSION.get(f"{self.cfg['http_base']}/save",
                             params={"id": str(pid),
                                     "token": self.cfg["access_token"]},
                             timeout=15)
             text = (r.text or "").strip()[:120] or f"HTTP {r.status_code}"
-            self.toast(text if r.ok else f"Save failed: {text}",
-                      thumb=thumb if r.ok else None)
+            # Thumbnail fetch runs after the save itself completes so a slow
+            # preview never delays the operation the user actually pressed
+            # SPACE for.
+            thumb = self._fetch_save_thumb(pid, kind) if r.ok else None
+            self.toast(text if r.ok else f"Save failed: {text}", thumb=thumb)
         except Exception as e:
             self.toast(f"Save error: {e}")
 
