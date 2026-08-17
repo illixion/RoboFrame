@@ -657,7 +657,7 @@ class Kiosk:
                 self.emoji_font = pygame.font.Font(emoji_path, 26)
             except Exception as e:
                 log.warning("emoji font init failed: %s", e)
-        self.toasts = []                 # list of (text_surface, expires_ts)
+        self.toasts = []                 # list of (text_surface, expires_ts, thumb_surface_or_None)
         self.toasts_lock = threading.Lock()
         self.sensors = {}                # entity -> {name, value, stale}
         self.sensors_lock = threading.Lock()
@@ -696,6 +696,7 @@ class Kiosk:
         # state.currentPost being set ~1s after crossfade start
         # (slideshow.js finishLoad setTimeout).
         self.save_id = None
+        self.save_is_video = False       # is save_id a video? (poster vs. still thumb)
         self._save_id_timer = None
         self.server_off = False          # server displayState=off
         self.force_off = False           # local 'p'-key toggle (panel off)
@@ -966,8 +967,10 @@ class Kiosk:
     TOAST_DURATION = 3.0
     TOAST_MAX = 5
 
-    def toast(self, text):
-        """Queue a 3-second banner. Safe to call from any thread."""
+    def toast(self, text, thumb=None):
+        """Queue a 3-second banner, optionally with a small preview image
+        (e.g. the save-confirmation thumbnail). Safe to call from any
+        thread."""
         log.info("toast: %s", text)
         try:
             surf = self.toast_font.render(text, True, (255, 255, 255))
@@ -975,7 +978,7 @@ class Kiosk:
             log.warning("toast render failed: %s", e)
             return
         with self.toasts_lock:
-            self.toasts.append((surf, time.monotonic() + self.TOAST_DURATION))
+            self.toasts.append((surf, time.monotonic() + self.TOAST_DURATION, thumb))
             if len(self.toasts) > self.TOAST_MAX:
                 self.toasts = self.toasts[-self.TOAST_MAX:]
             self._overlay_dirty = True
@@ -1265,12 +1268,15 @@ class Kiosk:
             # _maybe_restore_video_base re-applies from last_playback once
             # the effect clears.
             return
-        self._stop_slideshow_video()
+        # Keep current_id/save_id pointed at the outgoing clip (still the
+        # thing actually on screen) until the new one is confirmed playing
+        # below — preserve_current stops the teardown from blanking it out
+        # for the whole load window.
+        self._stop_slideshow_video(preserve_current=True)
         self._slideshow_gen += 1
         gen = self._slideshow_gen
-        self.current_id = pid
         self.base_surface = None
-        self._roll_save_id(pid)
+        is_video_post = self._is_video(post)
 
         if not self._have_mpv():
             log.warning("mpv not installed — slideshow video %s can't play", pid)
@@ -1279,6 +1285,8 @@ class Kiosk:
             # riding the readiness timeout on a frame we can't render.
             self.slideshow_video = {"proc": None, "id": pid,
                                     "ipc_path": None, "gen": gen}
+            self.current_id = pid
+            self._roll_save_id(pid, is_video=is_video_post)
             if self.connected:
                 self._send_image_ready(pid)
             return
@@ -1301,10 +1309,10 @@ class Kiosk:
         # image interval mid-playback.
         known_dur = int(post.get("durationMs") or 0)
         threading.Thread(target=self._slideshow_video_worker,
-                         args=(proc, ipc_path, pid, gen, known_dur),
+                         args=(proc, ipc_path, pid, gen, known_dur, is_video_post),
                          daemon=True).start()
 
-    def _stop_slideshow_video(self):
+    def _stop_slideshow_video(self, preserve_current=False):
         sv = self.slideshow_video
         self.slideshow_video = None
         if not sv:
@@ -1336,22 +1344,34 @@ class Kiosk:
             except OSError:
                 pass
         self._cleanup_overlay_files()
-        if self.current_id == sv.get("id"):
+        if not preserve_current and self.current_id == sv.get("id"):
             self.current_id = None
 
-    def _slideshow_video_worker(self, proc, ipc_path, pid, gen, known_dur_ms=0):
-        """Off-thread: connect mpv's IPC socket, learn the clip length (from
+    def _slideshow_video_worker(self, proc, ipc_path, pid, gen, known_dur_ms=0,
+                                is_video_post=False):
+        """Off-thread: connect mpv's IPC socket, wait for it to actually be
+        rendering the clip (not merely spawned), learn the clip length (from
         the server-supplied duration when present, else by querying mpv), set
-        the loop policy, then report imageReady{id, durationMs}. Fenced on
-        `gen` so a superseded clip's late report can't fire. The socket is
-        then handed to the main loop, which uses it to ship the clock/sensors
-        overlay layer into mpv (overlay-add) for as long as the clip plays.
+        the loop policy, then report imageReady{id, durationMs} and promote
+        current_id/save_id to this clip. Fenced on `gen` so a superseded
+        clip's late report can't fire. The socket is then handed to the main
+        loop, which uses it to ship the clock/sensors overlay layer into mpv
+        (overlay-add) for as long as the clip plays.
+
+        current_id/save_id deliberately promote here rather than at spawn
+        time (kiosk.py _play_slideshow_video): a cold transcode or a slow
+        buffer can take several seconds between "mpv was told to start" and
+        "a frame is actually visible," and SAVE/block pressed in that window
+        must still target the previous (still on-screen) post.
         """
         duration_ms = int(known_dur_ms) if known_dur_ms and known_dur_ms > 0 else 0
         sock = None
         try:
             sock = self._mpv_connect(ipc_path, proc, timeout=5)
             if sock is not None:
+                if not self._mpv_wait_playing(sock, timeout=8):
+                    log.warning("mpv never reported a playback position for "
+                               "%s within timeout; promoting anyway", pid)
                 # Only fall back to demuxing mpv when the server didn't tell us
                 # the length (older server, or a library that indexed 0).
                 if not duration_ms:
@@ -1382,9 +1402,14 @@ class Kiosk:
                 self._overlay_dirty = True  # push overlays on the next tick
             else:
                 sock.close()
-        # Only report if this clip is still the current one.
-        if sv and sv.get("gen") == gen and self.connected and not self._is_off():
-            self._send_image_ready(pid, duration_ms)
+        # Only promote/report if this clip is still the current one — a
+        # superseded clip's late arrival must not clobber whatever's playing
+        # now.
+        if sv and sv.get("gen") == gen:
+            self.current_id = pid
+            self._roll_save_id(pid, is_video=is_video_post)
+            if self.connected and not self._is_off():
+                self._send_image_ready(pid, duration_ms)
 
     # -- mpv JSON IPC (unix socket) -----------------------------------------
 
@@ -1430,6 +1455,23 @@ class Kiosk:
                 if "error" in obj:  # command reply (events lack `error`)
                     return obj
         return None
+
+    def _mpv_wait_playing(self, sock, timeout):
+        """Poll until mpv reports a real playback position — i.e. it has
+        decoded and is showing a frame, not just opened the file — or give
+        up after `timeout`s (a stalled/never-starting stream; imageReady
+        still fires afterwards so the channel doesn't wedge on the
+        readiness barrier). `time-pos` stays null while mpv is still
+        opening/buffering and becomes a number once playback has begun.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            reply = self._mpv_command(sock, ["get_property", "time-pos"])
+            if (reply and reply.get("error") == "success"
+                    and isinstance(reply.get("data"), (int, float))):
+                return True
+            time.sleep(0.1)
+        return False
 
     def _mpv_get_duration(self, sock, timeout):
         # `duration` is unknown until mpv has demuxed the file, so poll.
@@ -1491,13 +1533,21 @@ class Kiosk:
         """Render the toast stack into one surface, boxes right-aligned,
         mirroring the pygame compositor's top-right stagger.
         """
-        gap, pad_x, pad_y = 6, 10, 6
+        gap, pad_x, pad_y, thumb_gap = 6, 10, 6, 8
         boxes = []
-        for surf, _ in active_toasts:
+        for surf, _, thumb in active_toasts:
             w, h = surf.get_size()
-            box = pygame.Surface((w + 2 * pad_x, h + 2 * pad_y), pygame.SRCALPHA)
+            tw, th = thumb.get_size() if thumb is not None else (0, 0)
+            tg = thumb_gap if thumb is not None else 0
+            box_w = tw + tg + w + 2 * pad_x
+            box_h = max(h, th) + 2 * pad_y
+            box = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
             box.fill((51, 51, 51, 230))
-            box.blit(surf, (pad_x, pad_y))
+            cx = pad_x
+            if thumb is not None:
+                box.blit(thumb, (cx, (box_h - th) // 2))
+                cx += tw + tg
+            box.blit(surf, (cx, (box_h - h) // 2))
             boxes.append(box)
         if not boxes:
             return None
@@ -1559,7 +1609,7 @@ class Kiosk:
             (self.MPV_OV_CLOCK, clock_str, clock_box),
             (self.MPV_OV_DATE, date_str, date_box),
             (self.MPV_OV_SENSORS, sensors_key, sensors_box),
-            (self.MPV_OV_TOASTS, tuple(id(s) for s, _ in active_toasts), toasts_box),
+            (self.MPV_OV_TOASTS, tuple(id(s) for s, _, _ in active_toasts), toasts_box),
         )
         try:
             for slot, key, build in slots:
@@ -1869,7 +1919,7 @@ class Kiosk:
         """
         now_mono = time.monotonic()
         with self.toasts_lock:
-            self.toasts = [(s, t) for (s, t) in self.toasts if t > now_mono]
+            self.toasts = [(s, t, th) for (s, t, th) in self.toasts if t > now_mono]
             active_toasts = list(self.toasts)
 
         # 0. Effect overlay takes precedence over the photo. Video is
@@ -1927,17 +1977,23 @@ class Kiosk:
 
         # 4. toasts (top-right, on top of sensors — matches the web kiosk's
         # z-index stacking). Stagger downward from the top.
-        margin, gap, pad_x, pad_y = 20, 6, 10, 6
+        margin, gap, pad_x, pad_y, thumb_gap = 20, 6, 10, 6, 8
         y = margin
-        for surf, _ in active_toasts:
+        for surf, _, thumb in active_toasts:
             w, h = surf.get_size()
-            box_w = w + 2 * pad_x
-            box_h = h + 2 * pad_y
+            tw, th = thumb.get_size() if thumb is not None else (0, 0)
+            tg = thumb_gap if thumb is not None else 0
+            box_w = tw + tg + w + 2 * pad_x
+            box_h = max(h, th) + 2 * pad_y
             x = self.size[0] - box_w - margin
             bg = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
             bg.fill((51, 51, 51, 230))
             self.screen.blit(bg, (x, y))
-            self.screen.blit(surf, (x + pad_x, y + pad_y))
+            cx = x + pad_x
+            if thumb is not None:
+                self.screen.blit(thumb, (cx, y + (box_h - th) // 2))
+                cx += tw + tg
+            self.screen.blit(surf, (cx, y + (box_h - h) // 2))
             y += box_h + gap
 
         pygame.display.flip()
@@ -2032,27 +2088,32 @@ class Kiosk:
         log.info("rendered %s", pid)
         if self.connected:
             self._send_image_ready(pid)
-        self._roll_save_id(pid)
+        self._roll_save_id(pid, is_video=False)
 
-    def _roll_save_id(self, pid):
+    def _roll_save_id(self, pid, is_video=False):
         """Advance the SPACE-key save target to `pid` after a grace window —
         until then SPACE still targets the previously-shown post (so a save
         pressed just as the post switches hits the one being looked at).
-        Called for both images (on render) and videos (on playback start).
+        Called for both images (on render) and videos (once playback is
+        actually confirmed — see _slideshow_video_worker). `is_video` tracks
+        alongside save_id so the save toast knows whether to fetch a video
+        poster or a plain image thumbnail.
         """
         if self._save_id_timer is not None:
             self._save_id_timer.cancel()
         if self.save_id is None:
             # First post of the session: no preceding one to protect.
             self.save_id = pid
+            self.save_is_video = is_video
         else:
-            t = threading.Timer(self.SAVE_ID_LAG, self._promote_save_id, args=(pid,))
+            t = threading.Timer(self.SAVE_ID_LAG, self._promote_save_id, args=(pid, is_video))
             t.daemon = True
             self._save_id_timer = t
             t.start()
 
-    def _promote_save_id(self, pid):
+    def _promote_save_id(self, pid, is_video=False):
         self.save_id = pid
+        self.save_is_video = is_video
 
     # -- run loop -----------------------------------------------------------
 
@@ -2106,7 +2167,7 @@ class Kiosk:
             if pid:
                 self.toast(f"Saving {pid}")
                 threading.Thread(target=self._save_remote,
-                                 args=(pid,), daemon=True).start()
+                                 args=(pid, self.save_is_video), daemon=True).start()
         elif k == pygame.K_t:
             self.conn.send({"sessionId": KIOSK_SESSION_ID, "action": "reshuffle"})
             self.toast("Reshuffling")
@@ -2120,14 +2181,50 @@ class Kiosk:
         elif k == pygame.K_LEFT:
             self._show_previous()
 
-    def _save_remote(self, pid):
+    TOAST_THUMB_SIZE = 72
+
+    def _fetch_save_thumb(self, pid, is_video):
+        """Small preview for the save-confirmation toast: a poster frame for
+        a video post, a resized still otherwise — same server endpoints (and
+        the same poster/convert split) browse.ejs uses for its grid
+        thumbnails. Best-effort; any failure just drops the thumbnail and
+        the toast falls back to text-only.
+        """
+        try:
+            params = {"id": str(pid),
+                      "width": str(self.TOAST_THUMB_SIZE),
+                      "height": str(self.TOAST_THUMB_SIZE),
+                      "bright": "0", "record": "0",
+                      "token": self.cfg["access_token"]}
+            if is_video:
+                params["poster"] = "1"
+            else:
+                params["convert"] = "1"
+            r = SESSION.get(f"{self.cfg['http_base']}/get", params=params, timeout=10)
+            r.raise_for_status()
+            img = Image.open(io.BytesIO(r.content))
+            img.load()
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            scale = min(self.TOAST_THUMB_SIZE / img.width, self.TOAST_THUMB_SIZE / img.height)
+            if scale < 1.0:
+                img = img.resize((max(1, int(img.width * scale)),
+                                  max(1, int(img.height * scale))), Image.LANCZOS)
+            return pygame.image.fromstring(img.tobytes(), img.size, "RGB")
+        except Exception as e:
+            log.warning("save thumb fetch failed for %s: %s", pid, e)
+            return None
+
+    def _save_remote(self, pid, is_video):
+        thumb = self._fetch_save_thumb(pid, is_video)
         try:
             r = SESSION.get(f"{self.cfg['http_base']}/save",
                             params={"id": str(pid),
                                     "token": self.cfg["access_token"]},
                             timeout=15)
             text = (r.text or "").strip()[:120] or f"HTTP {r.status_code}"
-            self.toast(text if r.ok else f"Save failed: {text}")
+            self.toast(text if r.ok else f"Save failed: {text}",
+                      thumb=thumb if r.ok else None)
         except Exception as e:
             self.toast(f"Save error: {e}")
 
