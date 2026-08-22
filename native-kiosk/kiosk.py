@@ -808,6 +808,14 @@ class Kiosk:
             # display PIR had turned off.
             if p.get("target") == self.cfg["device_id"] and "state" in p:
                 off = p.get("state") == "off" or p.get("state") is False
+                # Resync on every "on" report, not just a detected off->on
+                # transition: server_off starts False (assume-on) at boot,
+                # so a device that's already "on" when we first connect
+                # would otherwise never hit the wake path in
+                # _resolve_visibility and could stay latched onto whatever
+                # (possibly stale) size we captured at startup.
+                if not off:
+                    self._resync_screen_size()
                 self._set_server_off(off)
         elif action == "refresh":
             log.info("refresh — re-exec")
@@ -2004,30 +2012,59 @@ class Kiosk:
         pygame.display.flip()
         return bool(active_toasts)
 
+    def _query_live_screen_size(self):
+        """Ground-truth screen size straight from xrandr.
+
+        SDL enumerates displays/modes once when the video subsystem inits
+        and doesn't reliably notice a mode change made by another client
+        (node-display's xrandr on/off cycle) afterwards — both
+        pygame.display.Info() and get_desktop_sizes() can keep echoing the
+        size we launched with. A fresh xrandr process has no such cache.
+        """
+        try:
+            out = subprocess.run(["xrandr", "--query"], capture_output=True,
+                                  text=True, timeout=3).stdout
+        except Exception:
+            return None
+        line = next((l for l in out.splitlines() if l.startswith("Screen ")), "")
+        if "current" not in line:
+            return None
+        try:
+            w, _x, h = line.split("current", 1)[1].split(",", 1)[0].split()[:3]
+            return (int(w), int(h))
+        except ValueError:
+            return None
+
     def _resync_screen_size(self):
         """Recreate the pygame surface if the live desktop size changed.
 
         node-display's xrandr on/off cycle (raspberry-pi.js) can restore a
         different mode than the one we launched with — most often a stale
         small mode left over from a prior off that collapsed the
-        framebuffer. pygame.display.Info() reflects the mode we last set,
-        not the live desktop, so a change made from outside otherwise went
-        unnoticed until a full re-exec (the Ctrl+R shortcut) recreated the
-        SDL video subsystem from scratch. get_desktop_sizes() queries X
-        directly, so it catches the mismatch without a restart.
+        framebuffer, latched at boot if our own startup raced node-display's
+        first mode discovery. Without this the kiosk kept compositing into a
+        wrong-sized surface — and mpv fell back to its own top-level window
+        since the captured `_wid` no longer matched — until a full re-exec
+        (Ctrl+R) recreated the SDL video subsystem from scratch. Tearing
+        down and reinitializing the display subsystem here reproduces that
+        same clean slate without restarting the process.
         """
-        try:
-            sizes = pygame.display.get_desktop_sizes()
-        except pygame.error:
-            return
-        new_size = sizes[0] if sizes else None
+        new_size = self._query_live_screen_size()
         if not new_size or new_size == self.size:
             return
         log.info("screen size changed on wake: %s -> %s; recreating surface",
                   self.size, new_size)
+        pygame.display.quit()
+        pygame.display.init()
         self.size = new_size
         flags = pygame.FULLSCREEN | pygame.NOFRAME
         self.screen = pygame.display.set_mode(self.size, flags)
+        pygame.display.set_caption("RoboFrame")
+        pygame.mouse.set_visible(False)
+        try:
+            self._wid = pygame.display.get_wm_info().get("window")
+        except Exception:
+            self._wid = None
         self.fetcher.screen_size = self.size
         self.fetcher.keep_only(set())  # old surfaces are pre-scaled to the stale size
 
