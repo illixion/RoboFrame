@@ -2004,6 +2004,33 @@ class Kiosk:
         pygame.display.flip()
         return bool(active_toasts)
 
+    def _resync_screen_size(self):
+        """Recreate the pygame surface if the live desktop size changed.
+
+        node-display's xrandr on/off cycle (raspberry-pi.js) can restore a
+        different mode than the one we launched with — most often a stale
+        small mode left over from a prior off that collapsed the
+        framebuffer. pygame.display.Info() reflects the mode we last set,
+        not the live desktop, so a change made from outside otherwise went
+        unnoticed until a full re-exec (the Ctrl+R shortcut) recreated the
+        SDL video subsystem from scratch. get_desktop_sizes() queries X
+        directly, so it catches the mismatch without a restart.
+        """
+        try:
+            sizes = pygame.display.get_desktop_sizes()
+        except pygame.error:
+            return
+        new_size = sizes[0] if sizes else None
+        if not new_size or new_size == self.size:
+            return
+        log.info("screen size changed on wake: %s -> %s; recreating surface",
+                  self.size, new_size)
+        self.size = new_size
+        flags = pygame.FULLSCREEN | pygame.NOFRAME
+        self.screen = pygame.display.set_mode(self.size, flags)
+        self.fetcher.screen_size = self.size
+        self.fetcher.keep_only(set())  # old surfaces are pre-scaled to the stale size
+
     def _is_off(self):
         return self.server_off or self.force_off
 
@@ -2032,6 +2059,7 @@ class Kiosk:
             # which off-flavor (server vs force) is active.
             self._composite_overlay()
         else:
+            self._resync_screen_size()
             if self.last_playback:
                 self._apply_playback(self.last_playback)
         self._send_visibility(not is_off)
