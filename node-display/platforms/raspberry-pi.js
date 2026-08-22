@@ -175,14 +175,17 @@ function create() {
     // Off cuts the CRTC via xrandr (see top-of-file note); on re-sets the mode
     // explicitly (--auto doesn't wake this panel) and re-pins the framebuffer
     // in case a prior off collapsed it, then clears any stale software DPMS-off
-    // state with `dpms force on`. Without a discovered output we fall back to
-    // xset dpms force for panels that honour hardware DPMS.
+    // state with `dpms force on`. There is no `xset dpms force off` fallback
+    // here: on this Pi's vc4/KMS driver that call only flips X's software
+    // flag — the CRTC keeps scanning out the kiosk's frames, so the HDMI link
+    // stays live and the panel stays backlit showing black (green LED, no
+    // picture) instead of actually sleeping. A missing output is a real
+    // failure, surfaced to the caller, not silently swapped for a command
+    // that lies about the power state.
     function offCmd() {
         if (SESSION === 'wayland') return `wlopm --off '*'`;
         const out = ensureX11Output();
-        return out
-            ? `xrandr --display ${XRANDR_DISPLAY} --output ${out.name} --off`
-            : `xset -display ${XRANDR_DISPLAY} dpms force off`;
+        return out ? `xrandr --display ${XRANDR_DISPLAY} --output ${out.name} --off` : null;
     }
     function onCmd() {
         if (SESSION === 'wayland') return `wlopm --on '*'`;
@@ -298,7 +301,13 @@ function create() {
     }
 
     function _dpmsOff(cb) {
-        exec(offCmd(), (err, so, se) => {
+        const cmd = offCmd();
+        if (!cmd) {
+            const err = new Error('no xrandr output discovered; refusing to fake off via xset dpms force');
+            console.error(`[display] off failed: ${err.message}`);
+            return cb(err);
+        }
+        exec(cmd, (err, so, se) => {
             if (err) console.error(`[display] off failed: ${err.message} :: ${se}`);
             _powerStage = 'off';
             currentState = false;
@@ -331,10 +340,7 @@ function create() {
                     _dimToOffTimer = null;
                     _stateQueue = _stateQueue.then(() => new Promise((resolve) => {
                         if (_powerStage !== 'dim') return resolve();
-                        exec(offCmd(), () => {
-                            _powerStage = 'off';
-                            resolve();
-                        });
+                        _dpmsOff(() => resolve());
                     }));
                 }, DIM_TO_OFF_DELAY_MS);
             }
