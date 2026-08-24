@@ -423,6 +423,8 @@ Runs `q` through the same parser the slideshow orchestrator uses (`tag`, `-tag`,
 
 A cursored page that runs off the end of the deck wraps around and tops itself up from the head, so any `cursor` value returns a full `limit` rows (fewer only when the query itself matches fewer) with no repeats inside the page. Without that, a random float would return a short or empty page whenever it landed in the last `limit` posts — near-certain on a narrow query. A wrapped page reports `nextCursor: null`, since continuing it would circle.
 
+A random-order cursor is honoured only while it still points at the deck's least-seen tier. Displaying a post bumps its `display_count`, which re-sorts it back *ahead* of the cursor — so a long-lived cursor fed back page after page would be perpetually refilled by the very posts it just served, never reach the deck's end, and permanently orphan everything at a lower `(display_count, random_rank)`. When any matching post is less-seen than the cursor's tier, the page restarts from the deck's head instead — that head is exactly what least-seen-first must serve next.
+
 Unlike `/random`, `/search` ignores the blocklist and never bumps `display_count` — it's a plain view of the library rather than a slideshow pick, so a grid built off it won't deprioritise those posts on the frames.
 
 `GET /random?q=&list=&exclude=&ratio=&order=&convert=&bright=&width=&height=&lowmem=&wallpaper=&json=`

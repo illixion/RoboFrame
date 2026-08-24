@@ -11,16 +11,17 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createSearch } = require('../lib/searchQuery');
 
-function stubDb({ rows = [], count = 1 } = {}) {
-    const state = { rows, count };
+function stubDb({ rows = [], count = 1, stale = false } = {}) {
+    const state = { rows, count, stale };
     const calls = [];
     return {
         state,
         calls,
         creates() { return calls.filter((s) => /CREATE OR REPLACE TEMP TABLE/.test(s)); },
         drops() { return calls.filter((s) => /DROP TABLE IF EXISTS/.test(s)); },
+        probes() { return calls.filter((s) => /AS stale/.test(s)); },
         pages() {
-            return calls.filter((s) => !/CREATE OR REPLACE TEMP TABLE|COUNT\(\*\)|DROP TABLE/.test(s));
+            return calls.filter((s) => !/CREATE OR REPLACE TEMP TABLE|COUNT\(\*\)|DROP TABLE|AS stale/.test(s));
         },
         run(sql, cb) {
             calls.push(sql);
@@ -30,6 +31,7 @@ function stubDb({ rows = [], count = 1 } = {}) {
             const cb = typeof paramsOrCb === 'function' ? paramsOrCb : maybeCb;
             calls.push(sql);
             if (/COUNT\(\*\)/.test(sql)) return cb(null, [{ n: BigInt(state.count) }]);
+            if (/AS stale/.test(sql)) return cb(null, state.stale ? [{ stale: 1 }] : []);
             cb(null, state.rows);
         },
     };
@@ -227,6 +229,57 @@ test('random-mode cursor advances on a full page (BigInt display_count)', async 
     await search.runSearch({ q: 'cats', cursor: nextCursor, limit: 3 });
     const page2 = db.pages()[1];
     assert.match(page2, /r\.display_count > 2 OR \(r\.display_count = 2 AND r\.random_rank > 0\.30000000000000004\)/);
+});
+
+// Displaying a post bumps its display_count, re-sorting it *after* the
+// cursor — so a walking cursor is perpetually fed by the posts it just
+// served and never runs off the deck's end on its own. Everything at a
+// lower (display_count, random_rank) would be orphaned forever: the
+// slideshow visibly loops the small slice ahead of the cursor. The guard:
+// a cursor above the deck's least-seen tier restarts from the head.
+test('a cursor stranded above less-seen posts restarts from the deck head', async () => {
+    const db = stubDb({ rows: [{ _id: 5n, display_count: 1n, random_rank: 0.2 }], stale: true });
+    const search = createSearch({ db });
+    await search.runSearch({ q: 'cats', cursor: { dc: 4, rank: 0.9 }, limit: 3 });
+
+    const probe = db.probes()[0];
+    assert.match(probe, /r\.display_count < 4/);
+    assert.match(probe, /LIMIT 1/);
+    // The page restarted from the head — the tuple filter is gone.
+    const page = db.pages()[0];
+    assert.doesNotMatch(page, /display_count > 4/);
+    assert.doesNotMatch(page, /random_rank > 0\.9/);
+});
+
+test('a non-stale cursor keeps walking; the dc=0 floor skips the probe', async () => {
+    const db = stubDb({ rows: [] });
+    const search = createSearch({ db });
+    // dc=0 can't have a less-seen tier below it — no probe at all.
+    await search.runSearch({ q: 'cats', cursor: { dc: 0, rank: 0.5 }, limit: 3 });
+    assert.equal(db.probes().length, 0);
+    // dc>0 probes, and a clean answer leaves the tuple filter standing.
+    await search.runSearch({ q: 'cats', cursor: { dc: 3, rank: 0.5 }, limit: 3 });
+    assert.equal(db.probes().length, 1);
+    assert.match(db.pages()[1], /display_count > 3/);
+});
+
+test('runSearch filters the blocklist in SQL — pages and the staleness probe', async () => {
+    const db = stubDb({ rows: [] });
+    const search = createSearch({ db });
+    await search.runSearch({
+        q: 'cats', cursor: { dc: 2, rank: 0.5 }, limit: 3,
+        blockedIds: [11, 22], blockedTags: ['nsfw'],
+    });
+    for (const sql of [db.probes()[0], db.pages()[0]]) {
+        assert.match(sql, /m\._id NOT IN \(11, 22\)/);
+        assert.match(sql, /m\._id NOT IN \(SELECT _id FROM match_/);
+    }
+    // Deterministic order takes the same clauses.
+    await search.runSearch({ q: 'cats order:id', blockedIds: [11] });
+    assert.match(db.pages()[1], /m\._id NOT IN \(11\)/);
+    // And an empty blocklist emits nothing.
+    await search.runSearch({ q: 'cats', cursor: { dc: 2, rank: 0.5 }, limit: 3 });
+    assert.doesNotMatch(db.pages()[2], /NOT IN/);
 });
 
 // /search turns `?cursor=<float>` into one object carrying both cursor

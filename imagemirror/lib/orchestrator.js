@@ -471,7 +471,16 @@ function createOrchestrator({
                 const q = buildQuery(channel);
                 lastQuery = q;
                 const gen = channel.refillGen;
-                const { results, nextCursor } = await search.runSearch({ q, cursor: channel.cursor, limit: fetchSize });
+                // The blocklist rides along so blocked posts are excluded in
+                // SQL: a blocked post's display_count never moves, so left in
+                // the deck it would pin the least-seen tier and waste page
+                // rows the filter below drops anyway. The in-JS filter stays
+                // as the backstop for a data.json edit landing mid-refill.
+                const { results, nextCursor } = await search.runSearch({
+                    q, cursor: channel.cursor, limit: fetchSize,
+                    blockedIds: getBlockedIds() || [],
+                    blockedTags: getBlockedTags() || [],
+                });
                 // If clearAndRefill ran while we were awaiting, the query
                 // context has changed under us — drop these results instead
                 // of pushing stale-query rows into the cleared queue.

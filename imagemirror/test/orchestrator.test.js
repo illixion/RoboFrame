@@ -9,13 +9,16 @@ const { createOrchestrator } = require('../lib/orchestrator');
 function makeFakeSearch(pages) {
     let call = 0;
     const queries = [];
+    const searchArgs = [];
     return {
-        async runSearch({ q } = {}) {
-            queries.push(q);
+        async runSearch(opts = {}) {
+            queries.push(opts.q);
+            searchArgs.push(opts);
             const page = pages[Math.min(call, pages.length - 1)];
             call += 1;
             return page;
         },
+        get lastArgs() { return searchArgs[searchArgs.length - 1]; },
         clearCache() { call = 0; },
         get callCount() { return call; },
         get queries() { return queries; },
@@ -915,6 +918,19 @@ test('register with modTags bundles them into the first refill query', async (t)
     assert.ok(queries.length >= 1, 'expected at least one query from the first refill');
     assert.match(queries[0], /baseTag rating:s -blood/,
         'first query should already include modTags from slideshowConfig');
+});
+
+test('refill hands the blocklist to the search layer for SQL-side exclusion', async (t) => {
+    const { orch, search } = harness({ blockedIds: [7], blockedTags: ['nsfw'] });
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'kiosk1', interval: 5000 });
+    await tick(); await tick();
+    // Blocked posts must never occupy page rows: they're never shown, so
+    // their display_count never moves, and left in the deck they'd pin the
+    // least-seen tier the stale-cursor guard keys on.
+    assert.deepEqual(search.lastArgs.blockedIds, [7]);
+    assert.deepEqual(search.lastArgs.blockedTags, ['nsfw']);
 });
 
 test('refill skips posts whose _id is in the blocklist', async (t) => {

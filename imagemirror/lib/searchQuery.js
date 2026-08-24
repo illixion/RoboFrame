@@ -25,6 +25,15 @@
 //   - random (orderBy = RANDOM()): joins memory.random_ranks and orders by
 //     (display_count, random_rank) so unseen posts appear first; cursor is
 //     the (display_count, random_rank) tuple of the last row returned.
+//     A cursor is only honoured while it still points at the deck's
+//     least-seen tier: displaying a post bumps its display_count, which
+//     re-sorts it *after* the cursor, so a walking cursor is perpetually fed
+//     by the posts it just served and never runs off the deck's end on its
+//     own — everything at a lower (display_count, random_rank) would be
+//     orphaned forever and the slideshow would loop the small slice ahead of
+//     the cursor. When any matching post is less-seen than the cursor's
+//     tier, the cursor is treated as exhausted and the page restarts from
+//     the deck's head, which is exactly those least-seen posts.
 //   - deterministic (any explicit order:id|score|score_asc): OFFSET cursor.
 //
 // The server-side blocklist (blockedIds / blockedTags) is deliberately NOT
@@ -173,24 +182,50 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
     // where it asked for `limit` posts. Opt-in because the orchestrator reads a
     // short page as "deck exhausted" to end its refill loop; wrapping there
     // would make the queue never finish.
-    async function runSearch({ q = '', cursor = null, limit, wrap = false } = {}) {
+    //
+    // `blockedIds` / `blockedTags` filter the page in SQL (same clauses as the
+    // one-shot picks). The orchestrator passes its blocklist here so blocked
+    // posts never occupy pages — a blocked post is never shown, so its
+    // display_count never moves, and left in the deck it would pin the
+    // least-seen tier forever and burn every page on rows the caller drops.
+    async function runSearch({ q = '', cursor = null, limit, wrap = false, blockedIds = [], blockedTags = [] } = {}) {
         const parsed = parseQuery(q);
         const { limit: parsedLimit, orderBy } = parsed;
         const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : parsedLimit;
         const set = await getMatchSet(composeWhere(parsed));
         if (set.count === 0) return { results: [], nextCursor: null };
+        const blocked = await blockedClause({ blockedIds, blockedTags });
 
         const isRandom = orderBy === 'RANDOM()';
+        let effCursor = cursor;
+        if (isRandom && effCursor && Math.floor(Number(effCursor.dc) || 0) > 0) {
+            // Stale-cursor guard (see the header): a cursor above the deck's
+            // least-seen tier has less-seen posts *behind* it that a forward
+            // walk can never reach, because every displayed post's
+            // display_count bump re-inserts it ahead of the cursor and keeps
+            // the pages fed. Restart such a cursor from the head — the
+            // less-seen posts are exactly what least-seen-first must serve
+            // next. A dc=0 cursor can't be stale, so the floor skips the probe.
+            const dc = Math.floor(Number(effCursor.dc));
+            const behind = await allAsync(`
+                SELECT 1 AS stale
+                FROM ${set.table} m
+                JOIN memory.random_ranks r ON r._id = m._id
+                WHERE r.display_count < ${dc}${blocked}
+                LIMIT 1;
+            `);
+            if (behind.length > 0) effCursor = null;
+        }
         const sql = isRandom
-            ? buildRandomPageSql({ table: set.table, cursor, limit: effectiveLimit })
-            : buildDeterministicPageSql({ table: set.table, orderBy, cursor, limit: effectiveLimit });
+            ? buildRandomPageSql({ table: set.table, cursor: effCursor, limit: effectiveLimit, blocked })
+            : buildDeterministicPageSql({ table: set.table, orderBy, cursor: effCursor, limit: effectiveLimit, blocked });
         const rows = await allAsync(sql);
 
         let wrapped = false;
-        if (wrap && isRandom && cursor && rows.length < effectiveLimit) {
+        if (wrap && isRandom && effCursor && rows.length < effectiveLimit) {
             const seen = new Set(rows.map((r) => String(r._id)));
             const head = await allAsync(buildRandomPageSql({
-                table: set.table, cursor: null, limit: effectiveLimit,
+                table: set.table, cursor: null, limit: effectiveLimit, blocked,
             }));
             for (const row of head) {
                 if (rows.length >= effectiveLimit) break;
@@ -350,7 +385,7 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
     return { runSearch, runCount, runRandomOne, runRankedRandomOne, clearCache };
 }
 
-function buildRandomPageSql({ table, cursor, limit }) {
+function buildRandomPageSql({ table, cursor, limit, blocked = '' }) {
     let pageFilter = '';
     if (cursor && typeof cursor === 'object' && Number.isFinite(cursor.rank)) {
         const dc = Number(cursor.dc) || 0;
@@ -364,7 +399,7 @@ function buildRandomPageSql({ table, cursor, limit }) {
             SELECT m._id, r.random_rank, r.display_count
             FROM ${table} m
             JOIN memory.random_ranks r ON r._id = m._id
-            WHERE TRUE${pageFilter}
+            WHERE TRUE${blocked}${pageFilter}
             ORDER BY r.display_count ASC, r.random_rank ASC
             LIMIT ${limit}
         )
@@ -376,13 +411,14 @@ function buildRandomPageSql({ table, cursor, limit }) {
     `;
 }
 
-function buildDeterministicPageSql({ table, orderBy, cursor, limit }) {
+function buildDeterministicPageSql({ table, orderBy, cursor, limit, blocked = '' }) {
     const offset = (cursor && Number(cursor.offset)) || 0;
     return `
         WITH page AS (
             SELECT m._id
             FROM ${table} m
             JOIN file_db.posts p ON p._id = m._id
+            WHERE TRUE${blocked}
             ORDER BY ${orderBy}
             LIMIT ${limit} OFFSET ${offset}
         )

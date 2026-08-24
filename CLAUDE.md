@@ -162,11 +162,15 @@ updates to track a server change, ship those too:
   explicit `displaySync {enabled:false}` from some session on the
   driver channel, or by `close()` at process shutdown.
 - **Server-side blocklist.** Blocked posts are filtered out server-side
-  on every path that selects images: the orchestrator drops them from
-  each channel's queue and advances any channel that was just showing
-  one, and the `/random` HTTP route excludes them in SQL so a blocked
-  post is never picked. Both read the same `blockedIds`/`blockedTags`
-  from `data.json`. Don't add client-side defensive filtering.
+  on every path that selects images: the refill passes the blocklist into
+  `runSearch` so blocked posts never occupy page rows (a blocked post is
+  never shown, so its `display_count` never moves — left in the deck it
+  would pin the least-seen tier the stale-cursor guard keys on), the
+  orchestrator additionally drops them from each channel's queue and
+  advances any channel that was just showing one, and the `/random` HTTP
+  route excludes them in SQL so a blocked post is never picked. All read
+  the same `blockedIds`/`blockedTags` from `data.json`. Don't add
+  client-side defensive filtering.
 - **node-display is not a session.** It never sends `slideshowConfig`,
   so it never appears in any channel's `sessions`. It still drives
   per-deviceId visibility via `visibility {deviceId, ...}` — the broker
@@ -191,7 +195,13 @@ the deadline) is the canary for the wake-advance class of bug.
   higher tier — back ahead of the cursor — so it comes round again on a later
   page. A wrapped final page tops itself up from the deck's head for the same
   reason. Don't "fix" it by freezing the order globally — that's what makes
-  the orchestrator's queue refill least-seen-first. `/browse` instead sends
+  the orchestrator's queue refill least-seen-first. The same bump feedback
+  means a walking cursor never runs off the deck's end on its own (the posts
+  it serves keep re-sorting in ahead of it), so `runSearch` restarts any
+  cursor that has climbed above the deck's least-seen tier from the head —
+  without that guard everything behind the cursor is orphaned and a display
+  visibly loops the small slice ahead of it. `test/searchQuery.deck.test.js`
+  is the regression test, on the real DuckDB engine. `/browse` instead sends
   every query with an implicit `order:id` (unless the box already names an
   `order:`), which pages by flat row offset and never reads `display_count` at
   all — a genuine DB view, immune to whatever the frames are doing. It still
