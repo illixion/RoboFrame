@@ -1423,9 +1423,36 @@ app.get('/addtohistory', (req, res) => {
 
 // Debugging helper: total number of posts matching a query string. Reuses
 // the same parseQuery as /search so syntax stays in sync.
+//
+//   q=    raw query (see lib/parseQuery.js for the syntax)
+//   list= join the server-side tag list at index N (combined with q). When
+//         omitted, defaults to the active global list index in shared-tag
+//         mode, or list 0 otherwise.
 app.get('/count', async (req, res) => {
   if (!searchRef) return res.status(503).send('Search not ready');
-  const q = String(req.query.q || '');
+
+  const parts = [];
+  // `list=` joins the server-side tag list at that index. When omitted, fall
+  // back to what the displays are currently showing: in shared-tag mode that's
+  // the active global list index; otherwise list 0.
+  const listParam = req.query.list;
+  const listOmitted = listParam === undefined || listParam === '';
+  let listIdx;
+  if (listOmitted) {
+    const sharedOn = brokerRef && brokerRef.getSharedTags && brokerRef.getSharedTags();
+    listIdx = sharedOn && brokerRef.orchestrator
+      ? Number(brokerRef.orchestrator.getActiveTagsList())
+      : 0;
+  } else {
+    listIdx = Number(listParam);
+  }
+  if (Number.isInteger(listIdx) && listIdx >= 0 && brokerRef) {
+    const lists = brokerRef.getTagLists() || [];
+    if (Array.isArray(lists[listIdx])) parts.push(...lists[listIdx]);
+  }
+  if (req.query.q) parts.push(String(req.query.q));
+
+  const q = parts.filter(Boolean).join(' ');
   try {
     const n = await searchRef.runCount({ q });
     res.json({ q, count: n });
