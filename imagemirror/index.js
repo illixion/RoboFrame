@@ -1455,7 +1455,7 @@ app.get('/count', async (req, res) => {
   const q = parts.filter(Boolean).join(' ');
   try {
     const n = await searchRef.runCount({ q });
-    res.json({ q, count: n });
+    res.json({ count: n });
   } catch (err) {
     console.error(`count error: ${err.message}`);
     res.status(500).send('Count failed');
