@@ -1472,12 +1472,37 @@ function parseSearchCursor(raw) {
 //           row offset instead. Feed `nextCursor` back for the next page as
 //           `dc,rank` (random order) or a bare offset (deterministic order) —
 //           see parseSearchCursor.
+//   list=   join the server-side tag list at index N (combined with q). When
+//           omitted, defaults to the active global list index in shared-tag
+//           mode, or list 0 otherwise.
 //
 // Unlike /random this deliberately ignores the blocklist and never bumps
 // display_count: it's a plain view of the library, not a slideshow pick.
 app.get('/search', async (req, res) => {
   if (!searchRef) return res.status(503).send('Search not ready');
-  const q = String(req.query.q || '');
+
+  const parts = [];
+  // `list=` joins the server-side tag list at that index. When omitted, fall
+  // back to what the displays are currently showing: in shared-tag mode that's
+  // the active global list index; otherwise list 0.
+  const listParam = req.query.list;
+  const listOmitted = listParam === undefined || listParam === '';
+  let listIdx;
+  if (listOmitted) {
+    const sharedOn = brokerRef && brokerRef.getSharedTags && brokerRef.getSharedTags();
+    listIdx = sharedOn && brokerRef.orchestrator
+      ? Number(brokerRef.orchestrator.getActiveTagsList())
+      : 0;
+  } else {
+    listIdx = Number(listParam);
+  }
+  if (Number.isInteger(listIdx) && listIdx >= 0 && brokerRef) {
+    const lists = brokerRef.getTagLists() || [];
+    if (Array.isArray(lists[listIdx])) parts.push(...lists[listIdx]);
+  }
+  if (req.query.q) parts.push(String(req.query.q));
+
+  const q = parts.filter(Boolean).join(' ');
   const limitRaw = Number(req.query.limit);
   // parseQuery already defaults to 40 and honors `limit:N` inside `q`; only
   // pass an override when the caller set `?limit=` explicitly.
