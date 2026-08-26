@@ -690,16 +690,24 @@ class Kiosk:
         self.last_playback = None        # last full playback payload
         self.interval = cfg["interval"]  # dwell (ms); tracks playback.interval
         self.current_id = None           # what's actually on screen
-        # `save_target` (id, kind) is what the SPACE key acts on. It lags
-        # `current_id` by 1.5s so a user pressing save just as an image
-        # switches still targets the post they were looking at — mirrors
-        # the web kiosk's state.currentPost being set ~1s after crossfade
-        # start (slideshow.js finishLoad setTimeout). `kind` is one of
-        # "still" | "video" | "animated" (a still image, a true mp4/webm
-        # post, or an animated source played as a clip) — it picks how the
-        # save toast fetches its preview thumbnail.
+        # `save_target` (id, kind) is what the SPACE key acts on. On an
+        # automatic advance it lags `current_id` by 1.5s so a user pressing
+        # save just as an image switches still targets the post they were
+        # looking at — mirrors the web kiosk's state.currentPost being set
+        # ~1s after crossfade start (slideshow.js finishLoad). A post the
+        # user asked for (NEXT/PREVIOUS) promotes immediately instead — see
+        # `_nav_intent_until`. `kind` is one of "still" | "video" |
+        # "animated" (a still image, a true mp4/webm post, or an animated
+        # source played as a clip) — it picks how the save toast fetches its
+        # preview thumbnail.
         self.save_target = (None, "still")
         self._save_id_timer = None
+        # Deadline (monotonic) until which the next post to land counts as
+        # user-requested. A NEXT/PREVIOUS press arms it, so SPACE straight
+        # after the press hits the post now on screen rather than the one
+        # navigated away from. Bounded so a nav whose frame never arrives
+        # can't strip the grace window off a later automatic advance.
+        self._nav_intent_until = 0.0
         self.server_off = False          # server displayState=off
         self.force_off = False           # local 'p'-key toggle (panel off)
         self.is_primary_sync = False     # local displaySync claim state
@@ -936,6 +944,7 @@ class Kiosk:
         self.toast("Previous")
         if self._is_off():
             return
+        self._mark_nav_intent()
         if self._is_video(post):
             self._play_slideshow_video(post)
         else:
@@ -2149,7 +2158,8 @@ class Kiosk:
         else:
             self._render(pid, item)
 
-    SAVE_ID_LAG = 1.5  # seconds; see save_target docstring above.
+    SAVE_ID_LAG = 1.5  # seconds; see save_target comment in __init__.
+    NAV_INTENT_WINDOW = 10.0  # seconds; see _mark_nav_intent.
 
     def _render(self, pid, surf):
         self.base_surface = surf
@@ -2160,10 +2170,23 @@ class Kiosk:
             self._send_image_ready(pid)
         self._roll_save_id(pid, kind="still")
 
+    def _mark_nav_intent(self):
+        """Arm the next post to land as user-requested, so `_roll_save_id`
+        promotes the save target the moment it renders instead of waiting out
+        the grace window. Called from the NEXT/PREVIOUS key handlers."""
+        self._nav_intent_until = time.monotonic() + self.NAV_INTENT_WINDOW
+
+    def _take_nav_intent(self):
+        live = self._nav_intent_until > time.monotonic()
+        self._nav_intent_until = 0.0
+        return live
+
     def _roll_save_id(self, pid, kind="still"):
         """Advance the SPACE-key save target to `pid` after a grace window —
         until then SPACE still targets the previously-shown post (so a save
         pressed just as the post switches hits the one being looked at).
+        A post the user navigated to skips the window entirely: they asked
+        for it, so it is what they mean to save.
         Called for stills (on render) and videos/animated clips (once
         playback is actually confirmed — see _slideshow_video_worker).
         `kind` tracks alongside the id, atomically as one tuple, so the
@@ -2171,8 +2194,11 @@ class Kiosk:
         """
         if self._save_id_timer is not None:
             self._save_id_timer.cancel()
-        if self.save_target[0] is None:
-            # First post of the session: no preceding one to protect.
+            self._save_id_timer = None
+        user_requested = self._take_nav_intent()
+        if user_requested or self.save_target[0] is None:
+            # Asked for by name, or the first post of the session (no
+            # preceding one to protect).
             self.save_target = (pid, kind)
         else:
             t = threading.Timer(self.SAVE_ID_LAG, self._promote_save_id, args=(pid, kind))
@@ -2244,6 +2270,7 @@ class Kiosk:
             self.suppress_until = 0.0
             self.back_steps = 0
             self.nav_override = None
+            self._mark_nav_intent()
             self.conn.send({"sessionId": KIOSK_SESSION_ID, "action": "requestNext"})
             self.toast("Next")
         elif k == pygame.K_LEFT:

@@ -84,10 +84,34 @@ const pendingPrefetch = new Map(); // id -> { controller, promise, post }
 let prefetchQueue = [];
 let currentRenderToken = 0;
 // Post we've committed to crossfade to, but whose animation hasn't finished
-// (state.currentPost lags by ~1s — see finishLoad below). Without this guard
-// every prefetch finishing inside the 1s window re-triggers the same render
-// because state.currentPost still points at the previous post.
+// (state.currentPost can lag by up to CURRENT_POST_GRACE_MS — see finishLoad
+// below). Without this guard every prefetch finishing inside that window
+// re-triggers the same render because state.currentPost still points at the
+// previous post.
 let inFlightPostId = null;
+
+// How long state.currentPost — and so what SPACE saves and B blocks — trails
+// a rendered frame on an automatic advance: a save pressed just as the post
+// switches still targets the one the user was looking at.
+const CURRENT_POST_GRACE_MS = 1000;
+// A post the user asked for (ArrowRight / ArrowLeft) skips that grace window:
+// they navigated to it deliberately, so a save pressed right after the press
+// must hit it, not the post they navigated away from. The deadline bounds the
+// wait for the server's `playback` reply, so a nav whose frame never lands
+// can't strip the grace off a later automatic advance. Mirrors native-kiosk's
+// _nav_intent_until.
+const NAV_INTENT_WINDOW_MS = 10000;
+let navIntentUntil = 0;
+
+function markNavIntent() {
+    navIntentUntil = Date.now() + NAV_INTENT_WINDOW_MS;
+}
+
+function takeNavIntent() {
+    const live = Date.now() < navIntentUntil;
+    navIntentUntil = 0;
+    return live;
+}
 
 // Drop every cached blob and abort in-flight prefetch. Used when a
 // kiosk-side parameter that affects the /get URL (e.g. bright) flips
@@ -278,8 +302,8 @@ function startCrossfade(currentLayer, nextLayer) {
 
 export function crossfadeFullscreenMedia(container, newMediaUrl, postId, isVideo = false) {
     // Idempotent for callers that may re-fire for the same post within the
-    // ~1s state.currentPost-update window: bail if we're already rendering
-    // (or have just rendered) this id.
+    // state.currentPost-update window: bail if we're already rendering (or
+    // have just rendered) this id.
     if (postId && (postId === inFlightPostId || postId === state.currentPost)) return;
 
     const renderToken = ++currentRenderToken;
@@ -303,12 +327,14 @@ export function crossfadeFullscreenMedia(container, newMediaUrl, postId, isVideo
         // max(interval, durationMs), so a clip longer than the interval
         // delays the advance until it has played through.
         reportImageReady(postId, durationMs);
-        setTimeout(() => {
+        const promote = () => {
             if (renderToken !== currentRenderToken) return;
             state.currentPost = postId;
             if (inFlightPostId === postId) inFlightPostId = null;
             console.log('Current post:', postId);
-        }, 1000);
+        };
+        if (takeNavIntent()) promote();
+        else setTimeout(promote, CURRENT_POST_GRACE_MS);
     };
 
     const handleError = () => {
@@ -416,6 +442,7 @@ export function requestNext() {
     // Forward exits any "previous" hold and returns to live server playback.
     playbackSuppressedUntil = 0;
     backSteps = 0;
+    markNavIntent();
     if (state.socket && state.socket.readyState === WebSocket.OPEN) {
         state.socket.send(JSON.stringify({ sessionId: KIOSK_SESSION_ID, action: 'requestNext' }));
     }
@@ -435,6 +462,7 @@ export function requestPrev() {
     const post = history[targetIdx];
     const holdMs = Math.max(2000, Number(state.interval) || 15000);
     playbackSuppressedUntil = Date.now() + holdMs;
+    markNavIntent();
     renderHistoryPost(post);
 }
 
