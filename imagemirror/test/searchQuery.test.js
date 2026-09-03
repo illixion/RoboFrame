@@ -285,56 +285,53 @@ test('runSearch filters the blocklist in SQL — pages and the staleness probe',
 // /search turns `?cursor=<float>` into one object carrying both cursor
 // shapes, so the same bare float has to seed the deck in random order and
 // act as a row offset in a deterministic one.
-test("the route's bare-float cursor serves both order modes", async () => {
+test("the route's bare-number cursor serves both order modes", async () => {
     const db = stubDb({ rows: [{ _id: 1n, display_count: 0n, random_rank: 0.9 }] });
     const search = createSearch({ db });
-    const cursor = { origin: 0.4137, offset: 0 };
+    const cursor = { seed: 0.4137, offset: 0 };
 
-    // Random order: the float rotates the deck — the page is the head of the
-    // least-seen tier on that rotation, whatever its display_count is.
+    // Random order: the number seeds the caller's own ordering — the page is
+    // the head of the least-seen tier on that permutation, whatever its
+    // display_count is. A fraction is spread over the integer seed space.
     await search.runSearch({ q: 'cats', cursor, limit: 3 });
     const page = db.pages()[0];
-    assert.match(page, /\(\(r\.random_rank - 0\.4137\) \+ 1\.0\) % 1\.0 AS pos/);
-    assert.match(page, /ORDER BY r\.display_count ASC, pos ASC/);
-    assert.doesNotMatch(page, /display_count = 0/, 'a rotation is not a tuple cursor');
+    const seed = Math.floor(0.4137 * 2 ** 32);
+    assert.match(page, new RegExp(`\\(\\(hash\\(m\\._id, ${seed}\\) >> 11\\)::DOUBLE / 9007199254740992\\.0\\) AS random_rank`));
+    assert.match(page, /ORDER BY r\.display_count ASC, random_rank ASC/);
+    assert.doesNotMatch(page, /display_count = 0/, 'a seed is not a tuple cursor');
 
     await search.runSearch({ q: 'cats order:id', cursor: { ...cursor, offset: 12 }, limit: 3 });
     const deterministic = db.pages()[1];
     assert.match(deterministic, /OFFSET 12/);
-    assert.doesNotMatch(deterministic, /0\.4137/);
+    assert.doesNotMatch(deterministic, /hash\(/);
 });
 
-// Each orchestrator channel walks its own rotation of the deck. The cursor
-// filter is the cyclic interval from the cursor's rank round to the origin,
-// written as plain rank comparisons on both sides so the boundary row is
-// never skipped or repeated by a float-rounding mismatch.
-test('a rotated cursor pages the cyclic interval back to its origin', async () => {
+// Each orchestrator channel walks its own permutation of the deck: the rank
+// is a per-(id, seed) hash, and the cursor filter compares that same
+// expression so the boundary row is never skipped or repeated.
+test('a seeded cursor pages the keyed order and carries the seed forward', async () => {
     const rows = [{ _id: 1n, display_count: 2n, random_rank: 0.95 }, { _id: 2n, display_count: 2n, random_rank: 0.97 }];
     const db = stubDb({ rows });
     const search = createSearch({ db });
 
-    // Above the origin: everything up to the deck's end, then rank 0 up to it.
-    const { nextCursor } = await search.runSearch({ q: 'cats', cursor: { dc: 2, rank: 0.9, origin: 0.6 }, limit: 2 });
-    assert.match(db.pages()[0], /r\.display_count = 2 AND \(r\.random_rank > 0\.9 OR r\.random_rank < 0\.6\)/);
-    assert.deepEqual(nextCursor, { dc: 2, rank: 0.97, origin: 0.6 }, 'the rotation rides along');
+    const { nextCursor } = await search.runSearch({ q: 'cats', cursor: { dc: 2, rank: 0.9, seed: 77 }, limit: 2 });
+    assert.match(db.pages()[0], /r\.display_count = 2 AND \(\(hash\(m\._id, 77\) >> 11\)::DOUBLE \/ 9007199254740992\.0\) > 0\.9\)/);
+    assert.deepEqual(nextCursor, { dc: 2, rank: 0.97, seed: 77 }, 'the seed rides along');
 
-    // Wrapped below the origin: only the gap left before it.
-    await search.runSearch({ q: 'cats', cursor: { dc: 2, rank: 0.1, origin: 0.6 }, limit: 2 });
-    assert.match(db.pages()[1], /r\.display_count = 2 AND \(r\.random_rank > 0\.1 AND r\.random_rank < 0\.6\)/);
-
-    // No rotation keeps the plain tuple filter and no `origin` in the cursor.
+    // No seed keeps the frozen random_rank order and no `seed` in the cursor.
     const plain = await search.runSearch({ q: 'cats', cursor: { dc: 2, rank: 0.1 }, limit: 2 });
-    assert.match(db.pages()[2], /r\.display_count = 2 AND r\.random_rank > 0\.1\)/);
+    assert.match(db.pages()[1], /r\.display_count = 2 AND r\.random_rank > 0\.1\)/);
+    assert.doesNotMatch(db.pages()[1], /hash\(/);
     assert.deepEqual(plain.nextCursor, { dc: 2, rank: 0.97 });
 });
 
-test('a stale rotated cursor restarts from its own origin, not rank 0', async () => {
+test('a stale seeded cursor restarts at the head of its own ordering', async () => {
     const db = stubDb({ rows: [{ _id: 5n, display_count: 1n, random_rank: 0.2 }], stale: true });
     const search = createSearch({ db });
-    await search.runSearch({ q: 'cats', cursor: { dc: 4, rank: 0.9, origin: 0.3 }, limit: 3 });
+    await search.runSearch({ q: 'cats', cursor: { dc: 4, rank: 0.9, seed: 5 }, limit: 3 });
     const page = db.pages()[0];
-    assert.doesNotMatch(page, /random_rank > 0\.9/);
-    assert.match(page, /r\.random_rank - 0\.3/, 'the restart keeps the rotation');
+    assert.doesNotMatch(page, / > 0\.9/);
+    assert.match(page, /hash\(m\._id, 5\)/, 'the restart keeps the ordering');
 });
 
 test('excludeIds keep queued-elsewhere posts off the page and out of the probe, with a fallback', async () => {

@@ -25,15 +25,20 @@
 //   - random (orderBy = RANDOM()): joins memory.random_ranks and orders by
 //     (display_count, random_rank) so unseen posts appear first; cursor is
 //     the (display_count, random_rank) tuple of the last row returned.
-//     A cursor may also carry an `origin` in [0, 1): the caller's own
-//     rotation of the deck. Within every tier the walk then starts at that
-//     rank and wraps around through rank 0 back up to it, so two callers
-//     with different origins reading the same least-seen tier start at
-//     different posts — whatever that tier's display_count happens to be.
-//     Without a rotation every fresh caller would open on the tier's
-//     lowest rank, and a fleet of displays coming up together (or all
-//     requeried at once by a shared-tags switch) would show the same
-//     posts in the same order. `origin` rides along in `nextCursor`.
+//     A cursor may also carry a `seed`: the caller's own ordering of the
+//     deck. The rank is then computed per row as a hash of (_id, seed)
+//     scaled to [0, 1) instead of read from random_rank, so every seed is
+//     an independent permutation of each tier — two callers reading the
+//     same least-seen tier open on different posts and walk it in
+//     different orders, whatever that tier's display_count happens to be,
+//     and a caller that re-rolls its seed per lap never sees the same
+//     sequence twice. Without one, every fresh caller would open on the
+//     frozen order's lowest rank, and a fleet of displays coming up
+//     together (or all requeried at once by a shared-tags switch) would
+//     show the same posts in the same order. The hash costs one cheap
+//     expression on a scan the page query does anyway (the join for
+//     display_count). `seed` rides along in `nextCursor`; a seedless
+//     cursor pages the frozen random_rank order.
 //     `excludeIds` keeps specific posts off a page — the orchestrator
 //     passes what its other channels have already queued, so displays
 //     drawing from one deck leapfrog instead of converging when only a
@@ -213,9 +218,9 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
         const excluded = excludeClause(excludeIds);
 
         const isRandom = orderBy === 'RANDOM()';
-        const origin = originOf(cursor);
-        // The rotated deck's head: what a null cursor means for this caller.
-        const head = origin ? { origin } : null;
+        const seed = seedOf(cursor);
+        // The head of this caller's ordering: what a null cursor means here.
+        const head = seed !== null ? { seed } : null;
         let effCursor = cursor;
         if (isRandom && effCursor && Math.floor(Number(effCursor.dc) || 0) > 0) {
             // Stale-cursor guard (see the header): a cursor above the deck's
@@ -268,7 +273,7 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
                     dc: Number(last.display_count) || 0,
                     rank: Number(last.random_rank),
                 };
-                if (origin) nextCursor.origin = origin;
+                if (seed !== null) nextCursor.seed = seed;
             } else {
                 const offset = (cursor && Number(cursor.offset)) || 0;
                 nextCursor = { offset: offset + effectiveLimit };
@@ -409,13 +414,33 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
     return { runSearch, runCount, runRandomOne, runRankedRandomOne, clearCache };
 }
 
-// A cursor's deck rotation, normalised to [0, 1); 0 (no rotation) when the
-// cursor carries none.
-function originOf(cursor) {
-    const o = cursor && typeof cursor === 'object' ? Number(cursor.origin) : NaN;
-    if (!Number.isFinite(o)) return 0;
-    const frac = o - Math.floor(o);
-    return frac > 0 && frac < 1 ? frac : 0;
+// Seeds are integers in [0, 2^32) so the SQL literal round-trips exactly.
+// A caller may hand over any finite number: a fraction is spread over that
+// range (the bare float /search accepts), anything else is truncated.
+const SEED_SPACE = 2 ** 32;
+function normalizeSeed(n) {
+    if (!Number.isFinite(n)) return null;
+    if (Number.isInteger(n) && n >= 0 && n < SEED_SPACE) return n;
+    const frac = n - Math.floor(n);
+    return Math.floor(frac * SEED_SPACE);
+}
+function seedOf(cursor) {
+    if (!cursor || typeof cursor !== 'object' || cursor.seed === undefined || cursor.seed === null) return null;
+    return normalizeSeed(Number(cursor.seed));
+}
+function randomSeed() {
+    return Math.floor(Math.random() * SEED_SPACE);
+}
+
+// The rank a row sorts by in random order: the frozen random_rank for a
+// seedless caller, otherwise a per-(_id, seed) hash scaled to a double in
+// [0, 1). 53 bits of the 64-bit hash go into the mantissa, so the value the
+// row reports and the value a cursor filter compares against are the same
+// exact double — no boundary row is skipped or repeated.
+function rankExpr(seed) {
+    return seed === null
+        ? 'r.random_rank'
+        : `((hash(m._id, ${seed}) >> 11)::DOUBLE / 9007199254740992.0)`;
 }
 
 function excludeClause(ids) {
@@ -424,41 +449,32 @@ function excludeClause(ids) {
 }
 
 function buildRandomPageSql({ table, cursor, limit, blocked = '' }) {
-    const origin = originOf(cursor);
+    const seed = seedOf(cursor);
+    const rank = rankExpr(seed);
     let pageFilter = '';
     if (cursor && typeof cursor === 'object' && Number.isFinite(cursor.rank)) {
         const dc = Number(cursor.dc) || 0;
-        const rank = Number(cursor.rank);
-        // "Still ahead of the cursor" on the rotated tier is the cyclic
-        // interval from the cursor's rank round to the origin: up to the
-        // deck's end and then from rank 0 while the cursor is above the
-        // origin, only the gap below the origin once it has wrapped. Both
-        // ends compare stored ranks directly so no float trick can skip or
-        // repeat the boundary row.
-        let ahead;
-        if (!origin) ahead = `r.random_rank > ${rank}`;
-        else if (rank >= origin) ahead = `(r.random_rank > ${rank} OR r.random_rank < ${origin})`;
-        else ahead = `(r.random_rank > ${rank} AND r.random_rank < ${origin})`;
-        pageFilter = ` AND (r.display_count > ${dc} OR (r.display_count = ${dc} AND ${ahead}))`;
+        const after = Number(cursor.rank);
+        pageFilter = ` AND (r.display_count > ${dc} OR (r.display_count = ${dc} AND ${rank} > ${after}))`;
     }
-    // Position within a tier, on this caller's rotation of the deck.
-    const pos = origin ? `((r.random_rank - ${origin}) + 1.0) % 1.0` : 'r.random_rank';
     // Narrow id pick first, then hydrate the full rows; the hydration joins
-    // don't preserve order, hence the outer re-ORDER.
+    // don't preserve order, hence the outer re-ORDER. The page reports the
+    // rank it sorted by as random_rank, whichever expression that was, so
+    // nextCursor is built the same way for both orders.
     return `
         WITH page AS (
-            SELECT m._id, r.random_rank, r.display_count, ${pos} AS pos
+            SELECT m._id, ${rank} AS random_rank, r.display_count
             FROM ${table} m
             JOIN memory.random_ranks r ON r._id = m._id
             WHERE TRUE${blocked}${pageFilter}
-            ORDER BY r.display_count ASC, pos ASC
+            ORDER BY r.display_count ASC, random_rank ASC
             LIMIT ${limit}
         )
         SELECT p.*, pp.path, page.random_rank, page.display_count
         FROM page
         JOIN file_db.posts p ON p._id = page._id
         LEFT JOIN file_db.posts_paths pp ON pp._id = page._id
-        ORDER BY page.display_count ASC, page.pos ASC;
+        ORDER BY page.display_count ASC, page.random_rank ASC;
     `;
 }
 
@@ -481,4 +497,4 @@ function buildDeterministicPageSql({ table, orderBy, cursor, limit, blocked = ''
     `;
 }
 
-module.exports = { createSearch };
+module.exports = { createSearch, randomSeed };

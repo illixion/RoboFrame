@@ -1287,11 +1287,11 @@ test('invalid getRatioWindow values fall back to the 0.15 default', async (t) =>
         'a non-numeric window should fall back to the default');
 });
 
-// Every channel walks its own rotation of the deck and keeps off what its
+// Every channel walks its own ordering of the deck and keeps off what its
 // neighbours have already queued — the two things that stop windows brought
 // up together (a server restart, a shared-tags switch) from opening on the
 // same posts once the whole deck has been seen the same number of times.
-test('channels refill on distinct deck rotations and exclude each other\'s queues', async (t) => {
+test('channels refill on distinct deck orderings and exclude each other\'s queues', async (t) => {
     // Full pages, so each refill is exactly one search call.
     const page = (from) => ({
         results: Array.from({ length: 5 }, (_, i) => ({ _id: from + i, file_ext: 'jpg' })),
@@ -1307,18 +1307,58 @@ test('channels refill on distinct deck rotations and exclude each other\'s queue
     await tick(); await tick();
 
     const [firstA, firstB] = [search.searchArgs[0], search.searchArgs[1]];
-    assert.ok(firstA.cursor.origin > 0 && firstA.cursor.origin < 1, 'a fresh channel opens at its own rotation');
-    assert.notEqual(firstA.cursor.origin, firstB.cursor.origin, 'channels do not share a rotation');
+    assert.ok(Number.isInteger(firstA.cursor.seed), 'a fresh channel opens on its own ordering');
+    assert.notEqual(firstA.cursor.seed, firstB.cursor.seed, 'channels do not share an ordering');
     assert.deepEqual(firstA.excludeIds, [], 'nothing queued elsewhere yet');
     assert.deepEqual(firstB.excludeIds, [1, 2, 3, 4, 5], 'b keeps off what a has queued');
 
-    // A requery (setModTags, setTagList, reshuffle) re-rolls the rotation:
-    // restarting every channel at its old origin of a new deck would still
-    // line them up on the same head.
-    const before = firstA.cursor.origin;
+    // A requery (setModTags, setTagList, reshuffle) re-rolls the ordering:
+    // restarting every channel at the head of its old ordering of a new
+    // deck would still line up any that happened to agree.
+    const before = firstA.cursor.seed;
     orch.setModTags(a, ['rating:s']);
     await tick(); await tick();
     const after = search.lastArgs;
-    assert.ok(after.cursor.origin > 0 && after.cursor.origin < 1);
-    assert.notEqual(after.cursor.origin, before, 'clearAndRefill rolls a new origin');
+    assert.ok(Number.isInteger(after.cursor.seed));
+    assert.notEqual(after.cursor.seed, before, 'clearAndRefill rolls a new seed');
+});
+
+// A lap ends when the walk runs off the deck or climbs into the next tier.
+// Each new lap gets a new ordering so a viewer never sees the same sequence
+// twice; the cursor restarts at that ordering's head.
+test('a channel re-rolls its ordering at the end of a lap', async (t) => {
+    const page = (from, nextCursor) => ({
+        results: Array.from({ length: 5 }, (_, i) => ({ _id: from + i, file_ext: 'jpg' })),
+        nextCursor,
+    });
+    const { orch, search } = harness({
+        pages: [
+            page(1, { dc: 0, rank: 0.5, seed: 9 }),   // mid-lap: cursor continues, seed kept
+            page(6, { dc: 1, rank: 0.1, seed: 9 }),   // climbed a tier: new lap
+            page(11, null),                           // ran off the deck: new lap
+            page(16, { dc: 1, rank: 0.2 }),
+        ],
+    });
+    t.after(() => orch.close());
+    const ws = makeFakeWs();
+    orch.register(ws, { deviceId: 'wall', interval: 15000 });
+    await tick(); await tick();
+    const seed0 = search.searchArgs[0].cursor.seed;
+
+    // Drain the queue so refills run; each refill is one search call.
+    const drain = async () => {
+        for (let i = 0; i < 5; i++) orch.requestAdvance(ws);
+        await tick(); await tick();
+    };
+    await drain();
+    assert.deepEqual(search.searchArgs[1].cursor, { dc: 0, rank: 0.5, seed: 9 }, 'mid-lap the cursor continues');
+    await drain();
+    const c2 = search.searchArgs[2].cursor;
+    assert.equal(c2.rank, undefined, 'a tier climb restarts at the head');
+    assert.notEqual(c2.seed, 9, 'with a new ordering');
+    await drain();
+    const c3 = search.searchArgs[3].cursor;
+    assert.equal(c3.rank, undefined, 'running off the deck restarts at the head');
+    assert.notEqual(c3.seed, c2.seed, 'with another new ordering');
+    assert.notEqual(c3.seed, seed0);
 });

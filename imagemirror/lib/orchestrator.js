@@ -64,6 +64,8 @@
 //   belongs to this channel. One frame can therefore satisfy N sessions
 //   when multiple windows on one device share a connection.
 
+const { randomSeed } = require('./searchQuery');
+
 const VIDEO_EXTS = new Set(['webm', 'mp4']);
 function isVideoExt(ext) {
     return VIDEO_EXTS.has(String(ext || '').toLowerCase());
@@ -189,16 +191,18 @@ function createOrchestrator({
             sessions: new Map(),
             queue: [],                   // [{ id, ext }]
             // Paging position in the search layer; null means the head of
-            // this channel's rotation of the deck (see `origin`).
+            // this channel's own ordering of the deck (see `seed`).
             cursor: null,
-            // The channel's own rotation of the random_ranks deck: within
-            // whichever tier is least-seen, its walk starts at this rank and
-            // wraps round through rank 0. Channels coming up together — every
-            // window after a server restart, every channel requeried by a
-            // shared-tags switch — therefore open on different posts even
-            // when the whole deck has been seen the same number of times.
+            // The channel's ordering of the deck: the search layer ranks
+            // posts by a hash of (id, seed), so each channel walks its own
+            // permutation of whichever tier is least-seen. Channels coming
+            // up together — every window after a server restart, every
+            // channel requeried by a shared-tags switch — therefore open on
+            // different posts and never share a sequence, even when the
+            // whole deck has been seen the same number of times. Re-rolled
+            // every lap so one channel doesn't repeat its own order either.
             // Deterministic queries ignore it (they page by cursor.offset).
-            origin: Math.random(),
+            seed: randomSeed(),
             modTags: [],
             // Index into getTagLists() that this channel uses for its base
             // tags. Per-channel so two displays can run different lists
@@ -498,7 +502,7 @@ function createOrchestrator({
                 // rows the filter below drops anyway. The in-JS filter stays
                 // as the backstop for a data.json edit landing mid-refill.
                 const { results, nextCursor } = await search.runSearch({
-                    q, cursor: channel.cursor || { origin: channel.origin }, limit: fetchSize,
+                    q, cursor: channel.cursor || { seed: channel.seed }, limit: fetchSize,
                     blockedIds: getBlockedIds() || [],
                     blockedTags: getBlockedTags() || [],
                     excludeIds: queuedElsewhere(channel),
@@ -528,7 +532,18 @@ function createOrchestrator({
                     channel.queue.push(entry);
                 }
                 const added = channel.queue.length - beforeLen;
-                channel.cursor = nextCursor || null;
+                // A new lap — the walk ran off the deck's end, or climbed
+                // into the next tier because the one it was on is spent —
+                // gets a new ordering, so the sequence a viewer sees never
+                // repeats from lap to lap. Restarting at the new order's
+                // head is what least-seen-first wants here anyway: the tier
+                // the cursor climbed into is the deck's least-seen one now,
+                // and if it isn't, the stale-cursor guard would have sent
+                // the walk back to the head on the next page regardless.
+                const prevDc = channel.cursor ? Number(channel.cursor.dc) || 0 : null;
+                const newLap = !nextCursor || (prevDc !== null && (Number(nextCursor.dc) || 0) > prevDc);
+                if (newLap) channel.seed = randomSeed();
+                channel.cursor = newLap ? null : nextCursor;
                 attempts += 1;
 
                 if (added === 0 && !channel.cursor) break;
@@ -562,10 +577,11 @@ function createOrchestrator({
     async function clearAndRefill(channel) {
         channel.queue.length = 0;
         channel.cursor = null;
-        // A fresh rotation too: in shared-tags mode every channel is
-        // requeried at once, and restarting them all from the same point
-        // of the new deck would put the same posts on every screen.
-        channel.origin = Math.random();
+        // A fresh ordering too: in shared-tags mode every channel is
+        // requeried at once, and restarting them all at the head of their
+        // previous orderings of the new deck would still line up any that
+        // happened to agree.
+        channel.seed = randomSeed();
         channel.refillGen += 1;
         // Wait for any in-flight refill to drain so its (aborted) results
         // can't race ahead of ours. The gen bump above guarantees that
