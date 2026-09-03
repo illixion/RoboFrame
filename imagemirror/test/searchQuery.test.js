@@ -288,15 +288,66 @@ test('runSearch filters the blocklist in SQL — pages and the staleness probe',
 test("the route's bare-float cursor serves both order modes", async () => {
     const db = stubDb({ rows: [{ _id: 1n, display_count: 0n, random_rank: 0.9 }] });
     const search = createSearch({ db });
-    const cursor = { dc: 0, rank: 0.4137, offset: 0 };
+    const cursor = { origin: 0.4137, offset: 0 };
 
+    // Random order: the float rotates the deck — the page is the head of the
+    // least-seen tier on that rotation, whatever its display_count is.
     await search.runSearch({ q: 'cats', cursor, limit: 3 });
-    assert.match(db.pages()[0], /r\.display_count = 0 AND r\.random_rank > 0\.4137/);
+    const page = db.pages()[0];
+    assert.match(page, /\(\(r\.random_rank - 0\.4137\) \+ 1\.0\) % 1\.0 AS pos/);
+    assert.match(page, /ORDER BY r\.display_count ASC, pos ASC/);
+    assert.doesNotMatch(page, /display_count = 0/, 'a rotation is not a tuple cursor');
 
     await search.runSearch({ q: 'cats order:id', cursor: { ...cursor, offset: 12 }, limit: 3 });
     const deterministic = db.pages()[1];
     assert.match(deterministic, /OFFSET 12/);
     assert.doesNotMatch(deterministic, /0\.4137/);
+});
+
+// Each orchestrator channel walks its own rotation of the deck. The cursor
+// filter is the cyclic interval from the cursor's rank round to the origin,
+// written as plain rank comparisons on both sides so the boundary row is
+// never skipped or repeated by a float-rounding mismatch.
+test('a rotated cursor pages the cyclic interval back to its origin', async () => {
+    const rows = [{ _id: 1n, display_count: 2n, random_rank: 0.95 }, { _id: 2n, display_count: 2n, random_rank: 0.97 }];
+    const db = stubDb({ rows });
+    const search = createSearch({ db });
+
+    // Above the origin: everything up to the deck's end, then rank 0 up to it.
+    const { nextCursor } = await search.runSearch({ q: 'cats', cursor: { dc: 2, rank: 0.9, origin: 0.6 }, limit: 2 });
+    assert.match(db.pages()[0], /r\.display_count = 2 AND \(r\.random_rank > 0\.9 OR r\.random_rank < 0\.6\)/);
+    assert.deepEqual(nextCursor, { dc: 2, rank: 0.97, origin: 0.6 }, 'the rotation rides along');
+
+    // Wrapped below the origin: only the gap left before it.
+    await search.runSearch({ q: 'cats', cursor: { dc: 2, rank: 0.1, origin: 0.6 }, limit: 2 });
+    assert.match(db.pages()[1], /r\.display_count = 2 AND \(r\.random_rank > 0\.1 AND r\.random_rank < 0\.6\)/);
+
+    // No rotation keeps the plain tuple filter and no `origin` in the cursor.
+    const plain = await search.runSearch({ q: 'cats', cursor: { dc: 2, rank: 0.1 }, limit: 2 });
+    assert.match(db.pages()[2], /r\.display_count = 2 AND r\.random_rank > 0\.1\)/);
+    assert.deepEqual(plain.nextCursor, { dc: 2, rank: 0.97 });
+});
+
+test('a stale rotated cursor restarts from its own origin, not rank 0', async () => {
+    const db = stubDb({ rows: [{ _id: 5n, display_count: 1n, random_rank: 0.2 }], stale: true });
+    const search = createSearch({ db });
+    await search.runSearch({ q: 'cats', cursor: { dc: 4, rank: 0.9, origin: 0.3 }, limit: 3 });
+    const page = db.pages()[0];
+    assert.doesNotMatch(page, /random_rank > 0\.9/);
+    assert.match(page, /r\.random_rank - 0\.3/, 'the restart keeps the rotation');
+});
+
+test('excludeIds keep queued-elsewhere posts off the page and out of the probe, with a fallback', async () => {
+    const db = stubDb({ rows: [] });
+    const search = createSearch({ db });
+    await search.runSearch({ q: 'cats', cursor: { dc: 2, rank: 0.5 }, limit: 3, excludeIds: [7, 8] });
+    assert.match(db.probes()[0], /m\._id NOT IN \(7, 8\)/);
+    const pages = db.pages();
+    assert.match(pages[0], /m\._id NOT IN \(7, 8\)/);
+    // The stub returned nothing, so the page re-ran without the exclusions:
+    // a deck with nothing else left still serves rather than reading empty.
+    assert.equal(pages.length, 2);
+    assert.doesNotMatch(pages[1], /NOT IN \(7, 8\)/);
 });
 
 // A random cursor lands near the deck's end sometimes; /search asks for a

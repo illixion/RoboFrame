@@ -19,6 +19,7 @@ function makeFakeSearch(pages) {
             return page;
         },
         get lastArgs() { return searchArgs[searchArgs.length - 1]; },
+        get searchArgs() { return searchArgs; },
         clearCache() { call = 0; },
         get callCount() { return call; },
         get queries() { return queries; },
@@ -1284,4 +1285,40 @@ test('invalid getRatioWindow values fall back to the 0.15 default', async (t) =>
     // Falls back to ±15% → 1.70..2.30.
     assert.ok(queries.every((q) => /ratio:1\.70\.\.2\.30/.test(q)),
         'a non-numeric window should fall back to the default');
+});
+
+// Every channel walks its own rotation of the deck and keeps off what its
+// neighbours have already queued — the two things that stop windows brought
+// up together (a server restart, a shared-tags switch) from opening on the
+// same posts once the whole deck has been seen the same number of times.
+test('channels refill on distinct deck rotations and exclude each other\'s queues', async (t) => {
+    // Full pages, so each refill is exactly one search call.
+    const page = (from) => ({
+        results: Array.from({ length: 5 }, (_, i) => ({ _id: from + i, file_ext: 'jpg' })),
+        nextCursor: { dc: 0, rank: 0.5 },
+    });
+    const { orch, search } = harness({ pages: [page(1), page(6), page(11)] });
+    t.after(() => orch.close());
+    const a = makeFakeWs();
+    const b = makeFakeWs();
+    orch.register(a, { deviceId: 'wall-a', interval: 15000 });
+    await tick(); await tick();
+    orch.register(b, { deviceId: 'wall-b', interval: 15000 });
+    await tick(); await tick();
+
+    const [firstA, firstB] = [search.searchArgs[0], search.searchArgs[1]];
+    assert.ok(firstA.cursor.origin > 0 && firstA.cursor.origin < 1, 'a fresh channel opens at its own rotation');
+    assert.notEqual(firstA.cursor.origin, firstB.cursor.origin, 'channels do not share a rotation');
+    assert.deepEqual(firstA.excludeIds, [], 'nothing queued elsewhere yet');
+    assert.deepEqual(firstB.excludeIds, [1, 2, 3, 4, 5], 'b keeps off what a has queued');
+
+    // A requery (setModTags, setTagList, reshuffle) re-rolls the rotation:
+    // restarting every channel at its old origin of a new deck would still
+    // line them up on the same head.
+    const before = firstA.cursor.origin;
+    orch.setModTags(a, ['rating:s']);
+    await tick(); await tick();
+    const after = search.lastArgs;
+    assert.ok(after.cursor.origin > 0 && after.cursor.origin < 1);
+    assert.notEqual(after.cursor.origin, before, 'clearAndRefill rolls a new origin');
 });

@@ -188,11 +188,17 @@ function createOrchestrator({
             // mirrored on `channel.modTags` — last-write-wins, see register).
             sessions: new Map(),
             queue: [],                   // [{ id, ext }]
-            // Seed each channel at a random point in random_ranks order so
-            // two channels coming up at the same time don't show the same
-            // dc=0 head of the queue. Deterministic queries ignore this
-            // shape (they read cursor.offset, which is absent here → 0).
-            cursor: { dc: 0, rank: Math.random() },
+            // Paging position in the search layer; null means the head of
+            // this channel's rotation of the deck (see `origin`).
+            cursor: null,
+            // The channel's own rotation of the random_ranks deck: within
+            // whichever tier is least-seen, its walk starts at this rank and
+            // wraps round through rank 0. Channels coming up together — every
+            // window after a server restart, every channel requeried by a
+            // shared-tags switch — therefore open on different posts even
+            // when the whole deck has been seen the same number of times.
+            // Deterministic queries ignore it (they page by cursor.offset).
+            origin: Math.random(),
             modTags: [],
             // Index into getTagLists() that this channel uses for its base
             // tags. Per-channel so two displays can run different lists
@@ -451,6 +457,21 @@ function createOrchestrator({
         return false;
     }
 
+    // Posts sitting in another live channel's queue are about to appear on
+    // that screen. Keeping them off this channel's pages makes displays that
+    // draw from the same deck leapfrog through the last of a least-seen tier
+    // instead of converging on the same slice of it. Parked channels don't
+    // count — nobody is watching them, and their queues would otherwise hold
+    // posts back from every other display for the life of the process.
+    function queuedElsewhere(channel) {
+        const ids = [];
+        for (const other of channels.values()) {
+            if (other === channel || other.parked) continue;
+            for (const entry of other.queue) ids.push(entry.id);
+        }
+        return ids;
+    }
+
     function refillQueue(channel, opts = {}) {
         if (channel.refillPromise) return channel.refillPromise;
         const minSize = opts.minSize ?? MIN_QUEUE_SIZE;
@@ -477,9 +498,10 @@ function createOrchestrator({
                 // rows the filter below drops anyway. The in-JS filter stays
                 // as the backstop for a data.json edit landing mid-refill.
                 const { results, nextCursor } = await search.runSearch({
-                    q, cursor: channel.cursor, limit: fetchSize,
+                    q, cursor: channel.cursor || { origin: channel.origin }, limit: fetchSize,
                     blockedIds: getBlockedIds() || [],
                     blockedTags: getBlockedTags() || [],
+                    excludeIds: queuedElsewhere(channel),
                 });
                 // If clearAndRefill ran while we were awaiting, the query
                 // context has changed under us — drop these results instead
@@ -540,6 +562,10 @@ function createOrchestrator({
     async function clearAndRefill(channel) {
         channel.queue.length = 0;
         channel.cursor = null;
+        // A fresh rotation too: in shared-tags mode every channel is
+        // requeried at once, and restarting them all from the same point
+        // of the new deck would put the same posts on every screen.
+        channel.origin = Math.random();
         channel.refillGen += 1;
         // Wait for any in-flight refill to drain so its (aborted) results
         // can't race ahead of ours. The gen bump above guarantees that

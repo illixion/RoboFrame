@@ -25,6 +25,19 @@
 //   - random (orderBy = RANDOM()): joins memory.random_ranks and orders by
 //     (display_count, random_rank) so unseen posts appear first; cursor is
 //     the (display_count, random_rank) tuple of the last row returned.
+//     A cursor may also carry an `origin` in [0, 1): the caller's own
+//     rotation of the deck. Within every tier the walk then starts at that
+//     rank and wraps around through rank 0 back up to it, so two callers
+//     with different origins reading the same least-seen tier start at
+//     different posts — whatever that tier's display_count happens to be.
+//     Without a rotation every fresh caller would open on the tier's
+//     lowest rank, and a fleet of displays coming up together (or all
+//     requeried at once by a shared-tags switch) would show the same
+//     posts in the same order. `origin` rides along in `nextCursor`.
+//     `excludeIds` keeps specific posts off a page — the orchestrator
+//     passes what its other channels have already queued, so displays
+//     drawing from one deck leapfrog instead of converging when only a
+//     sliver of the least-seen tier is left.
 //     A cursor is only honoured while it still points at the deck's
 //     least-seen tier: displaying a post bumps its display_count, which
 //     re-sorts it *after* the cursor, so a walking cursor is perpetually fed
@@ -188,15 +201,21 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
     // posts never occupy pages — a blocked post is never shown, so its
     // display_count never moves, and left in the deck it would pin the
     // least-seen tier forever and burn every page on rows the caller drops.
-    async function runSearch({ q = '', cursor = null, limit, wrap = false, blockedIds = [], blockedTags = [] } = {}) {
+    async function runSearch({
+        q = '', cursor = null, limit, wrap = false, blockedIds = [], blockedTags = [], excludeIds = [],
+    } = {}) {
         const parsed = parseQuery(q);
         const { limit: parsedLimit, orderBy } = parsed;
         const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : parsedLimit;
         const set = await getMatchSet(composeWhere(parsed));
         if (set.count === 0) return { results: [], nextCursor: null };
         const blocked = await blockedClause({ blockedIds, blockedTags });
+        const excluded = excludeClause(excludeIds);
 
         const isRandom = orderBy === 'RANDOM()';
+        const origin = originOf(cursor);
+        // The rotated deck's head: what a null cursor means for this caller.
+        const head = origin ? { origin } : null;
         let effCursor = cursor;
         if (isRandom && effCursor && Math.floor(Number(effCursor.dc) || 0) > 0) {
             // Stale-cursor guard (see the header): a cursor above the deck's
@@ -211,23 +230,27 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
                 SELECT 1 AS stale
                 FROM ${set.table} m
                 JOIN memory.random_ranks r ON r._id = m._id
-                WHERE r.display_count < ${dc}${blocked}
+                WHERE r.display_count < ${dc}${blocked}${excluded}
                 LIMIT 1;
             `);
-            if (behind.length > 0) effCursor = null;
+            if (behind.length > 0) effCursor = head;
         }
-        const sql = isRandom
-            ? buildRandomPageSql({ table: set.table, cursor: effCursor, limit: effectiveLimit, blocked })
-            : buildDeterministicPageSql({ table: set.table, orderBy, cursor: effCursor, limit: effectiveLimit, blocked });
-        const rows = await allAsync(sql);
+        const pageSql = (excl) => (isRandom
+            ? buildRandomPageSql({ table: set.table, cursor: effCursor, limit: effectiveLimit, blocked: blocked + excl })
+            : buildDeterministicPageSql({ table: set.table, orderBy, cursor: effCursor, limit: effectiveLimit, blocked: blocked + excl }));
+        let rows = await allAsync(pageSql(excluded));
+        // Exclusions are a preference, not a rule: when nothing else is left
+        // (a deck smaller than the other channels' queues) serve the page
+        // anyway rather than report an empty query.
+        if (rows.length === 0 && excluded) rows = await allAsync(pageSql(''));
 
         let wrapped = false;
-        if (wrap && isRandom && effCursor && rows.length < effectiveLimit) {
+        if (wrap && isRandom && effCursor && Number.isFinite(effCursor.rank) && rows.length < effectiveLimit) {
             const seen = new Set(rows.map((r) => String(r._id)));
-            const head = await allAsync(buildRandomPageSql({
-                table: set.table, cursor: null, limit: effectiveLimit, blocked,
+            const headRows = await allAsync(buildRandomPageSql({
+                table: set.table, cursor: head, limit: effectiveLimit, blocked: blocked + excluded,
             }));
-            for (const row of head) {
+            for (const row of headRows) {
                 if (rows.length >= effectiveLimit) break;
                 if (seen.has(String(row._id))) continue;
                 rows.push(row);
@@ -245,6 +268,7 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
                     dc: Number(last.display_count) || 0,
                     rank: Number(last.random_rank),
                 };
+                if (origin) nextCursor.origin = origin;
             } else {
                 const offset = (cursor && Number(cursor.offset)) || 0;
                 nextCursor = { offset: offset + effectiveLimit };
@@ -385,29 +409,56 @@ function createSearch({ db, maxSets = 16, expander = identityExpander(), hasPost
     return { runSearch, runCount, runRandomOne, runRankedRandomOne, clearCache };
 }
 
+// A cursor's deck rotation, normalised to [0, 1); 0 (no rotation) when the
+// cursor carries none.
+function originOf(cursor) {
+    const o = cursor && typeof cursor === 'object' ? Number(cursor.origin) : NaN;
+    if (!Number.isFinite(o)) return 0;
+    const frac = o - Math.floor(o);
+    return frac > 0 && frac < 1 ? frac : 0;
+}
+
+function excludeClause(ids) {
+    const list = (ids || []).map(Number).filter((n) => Number.isFinite(n));
+    return list.length ? ` AND m._id NOT IN (${list.join(', ')})` : '';
+}
+
 function buildRandomPageSql({ table, cursor, limit, blocked = '' }) {
+    const origin = originOf(cursor);
     let pageFilter = '';
     if (cursor && typeof cursor === 'object' && Number.isFinite(cursor.rank)) {
         const dc = Number(cursor.dc) || 0;
         const rank = Number(cursor.rank);
-        pageFilter = ` AND (r.display_count > ${dc} OR (r.display_count = ${dc} AND r.random_rank > ${rank}))`;
+        // "Still ahead of the cursor" on the rotated tier is the cyclic
+        // interval from the cursor's rank round to the origin: up to the
+        // deck's end and then from rank 0 while the cursor is above the
+        // origin, only the gap below the origin once it has wrapped. Both
+        // ends compare stored ranks directly so no float trick can skip or
+        // repeat the boundary row.
+        let ahead;
+        if (!origin) ahead = `r.random_rank > ${rank}`;
+        else if (rank >= origin) ahead = `(r.random_rank > ${rank} OR r.random_rank < ${origin})`;
+        else ahead = `(r.random_rank > ${rank} AND r.random_rank < ${origin})`;
+        pageFilter = ` AND (r.display_count > ${dc} OR (r.display_count = ${dc} AND ${ahead}))`;
     }
+    // Position within a tier, on this caller's rotation of the deck.
+    const pos = origin ? `((r.random_rank - ${origin}) + 1.0) % 1.0` : 'r.random_rank';
     // Narrow id pick first, then hydrate the full rows; the hydration joins
     // don't preserve order, hence the outer re-ORDER.
     return `
         WITH page AS (
-            SELECT m._id, r.random_rank, r.display_count
+            SELECT m._id, r.random_rank, r.display_count, ${pos} AS pos
             FROM ${table} m
             JOIN memory.random_ranks r ON r._id = m._id
             WHERE TRUE${blocked}${pageFilter}
-            ORDER BY r.display_count ASC, r.random_rank ASC
+            ORDER BY r.display_count ASC, pos ASC
             LIMIT ${limit}
         )
         SELECT p.*, pp.path, page.random_rank, page.display_count
         FROM page
         JOIN file_db.posts p ON p._id = page._id
         LEFT JOIN file_db.posts_paths pp ON pp._id = page._id
-        ORDER BY page.display_count ASC, page.random_rank ASC;
+        ORDER BY page.display_count ASC, page.pos ASC;
     `;
 }
 

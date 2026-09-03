@@ -1464,25 +1464,31 @@ app.get('/count', async (req, res) => {
 
 // Paging position for /search, in the two shapes runSearch understands.
 //
-//   "dc,rank"  the random deck's (display_count, random_rank) tuple — what
-//              `nextCursor` carries in the default random order, so a client
-//              walking a multi-page result feeds it straight back.
+//   "dc,rank[,origin]"  the random deck's (display_count, random_rank) tuple
+//              plus the caller's deck rotation — what `nextCursor` carries in
+//              the default random order, so a client walking a multi-page
+//              result feeds it straight back.
 //   "N"        a bare number: the row offset for `order:id|score|score_asc`,
-//              and in random order a point in the dc=0 tier — the seeding
-//              trick a one-shot client uses to land on an arbitrary window.
+//              and in random order a rotation of the deck — the walk starts
+//              at that rank of the least-seen tier and wraps round, the
+//              seeding trick a one-shot client uses to land on an arbitrary
+//              window (and the same one every orchestrator channel uses).
 function parseSearchCursor(raw) {
   if (raw === undefined || raw === null || raw === '') return null;
   const str = String(raw);
   if (str.includes(',')) {
-    const [dcStr, rankStr] = str.split(',');
+    const [dcStr, rankStr, originStr] = str.split(',');
     const dc = Number(dcStr);
     const rank = Number(rankStr);
     if (!Number.isFinite(dc) || !Number.isFinite(rank)) return null;
-    return { dc: Math.max(0, Math.floor(dc)), rank, offset: 0 };
+    const cursor = { dc: Math.max(0, Math.floor(dc)), rank, offset: 0 };
+    const origin = Number(originStr);
+    if (originStr !== undefined && Number.isFinite(origin)) cursor.origin = origin - Math.floor(origin);
+    return cursor;
   }
   const n = Number(str);
   if (!Number.isFinite(n)) return null;
-  return { dc: 0, rank: n, offset: Math.max(0, Math.floor(n)) };
+  return { origin: n - Math.floor(n), offset: Math.max(0, Math.floor(n)) };
 }
 
 // Run a query string through the same search layer the orchestrator uses.
@@ -1490,15 +1496,16 @@ function parseSearchCursor(raw) {
 //   q=      raw query (see lib/parseQuery.js for the syntax)
 //   limit=  page size override
 //   cursor= paging position. In the default random order this is a bare float
-//           in [0, 1) — a starting offset into the frozen random_ranks deck,
-//           the same seeding trick each orchestrator channel uses so two
+//           in [0, 1) — a rotation of the frozen random_ranks deck: the page
+//           starts at that rank of the least-seen tier and wraps round, the
+//           same seeding trick each orchestrator channel uses so two
 //           displays coming up together don't both get the deck's head. A
 //           fresh random float per call is how a one-shot client (e.g. an iOS
 //           Shortcut building a grid) gets an arbitrary window of N distinct
 //           posts in one request. For `order:id|score|score_asc` it's the
 //           row offset instead. Feed `nextCursor` back for the next page as
-//           `dc,rank` (random order) or a bare offset (deterministic order) —
-//           see parseSearchCursor.
+//           `dc,rank,origin` (random order) or a bare offset (deterministic
+//           order) — see parseSearchCursor.
 //   list=   join the server-side tag list at index N (combined with q). When
 //           omitted, defaults to the active global list index in shared-tag
 //           mode, or list 0 otherwise.

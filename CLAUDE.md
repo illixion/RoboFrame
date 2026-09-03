@@ -200,8 +200,18 @@ the deadline) is the canary for the wake-advance class of bug.
   it serves keep re-sorting in ahead of it), so `runSearch` restarts any
   cursor that has climbed above the deck's least-seen tier from the head —
   without that guard everything behind the cursor is orphaned and a display
-  visibly loops the small slice ahead of it. `test/searchQuery.deck.test.js`
-  is the regression test, on the real DuckDB engine. `/browse` instead sends
+  visibly loops the small slice ahead of it. "Head" is per caller: a cursor
+  carries an `origin` in [0, 1), its own rotation of the deck, and every tier
+  is walked from that rank round through 0 back to it. Each orchestrator
+  channel rolls its own origin (and a new one on every clearAndRefill), so
+  channels brought up together — every window after a server restart, every
+  channel requeried by a shared-tags switch — open on different posts even
+  when the whole deck sits at the same view count, which the restored
+  snapshot makes the normal state after a restart. Channels also pass the
+  other live channels' queued ids as `excludeIds`, so two displays that meet
+  on the last sliver of a tier take disjoint pages of it instead of the same
+  one. `test/searchQuery.deck.test.js` is the regression test, on
+  the real DuckDB engine. `/browse` instead sends
   every query with an implicit `order:id` (unless the box already names an
   `order:`), which pages by flat row offset and never reads `display_count` at
   all — a genuine DB view, immune to whatever the frames are doing. It still
