@@ -1379,11 +1379,15 @@ app.get('/browse', (req, res) => {
 });
 
 // JSON variant of /history for non-browser clients (e.g. the Spatial Stash
-// visionOS app) that want to render their own history UI. Returns the same
-// rolling window as /history, with id + ext per entry so clients can tell
-// images from videos without a second round-trip.
+// visionOS app) that want to render their own history UI. `history` is the
+// same deduped, newest-first rolling window as before (id + ext per entry,
+// so clients can tell images from videos without a second round-trip).
+// `groups` mirrors /history's per-display sections ({ deviceId, posts })
+// so a client can render the same "which display showed what" breakdown
+// the HTML page does — unlike `history`, a post shown on two displays
+// appears once per group instead of being deduped away.
 app.get('/history.json', (req, res) => {
-  res.json({ history: history.listJson() });
+  res.json({ history: history.listJson(), groups: history.listGroups() });
 });
 
 // This endpoint allows the user to send a post ID to insert it into history as the newest item

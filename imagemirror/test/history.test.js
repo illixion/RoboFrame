@@ -11,7 +11,7 @@ const { createHistory } = require('../lib/history');
 function startApp(history) {
     const app = express();
     app.get('/history.json', (req, res) => {
-        res.json({ history: history.listJson() });
+        res.json({ history: history.listJson(), groups: history.listGroups() });
     });
     return new Promise((resolve) => {
         const server = app.listen(0, '127.0.0.1', () => {
@@ -107,7 +107,27 @@ test('/history.json returns the JSON contract end-to-end', async () => {
         const res = await get(port, '/history.json');
         assert.equal(res.status, 200);
         const parsed = JSON.parse(res.body);
-        assert.deepEqual(parsed, { history: [{ id: 2, ext: 'png' }, { id: 1, ext: 'jpg' }] });
+        assert.deepEqual(parsed, {
+            history: [{ id: 2, ext: 'png' }, { id: 1, ext: 'jpg' }],
+            groups: [{ deviceId: 'a', posts: [{ id: 2, ext: 'png' }, { id: 1, ext: 'jpg' }] }],
+        });
+    } finally {
+        await new Promise((resolve) => server.close(resolve));
+    }
+});
+
+test('/history.json groups the same id under each display that showed it', async () => {
+    const h = createHistory();
+    h.addEntry({ id: 9, ext: 'jpg', deviceId: 'a' });
+    h.addEntry({ id: 9, ext: 'jpg', deviceId: 'b' });
+    const { server, port } = await startApp(h);
+    try {
+        const res = await get(port, '/history.json');
+        const parsed = JSON.parse(res.body);
+        assert.deepEqual(parsed.history, [{ id: 9, ext: 'jpg' }]);
+        assert.deepEqual(parsed.groups.map((g) => g.deviceId).sort(), ['a', 'b']);
+        assert.equal(parsed.groups.find((g) => g.deviceId === 'a').posts.length, 1);
+        assert.equal(parsed.groups.find((g) => g.deviceId === 'b').posts.length, 1);
     } finally {
         await new Promise((resolve) => server.close(resolve));
     }
@@ -119,7 +139,7 @@ test('/history.json reflects empty state', async () => {
     try {
         const res = await get(port, '/history.json');
         assert.equal(res.status, 200);
-        assert.deepEqual(JSON.parse(res.body), { history: [] });
+        assert.deepEqual(JSON.parse(res.body), { history: [], groups: [] });
     } finally {
         await new Promise((resolve) => server.close(resolve));
     }
