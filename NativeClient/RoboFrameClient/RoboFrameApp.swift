@@ -1,4 +1,5 @@
 import AVKit
+import Combine
 import SwiftUI
 import WebKit
 
@@ -179,6 +180,8 @@ struct SlideshowView: View {
     @State private var saveResult: String?
     @State private var showHistory = false
     @State private var controlsVisible = true
+    @State private var currentTime = Date()
+    private let clockTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     init(profile: RoboFrameProfile) { _model = State(initialValue: SlideshowModel(profile: profile)) }
 
@@ -195,35 +198,40 @@ struct SlideshowView: View {
                 ProgressView("Waiting for RoboFrame…").tint(.white).foregroundStyle(.white)
             }
 
-            VStack(alignment: .leading, spacing: 0) {
-                if controlsVisible {
-                    SlideshowTopBar(model: model)
-                        .padding(.horizontal, 18)
-                        .padding(.top, 24)
-                }
-
-                Spacer()
-
-                if controlsVisible {
-                    SlideshowControlBar(
-                        model: model,
-                        showHistory: $showHistory,
-                        saveResult: $saveResult
-                    )
+            if model.profile.showClock {
+                SlideshowClockOverlay(time: currentTime)
                     .padding(.horizontal, 18)
-                    .padding(.bottom, 24)
-                }
+                    .padding(.top, 24)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+
+            if model.profile.showSensors {
+                SlideshowSensorOverlay(model: model)
+                    .padding(.horizontal, 18)
+                    .padding(.top, 24)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
             }
 
             if let alert = model.alert {
                 AlertOverlay(alert: alert)
             }
+            if controlsVisible {
+                SlideshowOrnamentView(
+                    model: model,
+                    showHistory: $showHistory,
+                    saveResult: $saveResult
+                )
+                .padding(.horizontal, 18)
+                .padding(.bottom, 24)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            }
+        }
+        .contentShape(.rect)
+        .onTapGesture {
+            controlsVisible.toggle()
         }
         .sheet(isPresented: $showHistory) {
             HistoryBrowserView(profile: model.profile)
-        }
-        .onTapGesture {
-            controlsVisible.toggle()
         }
         .alert("RoboFrame", isPresented: Binding(get: { model.error != nil || saveResult != nil }, set: { if !$0 { model.clearError(); saveResult = nil } })) {
             Button("OK", role: .cancel) { model.clearError(); saveResult = nil }
@@ -231,45 +239,49 @@ struct SlideshowView: View {
         .task { model.start(); model.reportScene(active: true) }
         .onDisappear { model.stop() }
         .onChange(of: scenePhase) { _, phase in model.reportScene(active: phase == .active) }
+        .onReceive(clockTimer) { time in
+            currentTime = time
+        }
     }
 }
 
-private struct SlideshowTopBar: View {
+private struct SlideshowClockOverlay: View {
+    let time: Date
+
+    var body: some View {
+        HStack {
+            Text(time, format: .dateTime.hour().minute())
+                .font(.title3.monospacedDigit())
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .foregroundStyle(.white)
+                .background(.black.opacity(0.25), in: Capsule())
+            Spacer()
+        }
+    }
+}
+
+private struct SlideshowSensorOverlay: View {
     let model: SlideshowModel
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            if model.profile.showClock {
-                Text(Date.now, format: .dateTime.hour().minute())
-                    .font(.title3.monospacedDigit())
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .foregroundStyle(.white)
-                    .background(.black.opacity(0.25), in: Capsule())
-            }
-
-            Spacer()
-
-            if model.profile.showSensors {
-                let sensorList = model.sensors.values.sorted { $0.name < $1.name }
-                if !sensorList.isEmpty {
-                    HStack(spacing: 10) {
-                        ForEach(sensorList) { reading in
-                            Text("\(reading.name): \(reading.state)\(reading.unit)")
-                                .font(.caption.weight(.semibold))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .foregroundStyle(.white)
-                                .background(.black.opacity(0.25), in: Capsule())
-                        }
-                    }
+        let sensorList = model.sensors.values.sorted { $0.name < $1.name }
+        if !sensorList.isEmpty {
+            HStack(spacing: 10) {
+                ForEach(sensorList) { reading in
+                    Text("\(reading.name): \(reading.state)\(reading.unit)")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .foregroundStyle(.white)
+                        .background(.black.opacity(0.25), in: Capsule())
                 }
             }
         }
     }
 }
 
-private struct SlideshowControlBar: View {
+private struct SlideshowOrnamentView: View {
     let model: SlideshowModel
     @Binding var showHistory: Bool
     @Binding var saveResult: String?
@@ -350,16 +362,28 @@ private struct SlideshowControlBar: View {
 
             Spacer()
 
-            Text(model.profile.name)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(.black.opacity(0.25), in: Capsule())
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.profile.name)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                Text(model.profile.deviceId.isEmpty ? model.profile.endpoint : "device \(model.profile.deviceId)")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.white.opacity(0.75))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(.black.opacity(0.25), in: Capsule())
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .background(.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.white.opacity(0.16), lineWidth: 1)
+        )
+        .frame(maxWidth: 1200)
     }
 }
 
