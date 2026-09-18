@@ -23,6 +23,33 @@ struct RoboFrameProfile: Codable, Identifiable, Equatable {
     var webPageURL = ""
     var webTransparentBackground = false
     var webAutoRefreshInterval: Double = 0
+    var slideshow3DMode: Slideshow3DPreference = .off
+
+    enum CodingKeys: String, CodingKey {
+        case id, savedDate, name, mode, endpoint, deviceId, accessToken, interval, modTags
+        case showClock, showSensors, webPageURL, webTransparentBackground, webAutoRefreshInterval, slideshow3DMode
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        savedDate = try values.decodeIfPresent(Date.self, forKey: .savedDate) ?? .now
+        name = try values.decodeIfPresent(String.self, forKey: .name) ?? "New Display"
+        mode = try values.decodeIfPresent(ProfileMode.self, forKey: .mode) ?? .slideshow
+        endpoint = try values.decodeIfPresent(String.self, forKey: .endpoint) ?? ""
+        deviceId = try values.decodeIfPresent(String.self, forKey: .deviceId) ?? ""
+        accessToken = try values.decodeIfPresent(String.self, forKey: .accessToken) ?? ""
+        interval = try values.decodeIfPresent(Double.self, forKey: .interval) ?? 15
+        modTags = try values.decodeIfPresent([String].self, forKey: .modTags) ?? []
+        showClock = try values.decodeIfPresent(Bool.self, forKey: .showClock) ?? true
+        showSensors = try values.decodeIfPresent(Bool.self, forKey: .showSensors) ?? true
+        webPageURL = try values.decodeIfPresent(String.self, forKey: .webPageURL) ?? ""
+        webTransparentBackground = try values.decodeIfPresent(Bool.self, forKey: .webTransparentBackground) ?? false
+        webAutoRefreshInterval = try values.decodeIfPresent(Double.self, forKey: .webAutoRefreshInterval) ?? 0
+        slideshow3DMode = try values.decodeIfPresent(Slideshow3DPreference.self, forKey: .slideshow3DMode) ?? .off
+    }
 
     var normalizedEndpoint: URL? {
         let value = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -57,9 +84,24 @@ struct RoboFrameProfile: Codable, Identifiable, Equatable {
             if deviceId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return "Enter a stable display ID."
             }
+
             return nil
         case .webPage: return resolvedWebPageURL == nil ? "Enter a valid website URL." : nil
         }
+
+    }
+
+    func mediaURL(for post: RemotePost, record: Bool = false) -> URL? {
+        guard let base = normalizedEndpoint else { return nil }
+        var components = URLComponents(url: base.appending(path: "get"), resolvingAgainstBaseURL: false)
+        var items = [
+            URLQueryItem(name: "id", value: String(post.id)),
+            URLQueryItem(name: "record", value: record ? "1" : "0"),
+        ]
+        if !deviceId.isEmpty { items.append(URLQueryItem(name: "deviceId", value: deviceId)) }
+        if !accessToken.isEmpty { items.append(URLQueryItem(name: "token", value: accessToken)) }
+        components?.queryItems = items
+        return components?.url
     }
 
     func duplicated(named name: String) -> Self {
@@ -71,7 +113,22 @@ struct RoboFrameProfile: Codable, Identifiable, Equatable {
     }
 }
 
-struct RemotePost: Identifiable, Equatable, Hashable {
+enum Slideshow3DPreference: String, Codable, CaseIterable, Identifiable {
+    case off
+    case spatial
+    case pseudo3D
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .off: "2D"
+        case .spatial: "Spatial Images"
+        case .pseudo3D: "Real-Time 3D Video"
+        }
+    }
+}
+
+struct RemotePost: Identifiable, Equatable, Hashable, Decodable {
     let id: Int
     let ext: String
     let durationMs: Int?

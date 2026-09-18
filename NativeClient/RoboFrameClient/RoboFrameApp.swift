@@ -21,7 +21,21 @@ final class ProfileStore {
     var selectedID: UUID?
 
     init() {
-        profiles = (try? JSONDecoder().decode([RoboFrameProfile].self, from: UserDefaults.standard.data(forKey: key) ?? Data())) ?? []
+        let arguments = ProcessInfo.processInfo.arguments
+        if let fixture = arguments.first(where: { $0.hasPrefix("-UITestProfile=") })?.split(separator: "=", maxSplits: 1).last {
+            var profile = RoboFrameProfile()
+            profile.name = fixture == "web" ? "Pinned Test Page" : "Test Display"
+            if fixture == "web" {
+                profile.mode = .webPage
+                profile.webPageURL = "https://example.com"
+            } else {
+                profile.endpoint = "https://frame.example"
+                profile.deviceId = "ui-test"
+            }
+            profiles = [profile]
+        } else {
+            profiles = (try? JSONDecoder().decode([RoboFrameProfile].self, from: UserDefaults.standard.data(forKey: key) ?? Data())) ?? []
+        }
         selectedID = profiles.first?.id
     }
 
@@ -39,6 +53,7 @@ struct RootView: View {
     @Environment(ProfileStore.self) private var store
     @State private var editor: RoboFrameProfile?
     @State private var presenting: RoboFrameProfile?
+    @State private var historyProfile: RoboFrameProfile?
 
     var body: some View {
         @Bindable var store = store
@@ -61,12 +76,13 @@ struct RootView: View {
             }
         } detail: {
             if let profile = store.profiles.first(where: { $0.id == store.selectedID }) {
-                ProfileDetail(profile: profile, edit: { editor = profile }, open: { presenting = profile })
+                ProfileDetail(profile: profile, edit: { editor = profile }, open: { presenting = profile }, history: { historyProfile = profile })
             } else {
                 ContentUnavailableView("No Displays", systemImage: "rectangle.on.rectangle", description: Text("Create a RoboFrame display profile to begin."))
             }
         }
         .sheet(item: $editor) { ProfileEditor(profile: $0) { store.save($0); editor = nil } }
+        .sheet(item: $historyProfile) { HistoryBrowserView(profile: $0) }
         .fullScreenCover(item: $presenting) { ProfileDestination(profile: $0) }
     }
 }
@@ -75,6 +91,7 @@ struct ProfileDetail: View {
     let profile: RoboFrameProfile
     let edit: () -> Void
     let open: () -> Void
+    let history: () -> Void
     var body: some View {
         VStack(spacing: 20) {
             Image(systemName: profile.mode == .slideshow ? "photo.stack.fill" : "globe")
@@ -84,6 +101,10 @@ struct ProfileDetail: View {
             if let error = profile.launchError { Text(error).foregroundStyle(.red) }
             Button("Open", action: open).buttonStyle(.borderedProminent).disabled(profile.launchError != nil)
                 .accessibilityIdentifier("roboframe.profile.open")
+            if profile.mode == .slideshow {
+                Button("Viewing History", action: history)
+                    .accessibilityIdentifier("roboframe.history.open")
+            }
             Button("Edit", action: edit)
         }
         .padding()
@@ -119,6 +140,9 @@ struct ProfileEditor: View {
                     Section("Display") {
                         Toggle("Show Clock", isOn: $draft.showClock)
                         Toggle("Show Sensors", isOn: $draft.showSensors)
+                        Picker("Spatial playback", selection: $draft.slideshow3DMode) {
+                            ForEach(Slideshow3DPreference.allCases) { Text($0.label).tag($0) }
+                        }
                     }
                 } else {
                     Section("Website") {
@@ -160,8 +184,8 @@ struct SlideshowView: View {
             Color.black.ignoresSafeArea()
             if let effect = model.effectVideoURL {
                 VideoPlayer(player: AVPlayer(url: effect)).ignoresSafeArea()
-            } else if let url = model.mediaURL, let post = model.current {
-                MediaContent(url: url, post: post) { duration in model.markRendered(durationMs: duration) }
+            } else if let post = model.current {
+                RoboFrameSlideshowSurface(model: model)
                     .id(post.id)
             } else {
                 ProgressView("Waiting for RoboFrame…").tint(.white).foregroundStyle(.white)
@@ -243,9 +267,11 @@ struct WebPageView: View {
                     Spacer()
                     Text(model.title).lineLimit(1)
                     Button("Hide") { controlsVisible = false; model.setInteractionEnabled(false) }
+                        .accessibilityIdentifier("roboframe.web.hide")
                 }.buttonStyle(.bordered).padding()
             } else {
                 Color.white.opacity(0.001).contentShape(Rectangle()).onTapGesture { controlsVisible = true; model.setInteractionEnabled(true) }
+                    .accessibilityIdentifier("roboframe.web.reveal")
             }
         }
         .task { model.start() }.onDisappear { model.stop() }

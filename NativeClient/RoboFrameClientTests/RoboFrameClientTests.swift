@@ -1,4 +1,5 @@
 import XCTest
+import RAVESlideshow
 @testable import RoboFrameClient
 
 final class RoboFrameClientTests: XCTestCase {
@@ -38,5 +39,28 @@ final class RoboFrameClientTests: XCTestCase {
 
         let sessionID = await MainActor.run { SlideshowModel(profile: profile).sessionID }
         XCTAssertEqual(sessionID, profile.id.uuidString)
+    }
+    func testServerDrivenEngineWaitsForAuthoritativePlayback() async {
+        let provider = await MainActor.run { TestProvider() }
+        let engine = await MainActor.run {
+            RAVESlideshowEngine(provider: provider, configuration: .init(serverDriven: true, automaticAdvancement: false))
+        }
+        await MainActor.run { engine.start() }
+        try? await Task.sleep(for: .milliseconds(30))
+        XCTAssertNil(await MainActor.run { engine.current })
+
+        let item = RAVESlideshowItem(id: "17", fileExtension: "jpg")
+        await MainActor.run { engine.setAuthoritativeCurrent(item) }
+        await engine.waitUntilIdleForTesting()
+        XCTAssertEqual(await MainActor.run { engine.current?.item.id }, "17")
+        await MainActor.run { engine.stop() }
+    }
+}
+
+@MainActor
+private final class TestProvider: RAVESlideshowContentProvider {
+    func fetchMoreContent(_ request: RAVESlideshowFetchRequest) async throws -> [RAVESlideshowItem] { [] }
+    func loadMedia(for item: RAVESlideshowItem, maxResolution: Int) async throws -> RAVESlideshowLoadedMedia {
+        .still(data: Data([0xFF]), displayURL: nil)
     }
 }

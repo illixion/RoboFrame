@@ -49,8 +49,32 @@ xcodebuild -project NativeClient/RoboFrameClient.xcodeproj \
 ```
 
 The app currently presents slideshow/video/alert surfaces full-screen on iOS
-and as ordinary windows on visionOS. It deliberately does not include
-Hypnos's Photos, Stash, gallery, spatial-image, or pseudo-3D pipelines.
+and as ordinary windows on visionOS. Its slideshow is backed by RAVESDK's
+`RAVESlideshowEngine` and `RAVESlideshowSurface`: RoboFrame supplies the
+server-authoritative WebSocket driver and REST media provider, while the
+shared engine owns loaded-media slots, bounded prefetch, transitions, and
+background state. A `playback` frame is the sole authority for selection;
+the client never locally advances a RoboFrame channel.
+
+Profiles expose a dedicated **Viewing History** browser backed by
+`GET /history.json`. It renders both the rolling, deduplicated history and
+the server's per-display groups without inventing client-side grouping.
+
+On visionOS, **Spatial Images** applies the spatial slideshow presentation
+and **Real-Time 3D Video** uses RAVEMedia's `Pseudo3DStereoEngine`. The latter
+requires an installed RAVEMedia depth model and falls back to the flat player
+when depth or decode setup is unavailable. iOS always resolves those modes to
+the standard 2D rendering path.
+
+`RoboFrameClientUITests` covers deterministic profile creation, configured
+slideshow presentation, and the hidden pinned-web-page reveal catcher. Run it
+on an iOS simulator with:
+
+```bash
+xcodebuild -project NativeClient/RoboFrameClient.xcodeproj \
+  -scheme RoboFrameClientUITests -destination 'platform=iOS Simulator,name=iPhone 18 Pro' \
+  test CODE_SIGNING_ALLOWED=NO
+```
 
 ## Architecture
 
