@@ -51,6 +51,9 @@ imagemirror/video_cache/
 dist/
 build/
 
+# Local signing config (contains certs, team ID, and provisioning metadata)
+scripts/build-signing.conf
+
 # Python bytecode (native-kiosk)
 __pycache__/
 *.pyc

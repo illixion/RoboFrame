@@ -1,0 +1,22 @@
+# Build & sign configuration — copy to build-signing.conf and edit.
+# build-signing.conf is gitignored and will never be committed.
+#
+# This configures signing for the shared ~/bin/build-and-sign helper. It
+# sources the global config first and lets this repo override the project
+# identity and build target for the local checkout.
+
+# --- Project ---
+PROJECT_PATH="NativeClient/RoboFrameClient.xcodeproj"
+SCHEME_NAME="RoboFrameClient"
+TARGET_NAME="RoboFrameClient"
+PLATFORM="visionOS"
+
+# --- Identity ---
+TEAM_ID="XXXXXXXXXX"
+BUILD_BUNDLE_ID="com.illixion.roboframe.client"
+
+# --- Deployment ---
+DEVICE_NAME="Apple Vision Pro"
+
+# --- Extra xcodebuild settings (bash array) ---
+# EXTRA_BUILD_SETTINGS=()
