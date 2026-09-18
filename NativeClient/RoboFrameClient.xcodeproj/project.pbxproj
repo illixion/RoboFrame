@@ -10,6 +10,7 @@
 		A10000000000000000000031 /* RAVESlideshow in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000032 /* RAVESlideshow */; };
 		A10000000000000000000033 /* RAVEMedia in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000034 /* RAVEMedia */; };
 		A10000000000000000000100 /* RAVEUI in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000101 /* RAVEUI */; };
+		A10000000000000000000110 /* RAVEConsole in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000111 /* RAVEConsole */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -25,7 +26,7 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		A10000000000000000000013 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000011 /* RAVENet in Frameworks */, A10000000000000000000031 /* RAVESlideshow in Frameworks */, A10000000000000000000033 /* RAVEMedia in Frameworks */, A10000000000000000000100 /* RAVEUI in Frameworks */, ); runOnlyForDeploymentPostprocessing = 0; };
+		A10000000000000000000013 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000011 /* RAVENet in Frameworks */, A10000000000000000000031 /* RAVESlideshow in Frameworks */, A10000000000000000000033 /* RAVEMedia in Frameworks */, A10000000000000000000100 /* RAVEUI in Frameworks */, A10000000000000000000110 /* RAVEConsole in Frameworks */, ); runOnlyForDeploymentPostprocessing = 0; };
 		A10000000000000000000014 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 
@@ -41,7 +42,7 @@
 			buildPhases = (A10000000000000000000016 /* Sources */, A10000000000000000000013 /* Frameworks */, A10000000000000000000017 /* Resources */, );
 			fileSystemSynchronizedGroups = (A10000000000000000000003 /* RoboFrameClient */, );
 			name = RoboFrameClient;
-			packageProductDependencies = (A10000000000000000000012 /* RAVENet */, A10000000000000000000032 /* RAVESlideshow */, A10000000000000000000034 /* RAVEMedia */, A10000000000000000000101 /* RAVEUI */, );
+			packageProductDependencies = (A10000000000000000000012 /* RAVENet */, A10000000000000000000032 /* RAVESlideshow */, A10000000000000000000034 /* RAVEMedia */, A10000000000000000000101 /* RAVEUI */, A10000000000000000000111 /* RAVEConsole */, );
 			productName = RoboFrameClient;
 			productReference = A10000000000000000000001 /* RoboFrameClient.app */;
 			productType = "com.apple.product-type.application";
@@ -128,6 +129,7 @@
 		A10000000000000000000032 /* RAVESlideshow */ = {isa = XCSwiftPackageProductDependency; package = A10000000000000000000023 /* XCLocalSwiftPackageReference "../../RAVESDK" */; productName = RAVESlideshow; };
 		A10000000000000000000034 /* RAVEMedia */ = {isa = XCSwiftPackageProductDependency; package = A10000000000000000000023 /* XCLocalSwiftPackageReference "../../RAVESDK" */; productName = RAVEMedia; };
 		A10000000000000000000101 /* RAVEUI */ = {isa = XCSwiftPackageProductDependency; package = A10000000000000000000023 /* XCLocalSwiftPackageReference "../../RAVESDK" */; productName = RAVEUI; };
+		A10000000000000000000111 /* RAVEConsole */ = {isa = XCSwiftPackageProductDependency; package = A10000000000000000000023 /* XCLocalSwiftPackageReference "../../RAVESDK" */; productName = RAVEConsole; };
 /* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = A10000000000000000000009 /* Project object */;

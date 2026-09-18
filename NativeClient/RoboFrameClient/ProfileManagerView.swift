@@ -15,6 +15,9 @@
  */
 
 import SwiftUI
+#if os(visionOS)
+import RAVEUI
+#endif
 
 struct ProfileManagerView: View {
     @Environment(ProfileStore.self) private var store
@@ -44,6 +47,9 @@ struct ProfileManagerView: View {
     #endif
     #if os(visionOS)
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+    @Environment(\.raveWindowToken) private var raveWindowToken
+    @State private var showingWindowManager = false
     #endif
 
     private enum PendingSwitch: Equatable {
@@ -139,6 +145,38 @@ struct ProfileManagerView: View {
             #if !os(visionOS)
             .fullScreenCover(item: $presenting) { ViewerDestination(profile: $0, onConfigChanged: persistViewerConfigChange) }
             #endif
+            #if os(visionOS)
+            .toolbar {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button {
+                        openWindow(id: "console")
+                    } label: {
+                        Label("Console", systemImage: "terminal")
+                    }
+                    .accessibilityIdentifier("roboframe.toolbar.console")
+
+                    Button {
+                        showingWindowManager = true
+                    } label: {
+                        Label("Windows", systemImage: "macwindow.on.rectangle")
+                    }
+                    .accessibilityIdentifier("roboframe.toolbar.windows")
+                }
+            }
+            .sheet(isPresented: $showingWindowManager) {
+                RAVEWindowManagerView(
+                    emptyMessage: "Slideshow, web page and console windows you open will be listed here, so you can bring them back to you or close them."
+                ) {
+                    Section {
+                        Button("Close All Windows", role: .destructive) {
+                            closeAllSecondaryWindows()
+                        }
+                        .disabled(!hasOtherWindows)
+                    }
+                }
+            }
+            .manageWindow(ManagedWindows.main())
+            #endif
         }
     }
 
@@ -148,11 +186,31 @@ struct ProfileManagerView: View {
     /// iOS presents the existing single-window `.fullScreenCover`.
     private func launch(_ profile: RoboFrameProfile) {
         #if os(visionOS)
-        openWindow(id: "slideshow-viewer", value: profile.id)
+        openWindow(id: "slideshow-viewer", value: SlideshowWindowValue(profileID: profile.id))
         #else
         presenting = profile
         #endif
     }
+
+    #if os(visionOS)
+    /// Every other registered window, excluding this one (`RAVEWindowManagerView`
+    /// already excludes it from the list it renders; the bulk action needs the
+    /// same exclusion to decide whether it has anything to close).
+    private var hasOtherWindows: Bool {
+        RAVEWindowRegistry.shared.windows.contains { $0.id != raveWindowToken }
+    }
+
+    /// Closes every slideshow/web-page/console window through the registry
+    /// (rather than destroying scene sessions directly, as Hypnos's Close All
+    /// does) — RoboFrame's window set is just these three managed kinds, with
+    /// none of Hypnos's launch-time invisible-window history motivating a
+    /// scene-session-level sweep.
+    private func closeAllSecondaryWindows() {
+        for entry in RAVEWindowRegistry.shared.windows where entry.id != raveWindowToken {
+            RAVEWindowRegistry.shared.close(entry, dismiss: dismissWindow)
+        }
+    }
+    #endif
 
     /// Writes an ornament/adjustments-driven config edit back to whichever
     /// store owns the profile — the saved list if it's already there,

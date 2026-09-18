@@ -53,4 +53,32 @@ final class RoboFrameClientUITests: XCTestCase {
         reveal.tap()
         XCTAssertTrue(hide.waitForExistence(timeout: 2))
     }
+
+    // Console and window management are visionOS-only (RAVEUI's window
+    // registry, and the toolbar buttons that expose it, are both
+    // `#if os(visionOS)`) — these two are compiled out on iOS.
+    #if os(visionOS)
+    func testOpensConsoleWindow() throws {
+        app.launchArguments = ["-UITestProfile=empty"]
+        app.launch()
+        app.buttons["roboframe.toolbar.console"].tap()
+        // RAVEConsoleView's search field is the console screen's own content,
+        // distinct from anything the profile manager shows — its presence
+        // confirms the "console" window scene actually opened.
+        XCTAssertTrue(app.textFields["Filter…"].waitForExistence(timeout: 5))
+    }
+
+    func testWindowManagerListsOpenViewerAndClosesIt() throws {
+        app.launchArguments = ["-UITestProfile=web"]
+        app.launch()
+        app.buttons["roboframe.profile.open"].tap()
+        XCTAssertTrue(app.buttons["roboframe.web.hide"].waitForExistence(timeout: 5))
+
+        app.buttons["roboframe.toolbar.windows"].tap()
+        XCTAssertTrue(app.staticTexts["Pinned Test Page"].waitForExistence(timeout: 5))
+
+        app.buttons["Close All Windows"].tap()
+        XCTAssertFalse(app.buttons["roboframe.web.hide"].waitForExistence(timeout: 5))
+    }
+    #endif
 }

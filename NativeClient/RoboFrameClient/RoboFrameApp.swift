@@ -13,7 +13,7 @@ struct RoboFrameApp: App {
     @State private var store = ProfileStore()
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: "main") {
             ProfileManagerView()
                 .environment(store)
         }
@@ -23,16 +23,25 @@ struct RoboFrameApp: App {
         // run at once — visionOS only. iOS keeps the single-window
         // `.fullScreenCover` presentation in `ProfileManagerView`, since a
         // second `WindowGroup` scene has no multi-window benefit there and
-        // would just add an extra way to navigate. Keyed by profile id
-        // (`ViewerSceneRoot` resolves it live from the store) rather than by
-        // the profile value itself — see that file's header for why.
-        WindowGroup(id: "slideshow-viewer", for: UUID.self) { $profileID in
-            ViewerSceneRoot(profileID: profileID)
+        // would just add an extra way to navigate. Keyed by `SlideshowWindowValue`
+        // (its own window identity plus the profile id `ViewerSceneRoot`
+        // resolves live from the store) rather than by the profile id alone,
+        // so Summon can recreate a fresh window instead of waiting for the
+        // old scene to disconnect — see that struct's header for why.
+        WindowGroup(id: "slideshow-viewer", for: SlideshowWindowValue.self) { $value in
+            ViewerSceneRoot(windowValue: value)
                 .environment(store)
         }
         .windowStyle(.plain)
         .windowResizability(.contentMinSize)
         .defaultSize(width: 1400, height: 900)
+        .defaultLaunchBehavior(.suppressed)
+
+        // Pop-out console, ported from Hypnos's Console window/tab.
+        Window("Console", id: "console") {
+            ConsoleWindowView()
+        }
+        .windowResizability(.contentSize)
         .defaultLaunchBehavior(.suppressed)
         #endif
     }
