@@ -1,0 +1,109 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 70;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000000000000000000011 /* RAVENet in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000012 /* RAVENet */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A10000000000000000000001 /* RoboFrameClient.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = RoboFrameClient.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10000000000000000000002 /* RoboFrameClientTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RoboFrameClientTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		A10000000000000000000003 /* RoboFrameClient */ = {isa = PBXFileSystemSynchronizedRootGroup; exceptions = (); explicitFileTypes = {}; explicitFolders = (); path = RoboFrameClient; sourceTree = "<group>"; };
+		A10000000000000000000004 /* RoboFrameClientTests */ = {isa = PBXFileSystemSynchronizedRootGroup; exceptions = (); explicitFileTypes = {}; explicitFolders = (); path = RoboFrameClientTests; sourceTree = "<group>"; };
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A10000000000000000000013 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000011 /* RAVENet in Frameworks */, ); runOnlyForDeploymentPostprocessing = 0; };
+		A10000000000000000000014 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A10000000000000000000005 = {isa = PBXGroup; children = (A10000000000000000000003 /* RoboFrameClient */, A10000000000000000000004 /* RoboFrameClientTests */, A10000000000000000000006 /* Products */, ); sourceTree = "<group>"; };
+		A10000000000000000000006 /* Products */ = {isa = PBXGroup; children = (A10000000000000000000001 /* RoboFrameClient.app */, A10000000000000000000002 /* RoboFrameClientTests.xctest */, ); name = Products; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A10000000000000000000007 /* RoboFrameClient */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000000000000000000015 /* Build configuration list for PBXNativeTarget "RoboFrameClient" */;
+			buildPhases = (A10000000000000000000016 /* Sources */, A10000000000000000000013 /* Frameworks */, A10000000000000000000017 /* Resources */, );
+			fileSystemSynchronizedGroups = (A10000000000000000000003 /* RoboFrameClient */, );
+			name = RoboFrameClient;
+			packageProductDependencies = (A10000000000000000000012 /* RAVENet */, );
+			productName = RoboFrameClient;
+			productReference = A10000000000000000000001 /* RoboFrameClient.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A10000000000000000000008 /* RoboFrameClientTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000000000000000000018 /* Build configuration list for PBXNativeTarget "RoboFrameClientTests" */;
+			buildPhases = (A10000000000000000000019 /* Sources */, A10000000000000000000014 /* Frameworks */, A10000000000000000000020 /* Resources */, );
+			dependencies = (A10000000000000000000021 /* PBXTargetDependency */, );
+			fileSystemSynchronizedGroups = (A10000000000000000000004 /* RoboFrameClientTests */, );
+			name = RoboFrameClientTests;
+			productName = RoboFrameClientTests;
+			productReference = A10000000000000000000002 /* RoboFrameClientTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A10000000000000000000009 /* Project object */ = {
+			isa = PBXProject;
+			attributes = { BuildIndependentTargetsInParallel = 1; LastUpgradeCheck = 2700; TargetAttributes = { A10000000000000000000008 = { TestTargetID = A10000000000000000000007; }; }; };
+			buildConfigurationList = A10000000000000000000022 /* Build configuration list for PBXProject "RoboFrameClient" */;
+			compatibilityVersion = "Xcode 16.0";
+			developmentRegion = en;
+			knownRegions = (en, Base,);
+			mainGroup = A10000000000000000000005;
+			packageReferences = (A10000000000000000000023 /* XCLocalSwiftPackageReference "../../RAVESDK" */,);
+			productRefGroup = A10000000000000000000006 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (A10000000000000000000007 /* RoboFrameClient */, A10000000000000000000008 /* RoboFrameClientTests */,);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A10000000000000000000017 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		A10000000000000000000020 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+/* Begin PBXSourcesBuildPhase section */
+		A10000000000000000000016 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		A10000000000000000000019 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+/* Begin PBXTargetDependency section */
+		A10000000000000000000021 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = A10000000000000000000007 /* RoboFrameClient */; targetProxy = A10000000000000000000024 /* PBXContainerItemProxy */; };
+/* End PBXTargetDependency section */
+/* Begin PBXContainerItemProxy section */
+		A10000000000000000000024 /* PBXContainerItemProxy */ = {isa = PBXContainerItemProxy; containerPortal = A10000000000000000000009 /* Project object */; proxyType = 1; remoteGlobalIDString = A10000000000000000000007; remoteInfo = RoboFrameClient; };
+/* End PBXContainerItemProxy section */
+/* Begin XCBuildConfiguration section */
+		A10000000000000000000025 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; ARCHS = arm64; CLANG_ENABLE_MODULES = YES; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = ""; ENABLE_TESTABILITY = YES; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_CFBundleDisplayName = RoboFrame; INFOPLIST_KEY_NSLocalNetworkUsageDescription = "RoboFrame connects to your configured display server."; IPHONEOS_DEPLOYMENT_TARGET = 26.0; PRODUCT_BUNDLE_IDENTIFIER = com.illixion.roboframe.client; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = auto; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator xros xrsimulator"; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1,2,7"; }; name = Debug; };
+		A10000000000000000000026 /* Release */ = {isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_CFBundleDisplayName = RoboFrame; INFOPLIST_KEY_NSLocalNetworkUsageDescription = "RoboFrame connects to your configured display server."; IPHONEOS_DEPLOYMENT_TARGET = 26.0; PRODUCT_BUNDLE_IDENTIFIER = com.illixion.roboframe.client; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = auto; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator xros xrsimulator"; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1,2,7"; }; name = Release; };
+		A10000000000000000000027 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { ARCHS = arm64; BUNDLE_LOADER = "$(TEST_HOST)"; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 26.0; PRODUCT_BUNDLE_IDENTIFIER = com.illixion.roboframe.client.tests; PRODUCT_NAME = RoboFrameClientTests; SDKROOT = auto; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator xros xrsimulator"; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1,2,7"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/RoboFrameClient.app/RoboFrameClient"; TEST_TARGET_NAME = RoboFrameClient; }; name = Debug; };
+		A10000000000000000000028 /* Release */ = {isa = XCBuildConfiguration; buildSettings = { BUNDLE_LOADER = "$(TEST_HOST)"; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 26.0; PRODUCT_BUNDLE_IDENTIFIER = com.illixion.roboframe.client.tests; PRODUCT_NAME = RoboFrameClientTests; SDKROOT = auto; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator xros xrsimulator"; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1,2,7"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/RoboFrameClient.app/RoboFrameClient"; TEST_TARGET_NAME = RoboFrameClient; }; name = Release; };
+		A10000000000000000000029 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { IPHONEOS_DEPLOYMENT_TARGET = 26.0; SDKROOT = auto; }; name = Debug; };
+		A10000000000000000000030 /* Release */ = {isa = XCBuildConfiguration; buildSettings = { IPHONEOS_DEPLOYMENT_TARGET = 26.0; SDKROOT = auto; }; name = Release; };
+/* End XCBuildConfiguration section */
+/* Begin XCConfigurationList section */
+		A10000000000000000000015 /* Build configuration list for PBXNativeTarget "RoboFrameClient" */ = {isa = XCConfigurationList; buildConfigurations = (A10000000000000000000025 /* Debug */, A10000000000000000000026 /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A10000000000000000000018 /* Build configuration list for PBXNativeTarget "RoboFrameClientTests" */ = {isa = XCConfigurationList; buildConfigurations = (A10000000000000000000027 /* Debug */, A10000000000000000000028 /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A10000000000000000000022 /* Build configuration list for PBXProject "RoboFrameClient" */ = {isa = XCConfigurationList; buildConfigurations = (A10000000000000000000029 /* Debug */, A10000000000000000000030 /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+/* Begin XCLocalSwiftPackageReference section */
+		A10000000000000000000023 /* XCLocalSwiftPackageReference "../../RAVESDK" */ = {isa = XCLocalSwiftPackageReference; relativePath = "../../RAVESDK"; };
+/* End XCLocalSwiftPackageReference section */
+/* Begin XCSwiftPackageProductDependency section */
+		A10000000000000000000012 /* RAVENet */ = {isa = XCSwiftPackageProductDependency; package = A10000000000000000000023 /* XCLocalSwiftPackageReference "../../RAVESDK" */; productName = RAVENet; };
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = A10000000000000000000009 /* Project object */;
+}

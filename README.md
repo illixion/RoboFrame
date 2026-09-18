@@ -19,6 +19,39 @@ RPC_TOKEN=$(openssl rand -hex 16) DUCKDB_PATH=./posts.duckdb IMAGE_DB_PATH=~/Pic
 Open `http://localhost:3123/index.html` in a browser. That's it — one origin,
 one process, serves the page, the API, and the WebSocket.
 
+## Native Apple client
+
+`NativeClient/` is an independent Xcode app for iOS and visionOS. It is not an
+npm workspace and does not change the Node server, browser kiosk, or CLI.
+Create a RoboFrame profile in the app with the server's HTTP(S) URL, stable
+display ID, and access token. Slideshow profiles use the server-authoritative
+WebSocket cycle; web-page profiles retain their `WKWebView` state for the life
+of the opened panel.
+
+Build without signing:
+
+```bash
+xcodebuild -quiet -project NativeClient/RoboFrameClient.xcodeproj \
+  -scheme RoboFrameClient -destination 'generic/platform=iOS Simulator' \
+  build CODE_SIGNING_ALLOWED=NO
+
+xcodebuild -quiet -project NativeClient/RoboFrameClient.xcodeproj \
+  -scheme RoboFrameClient -destination 'generic/platform=visionOS' \
+  build CODE_SIGNING_ALLOWED=NO
+```
+
+Run the focused model tests on an iOS simulator:
+
+```bash
+xcodebuild -project NativeClient/RoboFrameClient.xcodeproj \
+  -scheme RoboFrameClient -destination 'platform=iOS Simulator,name=iPhone 18 Pro' \
+  test CODE_SIGNING_ALLOWED=NO
+```
+
+The app currently presents slideshow/video/alert surfaces full-screen on iOS
+and as ordinary windows on visionOS. It deliberately does not include
+Hypnos's Photos, Stash, gallery, spatial-image, or pseudo-3D pipelines.
+
 ## Architecture
 
 There is **one server process**. It runs from the `imagemirror/` workspace
