@@ -1,7 +1,12 @@
-import AVKit
-import Combine
+/*
+ RoboFrame Native Client - App Entry Point
+
+ Slimmed to the app shell + persisted profile store; the profile-manager and
+ viewer UI live in `ProfileManagerView.swift` and the `*WindowView.swift`
+ files (1:1 ports of Hypnos's Remote tab / Remote Viewer).
+ */
+
 import SwiftUI
-import WebKit
 
 @main
 struct RoboFrameApp: App {
@@ -9,9 +14,27 @@ struct RoboFrameApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView()
+            ProfileManagerView()
                 .environment(store)
         }
+
+        #if os(visionOS)
+        // Genuine independent windows so multiple slideshows/web pages can
+        // run at once — visionOS only. iOS keeps the single-window
+        // `.fullScreenCover` presentation in `ProfileManagerView`, since a
+        // second `WindowGroup` scene has no multi-window benefit there and
+        // would just add an extra way to navigate. Keyed by profile id
+        // (`ViewerSceneRoot` resolves it live from the store) rather than by
+        // the profile value itself — see that file's header for why.
+        WindowGroup(id: "slideshow-viewer", for: UUID.self) { $profileID in
+            ViewerSceneRoot(profileID: profileID)
+                .environment(store)
+        }
+        .windowStyle(.plain)
+        .windowResizability(.contentMinSize)
+        .defaultSize(width: 1400, height: 900)
+        .defaultLaunchBehavior(.suppressed)
+        #endif
     }
 }
 
@@ -24,16 +47,31 @@ final class ProfileStore {
     init() {
         let arguments = ProcessInfo.processInfo.arguments
         if let fixture = arguments.first(where: { $0.hasPrefix("-UITestProfile=") })?.split(separator: "=", maxSplits: 1).last {
-            var profile = RoboFrameProfile()
-            profile.name = fixture == "web" ? "Pinned Test Page" : "Test Display"
-            if fixture == "web" {
+            // Fixture launches never read the real persisted store, so a UI
+            // test's result can't depend on whatever earlier runs left behind
+            // in the simulator's UserDefaults. "empty" starts with a clean
+            // slate for tests (like creating a new profile) that don't need
+            // a preset one — without it, a saved-profiles list that keeps
+            // growing across repeated local test runs eventually pushes a
+            // freshly created row below the fold, and the accessibility
+            // query for it flakes because `List` doesn't materialize
+            // off-screen rows.
+            switch fixture {
+            case "web":
+                var profile = RoboFrameProfile()
+                profile.name = "Pinned Test Page"
                 profile.mode = .webPage
                 profile.webPageURL = "https://example.com"
-            } else {
+                profiles = [profile]
+            case "empty":
+                profiles = []
+            default:
+                var profile = RoboFrameProfile()
+                profile.name = "Test Display"
                 profile.endpoint = "https://frame.example"
                 profile.deviceId = "ui-test"
+                profiles = [profile]
             }
-            profiles = [profile]
         } else {
             profiles = (try? JSONDecoder().decode([RoboFrameProfile].self, from: UserDefaults.standard.data(forKey: key) ?? Data())) ?? []
         }
@@ -48,415 +86,10 @@ final class ProfileStore {
     }
     func delete(_ profile: RoboFrameProfile) { profiles.removeAll { $0.id == profile.id }; selectedID = profiles.first?.id; persist() }
     private func persist() { UserDefaults.standard.set(try? JSONEncoder().encode(profiles), forKey: key) }
-}
 
-struct RootView: View {
-    @Environment(ProfileStore.self) private var store
-    @State private var editor: RoboFrameProfile?
-    @State private var presenting: RoboFrameProfile?
-    @State private var historyProfile: RoboFrameProfile?
-
-    var body: some View {
-        @Bindable var store = store
-        NavigationSplitView {
-            List(selection: $store.selectedID) {
-                ForEach(store.profiles) { profile in
-                    Label(profile.name, systemImage: profile.mode == .slideshow ? "photo.stack" : "globe")
-                        .tag(profile.id)
-                        .contextMenu {
-                            Button("Open") { presenting = profile }
-                            Button("Copy") { editor = profile.duplicated(named: "\(profile.name) Copy") }
-                            Button("Delete", role: .destructive) { store.delete(profile) }
-                        }
-                }
-            }
-            .navigationTitle("RoboFrame")
-            .toolbar {
-                Button { editor = RoboFrameProfile() } label: { Label("New Display", systemImage: "plus") }
-                    .accessibilityIdentifier("roboframe.profile.new")
-            }
-        } detail: {
-            if let profile = store.profiles.first(where: { $0.id == store.selectedID }) {
-                ProfileDetail(profile: profile, edit: { editor = profile }, open: { presenting = profile }, history: { historyProfile = profile })
-            } else {
-                ContentUnavailableView("No Displays", systemImage: "rectangle.on.rectangle", description: Text("Create a RoboFrame display profile to begin."))
-            }
-        }
-        .sheet(item: $editor) { ProfileEditor(profile: $0) { store.save($0); editor = nil } }
-        .sheet(item: $historyProfile) { HistoryBrowserView(profile: $0) }
-        .fullScreenCover(item: $presenting) { ProfileDestination(profile: $0) }
-    }
-}
-
-struct ProfileDetail: View {
-    let profile: RoboFrameProfile
-    let edit: () -> Void
-    let open: () -> Void
-    let history: () -> Void
-    var body: some View {
-        VStack(spacing: 20) {
-            Image(systemName: profile.mode == .slideshow ? "photo.stack.fill" : "globe")
-                .font(.system(size: 54)).foregroundStyle(.tint)
-            Text(profile.name).font(.title.bold())
-            Text(profile.mode.label).foregroundStyle(.secondary)
-            if let error = profile.launchError { Text(error).foregroundStyle(.red) }
-            Button("Open", action: open).buttonStyle(.borderedProminent).disabled(profile.launchError != nil)
-                .accessibilityIdentifier("roboframe.profile.open")
-            if profile.mode == .slideshow {
-                Button("Viewing History", action: history)
-                    .accessibilityIdentifier("roboframe.history.open")
-            }
-            Button("Edit", action: edit)
-        }
-        .padding()
-    }
-}
-
-struct ProfileEditor: View {
-    @Environment(\.dismiss) private var dismiss
-    @State private var draft: RoboFrameProfile
-    let save: (RoboFrameProfile) -> Void
-
-    init(profile: RoboFrameProfile, save: @escaping (RoboFrameProfile) -> Void) {
-        _draft = State(initialValue: profile)
-        self.save = save
-    }
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Profile") {
-                    TextField("Name", text: $draft.name).accessibilityIdentifier("roboframe.profile.name")
-                    Picker("Mode", selection: $draft.mode) {
-                        ForEach(ProfileMode.allCases) { Text($0.label).tag($0) }
-                    }
-                }
-                if draft.mode == .slideshow {
-                    Section("RoboFrame Server") {
-                        TextField("Server URL", text: $draft.endpoint).textInputAutocapitalization(.never).autocorrectionDisabled()
-                        TextField("Display ID", text: $draft.deviceId).textInputAutocapitalization(.never).autocorrectionDisabled()
-                        SecureField("Access Token", text: $draft.accessToken)
-                        Stepper("Interval: \(Int(draft.interval)) seconds", value: $draft.interval, in: 2...3600)
-                        TextField("Modifier tags (space separated)", text: Binding(get: { draft.modTags.joined(separator: " ") }, set: { draft.modTags = $0.split(whereSeparator: \.isWhitespace).map(String.init) }))
-                    }
-                    Section("Display") {
-                        Toggle("Show Clock", isOn: $draft.showClock)
-                        Toggle("Show Sensors", isOn: $draft.showSensors)
-                        Picker("Spatial playback", selection: $draft.slideshow3DMode) {
-                            ForEach(Slideshow3DPreference.allCases) { Text($0.label).tag($0) }
-                        }
-                    }
-                } else {
-                    Section("Website") {
-                        TextField("Page URL", text: $draft.webPageURL).textInputAutocapitalization(.never).autocorrectionDisabled()
-                        Toggle("Transparent Background", isOn: $draft.webTransparentBackground)
-                        Stepper("Refresh: \(Int(draft.webAutoRefreshInterval)) seconds", value: $draft.webAutoRefreshInterval, in: 0...3600, step: 15)
-                    }
-                }
-                if let error = draft.launchError { Text(error).foregroundStyle(.red) }
-            }
-            .navigationTitle("Edit Profile")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) { Button("Save") { save(draft) }.accessibilityIdentifier("roboframe.profile.save") }
-            }
-        }
-    }
-}
-
-struct ProfileDestination: View {
-    let profile: RoboFrameProfile
-    var body: some View {
-        switch profile.mode {
-        case .slideshow: SlideshowView(profile: profile)
-        case .webPage: WebPageView(profile: profile)
-        }
-    }
-}
-
-struct SlideshowView: View {
-    @Environment(\.scenePhase) private var scenePhase
-    @Environment(\.dismiss) private var dismiss
-    @State private var model: SlideshowModel
-    @State private var saveResult: String?
-    @State private var showHistory = false
-    @State private var controlsVisible = true
-    @State private var currentTime = Date()
-    private let clockTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
-
-    init(profile: RoboFrameProfile) { _model = State(initialValue: SlideshowModel(profile: profile)) }
-
-    var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-
-            if let effect = model.effectVideoURL {
-                VideoPlayer(player: AVPlayer(url: effect)).ignoresSafeArea()
-            } else if let post = model.current {
-                RoboFrameSlideshowSurface(model: model)
-                    .id(post.id)
-            } else {
-                ProgressView("Waiting for RoboFrame…").tint(.white).foregroundStyle(.white)
-            }
-
-            if model.profile.showClock {
-                SlideshowClockOverlay(time: currentTime)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 24)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            }
-
-            if model.profile.showSensors {
-                SlideshowSensorOverlay(model: model)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 24)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-            }
-
-            if let alert = model.alert {
-                AlertOverlay(alert: alert)
-            }
-            if controlsVisible {
-                SlideshowOrnamentView(
-                    model: model,
-                    showHistory: $showHistory,
-                    saveResult: $saveResult
-                )
-                .padding(.horizontal, 18)
-                .padding(.bottom, 24)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-            }
-        }
-        .contentShape(.rect)
-        .onTapGesture {
-            controlsVisible.toggle()
-        }
-        .sheet(isPresented: $showHistory) {
-            HistoryBrowserView(profile: model.profile)
-        }
-        .alert("RoboFrame", isPresented: Binding(get: { model.error != nil || saveResult != nil }, set: { if !$0 { model.clearError(); saveResult = nil } })) {
-            Button("OK", role: .cancel) { model.clearError(); saveResult = nil }
-        } message: { Text(model.error ?? saveResult ?? "") }
-        .task { model.start(); model.reportScene(active: true) }
-        .onDisappear { model.stop() }
-        .onChange(of: scenePhase) { _, phase in model.reportScene(active: phase == .active) }
-        .onReceive(clockTimer) { time in
-            currentTime = time
-        }
-    }
-}
-
-private struct SlideshowClockOverlay: View {
-    let time: Date
-
-    var body: some View {
-        HStack {
-            Text(time, format: .dateTime.hour().minute())
-                .font(.title3.monospacedDigit())
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .foregroundStyle(.white)
-                .background(.black.opacity(0.25), in: Capsule())
-            Spacer()
-        }
-    }
-}
-
-private struct SlideshowSensorOverlay: View {
-    let model: SlideshowModel
-
-    var body: some View {
-        let sensorList = model.sensors.values.sorted { $0.name < $1.name }
-        if !sensorList.isEmpty {
-            HStack(spacing: 10) {
-                ForEach(sensorList) { reading in
-                    Text("\(reading.name): \(reading.state)\(reading.unit)")
-                        .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .foregroundStyle(.white)
-                        .background(.black.opacity(0.25), in: Capsule())
-                }
-            }
-        }
-    }
-}
-
-private struct SlideshowOrnamentView: View {
-    let model: SlideshowModel
-    @Binding var showHistory: Bool
-    @Binding var saveResult: String?
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Button { dismiss() } label: {
-                Image(systemName: "xmark")
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.black.opacity(0.35))
-            .foregroundStyle(.white)
-
-            Button { showHistory = true } label: {
-                Image(systemName: "clock.arrow.circlepath")
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.black.opacity(0.35))
-            .foregroundStyle(.white)
-
-            Divider().frame(height: 26).foregroundStyle(.white.opacity(0.45))
-
-            Button { model.previous() } label: {
-                Image(systemName: "chevron.left")
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.black.opacity(0.35))
-            .foregroundStyle(.white)
-
-            Button { model.next() } label: {
-                Image(systemName: "chevron.right")
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.black.opacity(0.35))
-            .foregroundStyle(.white)
-
-            Divider().frame(height: 26).foregroundStyle(.white.opacity(0.45))
-
-            Button { Task { saveResult = await model.save() } } label: {
-                Image(systemName: "square.and.arrow.down")
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.black.opacity(0.35))
-            .foregroundStyle(.white)
-
-            Button { model.reshuffle() } label: {
-                Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90")
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.black.opacity(0.35))
-            .foregroundStyle(.white)
-
-            Menu {
-                ForEach(Array(model.tagLists.enumerated()), id: \.offset) { index, tags in
-                    Button(tags.joined(separator: " ")) { model.setTagList(index) }
-                }
-            } label: {
-                Label("Tags", systemImage: "number")
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.black.opacity(0.35))
-            .foregroundStyle(.white)
-
-            Button { model.setDisplaySync(true) } label: {
-                Label("Sync", systemImage: "link")
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.black.opacity(0.35))
-            .foregroundStyle(.white)
-
-            Button(role: .destructive) { model.block() } label: {
-                Image(systemName: "hand.raised.fill")
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.red.opacity(0.65))
-            .foregroundStyle(.white)
-
-            Spacer()
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(model.profile.name)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-                Text(model.profile.deviceId.isEmpty ? model.profile.endpoint : "device \(model.profile.deviceId)")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.white.opacity(0.75))
-                    .lineLimit(1)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(.black.opacity(0.25), in: Capsule())
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(Color.white.opacity(0.16), lineWidth: 1)
-        )
-        .frame(maxWidth: 1200)
-    }
-}
-
-struct MediaContent: View {
-    let url: URL
-    let post: RemotePost
-    let rendered: (Int?) -> Void
-    var body: some View {
-        if post.isVideo {
-            VideoPlayer(player: AVPlayer(url: url))
-                .onAppear { rendered(post.durationMs) }
-        } else {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let image): image.resizable().scaledToFit().onAppear { rendered(nil) }
-                case .failure: ContentUnavailableView("Media unavailable", systemImage: "exclamationmark.triangle")
-                default: ProgressView()
-                }
-            }
-        }
-    }
-}
-
-struct AlertOverlay: View {
-    let alert: RemoteAlert
-    var body: some View {
-        ZStack {
-            Color(hex: alert.colorHex).opacity(0.94).ignoresSafeArea()
-            VStack(spacing: 20) {
-                if let url = alert.imageURL { AsyncImage(url: url) { $0.image?.resizable().scaledToFit() }.frame(maxHeight: 300) }
-                Text(alert.text).font(.largeTitle.bold()).multilineTextAlignment(.center).foregroundStyle(.white)
-            }.padding(40)
-        }.accessibilityIdentifier("roboframe.remote.alert")
-    }
-}
-
-struct WebPageView: View {
-    @Environment(\.dismiss) private var dismiss
-    @State private var model: WebPageModel
-    @State private var controlsVisible = true
-    init(profile: RoboFrameProfile) { _model = State(initialValue: WebPageModel(profile: profile)) }
-    var body: some View {
-        ZStack(alignment: .top) {
-            if let webView = model.webView { WebView(webView: webView).allowsHitTesting(controlsVisible) }
-            else { ProgressView() }
-            if controlsVisible {
-                HStack {
-                    Button("Close") { dismiss() }
-                    Button("Home", action: model.goHome)
-                    Button("Reload", action: model.reload)
-                    Spacer()
-                    Text(model.title).lineLimit(1)
-                    Button("Hide") { controlsVisible = false; model.setInteractionEnabled(false) }
-                        .accessibilityIdentifier("roboframe.web.hide")
-                }.buttonStyle(.bordered).padding()
-            } else {
-                Color.white.opacity(0.001).contentShape(Rectangle()).onTapGesture { controlsVisible = true; model.setInteractionEnabled(true) }
-                    .accessibilityIdentifier("roboframe.web.reveal")
-            }
-        }
-        .task { model.start() }.onDisappear { model.stop() }
-    }
-}
-
-struct WebView: UIViewRepresentable {
-    let webView: WKWebView
-    func makeUIView(context: Context) -> WKWebView { webView }
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
-}
-
-extension Color {
-    init(hex: String) {
-        let value = UInt64(hex.trimmingCharacters(in: CharacterSet(charactersIn: "#")).trimmingCharacters(in: .whitespacesAndNewlines), radix: 16) ?? 0
-        self.init(red: Double((value >> 16) & 255) / 255, green: Double((value >> 8) & 255) / 255, blue: Double(value & 255) / 255)
-    }
+    /// Seeds a fresh draft with device-wide defaults. `RoboFrameProfile()`
+    /// already carries sensible baked-in defaults, so today this is a no-op
+    /// hook — kept as the seam Hypnos's `applySlideshowDefaults` occupies, in
+    /// case a device-wide "new profile" preset is added later.
+    func applyDefaults(to profile: inout RoboFrameProfile) {}
 }

@@ -6,6 +6,7 @@ enum ProfileMode: String, Codable, CaseIterable, Identifiable {
 
     var id: String { rawValue }
     var label: String { self == .slideshow ? "RoboFrame" : "Website" }
+    var systemImage: String { self == .slideshow ? "photo.stack" : "globe" }
 }
 
 struct RoboFrameProfile: Codable, Identifiable, Equatable {
@@ -25,9 +26,25 @@ struct RoboFrameProfile: Codable, Identifiable, Equatable {
     var webAutoRefreshInterval: Double = 0
     var slideshow3DMode: Slideshow3DPreference = .off
 
+    // Display settings mirrored from Hypnos's RemoteViewerConfig, so a
+    // profile carries the same knobs the slideshow ornament and Adjustments
+    // popover expose there.
+    var useAspectRatio: Bool = true
+    var enableKenBurns: Bool = true
+    var enableDynamicBrightness: Bool = true
+    var transparentBackground: Bool = false
+    var textSize: Double = 1.0
+
+    /// Per-profile resolution caps. `nil` inherits `AppSettings`'s device-wide
+    /// default, matching `RemoteViewerConfig.maxImageResolution2D/3D`.
+    var maxImageResolution2D: Int?
+    var maxImageResolution3D: Int?
+
     enum CodingKeys: String, CodingKey {
         case id, savedDate, name, mode, endpoint, deviceId, accessToken, interval, modTags
         case showClock, showSensors, webPageURL, webTransparentBackground, webAutoRefreshInterval, slideshow3DMode
+        case useAspectRatio, enableKenBurns, enableDynamicBrightness, transparentBackground, textSize
+        case maxImageResolution2D, maxImageResolution3D
     }
 
     init() {}
@@ -49,6 +66,13 @@ struct RoboFrameProfile: Codable, Identifiable, Equatable {
         webTransparentBackground = try values.decodeIfPresent(Bool.self, forKey: .webTransparentBackground) ?? false
         webAutoRefreshInterval = try values.decodeIfPresent(Double.self, forKey: .webAutoRefreshInterval) ?? 0
         slideshow3DMode = try values.decodeIfPresent(Slideshow3DPreference.self, forKey: .slideshow3DMode) ?? .off
+        useAspectRatio = try values.decodeIfPresent(Bool.self, forKey: .useAspectRatio) ?? true
+        enableKenBurns = try values.decodeIfPresent(Bool.self, forKey: .enableKenBurns) ?? true
+        enableDynamicBrightness = try values.decodeIfPresent(Bool.self, forKey: .enableDynamicBrightness) ?? true
+        transparentBackground = try values.decodeIfPresent(Bool.self, forKey: .transparentBackground) ?? false
+        textSize = try values.decodeIfPresent(Double.self, forKey: .textSize) ?? 1.0
+        maxImageResolution2D = try values.decodeIfPresent(Int.self, forKey: .maxImageResolution2D)
+        maxImageResolution3D = try values.decodeIfPresent(Int.self, forKey: .maxImageResolution3D)
     }
 
     var normalizedEndpoint: URL? {
@@ -111,6 +135,19 @@ struct RoboFrameProfile: Codable, Identifiable, Equatable {
         result.name = name
         return result
     }
+
+    /// Mirrors `RemoteViewerConfig.webAutoRefreshOptions` — the slider snap
+    /// points for "reload after this long with no interaction".
+    static let webAutoRefreshOptions: [Double] = [0, 30, 60, 120, 300, 600, 1800]
+
+    static func webAutoRefreshLabel(_ interval: Double) -> String {
+        guard interval > 0 else { return "Off" }
+        if interval < 60 { return "\(Int(interval))s" }
+        let minutes = Int(interval) / 60
+        return "\(minutes) min"
+    }
+
+    static let roboFrameRepositoryURL = URL(string: "https://github.com/illixion/RoboFrame")!
 }
 
 enum Slideshow3DPreference: String, Codable, CaseIterable, Identifiable {
@@ -124,6 +161,16 @@ enum Slideshow3DPreference: String, Codable, CaseIterable, Identifiable {
         case .off: "2D"
         case .spatial: "Spatial Images"
         case .pseudo3D: "Real-Time 3D Video"
+        }
+    }
+
+    /// Matches the icon set `RemoteViewerOrnamentView`'s 3D menu uses in
+    /// Hypnos so the ornament reads the same at a glance.
+    var systemImage: String {
+        switch self {
+        case .off: "view.3d"
+        case .spatial: "spatial.capture.fill"
+        case .pseudo3D: "move.3d"
         }
     }
 }

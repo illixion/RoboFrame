@@ -1,5 +1,6 @@
 import XCTest
 
+@MainActor
 final class RoboFrameClientUITests: XCTestCase {
     private let app = XCUIApplication()
 
@@ -8,10 +9,17 @@ final class RoboFrameClientUITests: XCTestCase {
     }
 
     func testCreatesWebsiteProfile() throws {
+        app.launchArguments = ["-UITestProfile=empty"]
         app.launch()
         app.buttons["roboframe.profile.new"].tap()
         let name = app.textFields["roboframe.profile.name"]
         name.tap()
+        // The draft starts with a non-empty placeholder name ("New Profile",
+        // deduplicated) — mirrors Hypnos's `RemoteTabView.newDraft()`, which
+        // seeds "New Configuration" rather than leaving the field blank.
+        // Select-all before typing so the replacement is exact regardless of
+        // where the tap happened to land the caret.
+        name.typeKey("a", modifierFlags: .command)
         name.typeText("Kitchen Panel")
         app.buttons["roboframe.profile.save"].tap()
         XCTAssertTrue(app.staticTexts["Kitchen Panel"].waitForExistence(timeout: 2))
