@@ -177,11 +177,15 @@ struct SlideshowView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var model: SlideshowModel
     @State private var saveResult: String?
+    @State private var showHistory = false
+    @State private var controlsVisible = true
 
     init(profile: RoboFrameProfile) { _model = State(initialValue: SlideshowModel(profile: profile)) }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
+
             if let effect = model.effectVideoURL {
                 VideoPlayer(player: AVPlayer(url: effect)).ignoresSafeArea()
             } else if let post = model.current {
@@ -190,23 +194,36 @@ struct SlideshowView: View {
             } else {
                 ProgressView("Waiting for RoboFrame…").tint(.white).foregroundStyle(.white)
             }
-            VStack {
-                HStack {
-                    if model.profile.showClock { Text(Date.now, format: .dateTime.hour().minute()).font(.title2.monospacedDigit()) }
-                    Spacer()
-                    ForEach(model.sensors.values.sorted(by: { $0.name < $1.name })) { Text("\($0.name): \($0.state)\($0.unit)") }
-                }.foregroundStyle(.white).padding()
+
+            VStack(alignment: .leading, spacing: 0) {
+                if controlsVisible {
+                    SlideshowTopBar(model: model)
+                        .padding(.horizontal, 18)
+                        .padding(.top, 24)
+                }
+
                 Spacer()
-                HStack {
-                    Button("Close") { dismiss() }
-                    Button("Next", action: model.next)
-                    Button("Shuffle", action: model.reshuffle)
-                    Button("Block", role: .destructive, action: model.block)
-                    Button("Save") { Task { saveResult = await model.save() } }
-                    Menu("Tags") { ForEach(Array(model.tagLists.enumerated()), id: \.offset) { index, tags in Button(tags.joined(separator: " ")) { model.setTagList(index) } } }
-                }.buttonStyle(.bordered).padding()
+
+                if controlsVisible {
+                    SlideshowControlBar(
+                        model: model,
+                        showHistory: $showHistory,
+                        saveResult: $saveResult
+                    )
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 24)
+                }
             }
-            if let alert = model.alert { AlertOverlay(alert: alert) }
+
+            if let alert = model.alert {
+                AlertOverlay(alert: alert)
+            }
+        }
+        .sheet(isPresented: $showHistory) {
+            HistoryBrowserView(profile: model.profile)
+        }
+        .onTapGesture {
+            controlsVisible.toggle()
         }
         .alert("RoboFrame", isPresented: Binding(get: { model.error != nil || saveResult != nil }, set: { if !$0 { model.clearError(); saveResult = nil } })) {
             Button("OK", role: .cancel) { model.clearError(); saveResult = nil }
@@ -214,6 +231,135 @@ struct SlideshowView: View {
         .task { model.start(); model.reportScene(active: true) }
         .onDisappear { model.stop() }
         .onChange(of: scenePhase) { _, phase in model.reportScene(active: phase == .active) }
+    }
+}
+
+private struct SlideshowTopBar: View {
+    let model: SlideshowModel
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            if model.profile.showClock {
+                Text(Date.now, format: .dateTime.hour().minute())
+                    .font(.title3.monospacedDigit())
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .foregroundStyle(.white)
+                    .background(.black.opacity(0.25), in: Capsule())
+            }
+
+            Spacer()
+
+            if model.profile.showSensors {
+                let sensorList = model.sensors.values.sorted { $0.name < $1.name }
+                if !sensorList.isEmpty {
+                    HStack(spacing: 10) {
+                        ForEach(sensorList) { reading in
+                            Text("\(reading.name): \(reading.state)\(reading.unit)")
+                                .font(.caption.weight(.semibold))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .foregroundStyle(.white)
+                                .background(.black.opacity(0.25), in: Capsule())
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct SlideshowControlBar: View {
+    let model: SlideshowModel
+    @Binding var showHistory: Bool
+    @Binding var saveResult: String?
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button { dismiss() } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.black.opacity(0.35))
+            .foregroundStyle(.white)
+
+            Button { showHistory = true } label: {
+                Image(systemName: "clock.arrow.circlepath")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.black.opacity(0.35))
+            .foregroundStyle(.white)
+
+            Divider().frame(height: 26).foregroundStyle(.white.opacity(0.45))
+
+            Button { model.previous() } label: {
+                Image(systemName: "chevron.left")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.black.opacity(0.35))
+            .foregroundStyle(.white)
+
+            Button { model.next() } label: {
+                Image(systemName: "chevron.right")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.black.opacity(0.35))
+            .foregroundStyle(.white)
+
+            Divider().frame(height: 26).foregroundStyle(.white.opacity(0.45))
+
+            Button { Task { saveResult = await model.save() } } label: {
+                Image(systemName: "square.and.arrow.down")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.black.opacity(0.35))
+            .foregroundStyle(.white)
+
+            Button { model.reshuffle() } label: {
+                Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.black.opacity(0.35))
+            .foregroundStyle(.white)
+
+            Menu {
+                ForEach(Array(model.tagLists.enumerated()), id: \.offset) { index, tags in
+                    Button(tags.joined(separator: " ")) { model.setTagList(index) }
+                }
+            } label: {
+                Label("Tags", systemImage: "number")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.black.opacity(0.35))
+            .foregroundStyle(.white)
+
+            Button { model.setDisplaySync(true) } label: {
+                Label("Sync", systemImage: "link")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.black.opacity(0.35))
+            .foregroundStyle(.white)
+
+            Button(role: .destructive) { model.block() } label: {
+                Image(systemName: "hand.raised.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.red.opacity(0.65))
+            .foregroundStyle(.white)
+
+            Spacer()
+
+            Text(model.profile.name)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.black.opacity(0.25), in: Capsule())
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 }
 

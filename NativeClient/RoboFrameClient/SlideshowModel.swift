@@ -65,6 +65,7 @@ final class SlideshowModel {
     }
 
     func next() { pool.send(sessionID: sessionID, profile: profile, action: "requestNext") }
+    func previous() { engine.previous() }
     func reshuffle() { pool.send(sessionID: sessionID, profile: profile, action: "reshuffle") }
     func block() {
         guard let current else { return }
