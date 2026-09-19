@@ -15,7 +15,7 @@
 // the client's hardware decoder handles them as-is. Anything taller, faster,
 // or in another codec is downscaled/downsampled to fit. A cap of `0` means "no
 // cap" (source resolution / frame rate): Pi kiosks ask for 720/30, while a
-// client that renders H.264 directly (Spatialstash) asks for 0/0 to get the
+// client that renders H.264 directly (Hypnos) asks for 0/0 to get the
 // original. VideoToolbox encodes when available, else libx264 -preset ultrafast.
 //
 // The height cap is the real throttle for Pi-class kiosks. A Pi 3's
@@ -41,7 +41,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 // Cache entries carry the target height and fps cap so requests with
-// different budgets (a kiosk's 720p30 vs Spatialstash's original 0p0fps)
+// different budgets (a kiosk's 720p30 vs Hypnos's original 0p0fps)
 // don't collide. The matcher also sweeps up legacy `${id}.h264.mp4` /
 // `${id}.h264.720p.mp4` files (pre-fps cache) and MJPEG variants so they age
 // out of the size budget like any other. `0` in either slot means "no cap"
@@ -80,7 +80,7 @@ function createVideoTranscoder({
 
   // A source already H.264 within the height + fps caps is served raw — the
   // client decodes it as-is, no transcode. Either cap set to `0` means "no
-  // cap": clients that want the source resolution / frame rate (Spatialstash,
+  // cap": clients that want the source resolution / frame rate (Hypnos,
   // which renders via an <img> and can take original H.264) pass 0/0. Pi-class
   // kiosks pass 720/30. The +1 fps tolerance keeps 29.97 NTSC on its native
   // cadence (an exact check would resample it).
@@ -366,9 +366,9 @@ function createVideoTranscoder({
   // Animated-still → short looping H.264 mp4, sharing encodeArgs with the
   // video-post path. Animated JXL posts are delivered as video to every client
   // that can decode it (the web kiosk's <video>, native-kiosk's mpv,
-  // Spatialstash's <img>); this is the encode step. `maxHeight`/`maxFps` cap
+  // Hypnos's <img>); this is the encode step. `maxHeight`/`maxFps` cap
   // the output — Pi kiosks pass 720/30, clients that want the source geometry
-  // (Spatialstash) pass 0/0. The caller passes the APNG it already produced
+  // (Hypnos) pass 0/0. The caller passes the APNG it already produced
   // from the source via djxl — ffmpeg's apng demuxer reads it, but only from
   // a seekable file (it errors "Function not implemented" on a pipe), so the
   // APNG is staged to a temp file first. The mp4 still streams out over pipe:1
@@ -412,7 +412,7 @@ function createVideoTranscoder({
     return path.join(cachePath, `${id}.hls.${maxHeight}p.${maxFps}fps`);
   }
 
-  // HLS variant for Safari/WebKit clients (Spatialstash's `<video>`). Safari
+  // HLS variant for Safari/WebKit clients (Hypnos's `<video>`). Safari
   // refuses to play an on-the-fly transcode piped as a single unbounded mp4
   // (no Content-Length → it never produces media metadata), but plays HLS
   // fMP4 fine, starting on segment 0 while later segments are still encoding —

@@ -89,7 +89,7 @@ test('animatedToMp4 encodes an APNG to fMP4, capped to 720p30', { skip: !hasFfmp
     assert.ok(capped.height <= 720, `height capped to 720, got ${capped.height}`);
     assert.ok(capped.fps <= 31, `frame rate capped to ~30fps, got ${capped.fps}`);
 
-    // Uncapped (Spatialstash profile): source resolution + frame rate.
+    // Uncapped (Hypnos profile): source resolution + frame rate.
     const orig = probe(await t.animatedToMp4(fs.readFileSync(apngPath), { maxHeight: 0, maxFps: 0 }), 'orig');
     assert.equal(orig.height, 1440, `uncapped keeps source height, got ${orig.height}`);
     assert.ok(orig.fps > 31, `uncapped keeps source frame rate, got ${orig.fps}`);

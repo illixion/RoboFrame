@@ -45,7 +45,7 @@
 // Each WS connection can host multiple logical *sessions*, addressed by a
 // per-message `sessionId`. The orchestrator's session key is `(ws, sessionId)`,
 // and a single ws can have sessions in multiple channels at once. This is
-// what lets one Spatialstash app instance multiplex several remote-viewer
+// what lets one Hypnos app instance multiplex several remote-viewer
 // windows over a single TCP/TLS path.
 //
 //   slideshowConfig { sessionId, deviceId, interval, ratio, width, height, bright, convert, modTags? }
@@ -685,7 +685,7 @@ function createOrchestrator({
         // First-ready wins: a single visible session reporting `imageReady`
         // starts the dwell timer. Requiring *every* session to report wedged
         // the channel whenever clients mixed on one deviceId (e.g. a web kiosk
-        // and Spatialstash) reported at different speeds or one left
+        // and Hypnos) reported at different speeds or one left
         // mid-barrier. An empty expected set (all hidden) promotes too —
         // there's no one to wait for. `ready` is always a subset of
         // `expectedReady` (notifyImageReady gates on it), so a non-empty

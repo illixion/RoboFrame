@@ -2,7 +2,7 @@
   "_comment": "Copy this to roboframe.config.json and fill in your values. The file is gitignored. Per-service .env files keep working — env vars override anything in this file.",
 
   "accessToken": "REPLACE_ME_DIFFERENT_FROM_RPC_TOKEN",
-  "_accessTokenComment": "Read-mostly token shared by every WebSocket consumer (kiosks, node-display, spatialstash). Required to connect to /rpc/ws but cannot call privileged `rpcsend`. Top-level so the same value can be copied to client and server configs.",
+  "_accessTokenComment": "Read-mostly token shared by every WebSocket consumer (kiosks, node-display, hypnos). Required to connect to /rpc/ws but cannot call privileged `rpcsend`. Top-level so the same value can be copied to client and server configs.",
 
   "deviceId": "screen1",
   "_deviceIdComment": "Identifier this kiosk joins channels and HA entities under. Shared by node-display and native-kiosk on the same host (and by any browser kiosk URL that names this id via ?ws=). Override with the DEVICE_ID env var.",

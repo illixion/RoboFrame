@@ -68,7 +68,7 @@ End-to-end works. **Two settings dominate cost and quality:**
 
 **Layer 1 — generic signaling:** `rtcSignal` action in `broker.js`
 (`{streamId, kind, from, to, data}`), relaying between rpc-tier producers and
-access-tier consumers. Update `docs/protocol.md` + Spatialstash (can ignore it
+access-tier consumers. Update `docs/protocol.md` + Hypnos (can ignore it
 initially) + `public/modules/ws-client.js`.
 
 **Layer 2 — renderer service** behind `server.features.webrtcStreaming` (off by

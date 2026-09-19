@@ -676,7 +676,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
 
             } else if (action === 'reportMetrics') {
                 // Device → broker: periodic process-wide memory/state sample
-                // (web kiosk JS errors or Spatialstash). Appended to telemetry.jsonl
+                // (web kiosk JS errors or Hypnos). Appended to telemetry.jsonl
                 // for diagnosing multi-window slideshow memory pressure during
                 // live playback. Not part of the slideshow loop.
                 const deviceId = payload?.deviceId;
@@ -703,7 +703,7 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 if (orchestrator) orchestrator.register(ws, sessionId, payload || {});
                 const deviceId = payload?.deviceId;
                 attachDeviceId(ws, deviceId);
-                // Spatialstash briefly encoded its persistent window UUID as a
+                // Hypnos briefly encoded its persistent window UUID as a
                 // deviceId suffix. The corrected protocol uses that UUID as the
                 // sessionId, so the server can remove the retained HA discovery
                 // entries from that old format without a client-only mapping.

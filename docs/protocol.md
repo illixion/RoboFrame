@@ -1,15 +1,15 @@
 # RoboFrame WebSocket protocol
 
 The orchestrator drives playback for every connected display. This doc is
-the reference for anyone writing a client (browser kiosk, Spatialstash
+the reference for anyone writing a client (browser kiosk, Hypnos
 window, hardware controller, debugger). The contract has a few
 non-obvious rules — the *Critical flows* section calls them out
 explicitly so a fresh implementation doesn't land in the same traps the
 existing clients already navigated.
 
 The shipped clients are the canonical implementations: web kiosk
-([`public/modules/`](../public/modules/)), Spatialstash
-([`SpatialStash/SpatialStash/Services/RemoteWebSocketClient.swift`](https://github.com/illixion/Spatialstash/blob/main/SpatialStash/SpatialStash/Services/RemoteWebSocketClient.swift)),
+([`public/modules/`](../public/modules/)), Hypnos
+([`SpatialStash/SpatialStash/Services/RemoteWebSocketClient.swift`](https://github.com/illixion/Hypnos/blob/main/SpatialStash/SpatialStash/Services/RemoteWebSocketClient.swift)),
 node-display
 ([`node-display/server.js`](../node-display/server.js)), and the native
 SDL2 kiosk ([`native-kiosk/kiosk.py`](../native-kiosk/kiosk.py)) for
@@ -40,7 +40,7 @@ imageReady, sensor) only.
 
 A **session** is one logical slideshow audience addressed by a `sessionId`
 on a WebSocket connection. Each WS can carry many sessions — this is how
-a single Spatialstash app instance multiplexes ten remote-viewer windows
+a single Hypnos app instance multiplexes ten remote-viewer windows
 over one TCP/TLS path. Each session calls `slideshowConfig` independently
 to join the **channel** for its `(deviceId, sessionId)` pair. Different
 session ids on the same device get independent queues, intervals, and tag
@@ -202,7 +202,7 @@ player can read.
 The orchestrator's readiness barrier starts the dwell timer as soon as
 the **first** present session on the channel reports for the current
 image — first-ready wins, not all-ready. When several clients share a
-`deviceId` (e.g. a web kiosk and Spatialstash), the slowest doesn't gate
+`deviceId` (e.g. a web kiosk and Hypnos), the slowest doesn't gate
 the channel and a client leaving mid-barrier can't wedge it. Send it
 once per successful transition (matching the broadcast `current.id`). A
 channel whose sessions are all absent (each reported `present {false}`)
@@ -252,7 +252,7 @@ every socket reporting it.
 
 Only a client whose window-state genuinely tracks a person reports it:
 - **node-display** — its PIR motion loop (`/pir/motion`, `/pir/clear`).
-- **Spatialstash on Vision Pro** — the headset *is* the person, so its
+- **Hypnos on Vision Pro** — the headset *is* the person, so its
   scenePhase (one pinned window per room) is a legitimate occupancy
   signal; it reports `visibility` alongside `present`.
 
@@ -278,7 +278,7 @@ Keyed on `(ws, sessionId)` and routed to that session's channel. This lets
 two windows share one stable `deviceId` for MQTT/Home Assistant while
 pausing and resuming their slideshow queues independently. Only clients
 that actually *render* the slideshow send it (web frontend, native-kiosk,
-Spatialstash). A **service client** like node-display — which drives the
+Hypnos). A **service client** like node-display — which drives the
 physical panel and reports PIR but never renders (never sends
 `slideshowConfig`) — sends `visibility`/`reportDisplay` but **not**
 `present`; renderers that have not reported explicit presence fall back to the
@@ -447,7 +447,7 @@ commands and effect actions (`playVideo`, `playScene`, `showText`,
 switch's command topic.
 
 ### `reportMetrics`, `reportLog` (connection-wide, optional)
-Device telemetry for diagnostics — emitted by Spatialstash when its Console
+Device telemetry for diagnostics — emitted by Hypnos when its Console
 developer toggle is on (quasi-dev-mode), not by default. Both are
 connection-wide (no `sessionId`) and the broker appends them to an
 append-only `imagemirror/telemetry.jsonl` (rotated at ~5 MB to a single `.1`
@@ -461,7 +461,7 @@ show the app already trimmed/suspended.
 ```json
 { "action": "reportMetrics", "payload": {
   "deviceId": "vision1",
-  "app": "spatialstash",
+  "app": "hypnos",
   "footprintMB": 1840,
   "availableMB": 920,
   "gpuMB": 1420,
@@ -489,7 +489,7 @@ crashes are visible without a console attached.
 ```json
 { "action": "reportLog", "payload": {
   "deviceId": "vision1",
-  "app": "spatialstash",
+  "app": "hypnos",
   "level": "warning",
   "domain": "memory",
   "message": "Memory warning — trimmed 3 slideshow window(s), 2 photo window(s)",
@@ -565,7 +565,7 @@ with `sessionIds: ["win1", ..., "win10"]`).
     through a looping `<video>` (or mpv) exactly like a video post.
   - `vcodec=h264` → **`video/mp4`** (H.264) at the source resolution and
     frame rate (cap with `vmaxh`/`vmaxfps`; `0` = no cap). For clients
-    that render H.264 as an animated image (Spatialstash's `<img>`).
+    that render H.264 as an animated image (Hypnos's `<img>`).
   - `gif=1` → **`image/gif`** (256-color, per-frame timing preserved).
     The opt-out for clients that can't decode mp4 (PSP kiosk).
   - none of the above → **`image/webp`** (animated).
@@ -595,7 +595,7 @@ with `sessionIds: ["win1", ..., "win10"]`).
   when the transition completes.
 - Clients MUST pause video playback when the display is off
   (`displayState: off`, the page is hidden, or the platform equivalent
-  — e.g. Spatialstash's `scenePhase` going to `.background`) and
+  — e.g. Hypnos's `scenePhase` going to `.background`) and
   SHOULD release the media session entirely (`<video>` removed from
   the DOM, AVPlayer torn down) so single-source platforms like
   visionOS aren't pinned by a paused-but-attached video.
@@ -638,7 +638,7 @@ How a client honors `displayState: off` is platform-specific, but every
 slideshow client should report `visibility { deviceId, false }` while
 held off so the server parks the channel instead of riding the
 readiness-timeout fallback. The web kiosk blanks its render layer (the
-panel itself goes dark); Spatialstash keeps the current image rendered
+panel itself goes dark); Hypnos keeps the current image rendered
 and decoded — there's no physical panel to power down — so the PIR/HA
 wake that follows (`displayState: on` → report `visibility true`)
 resumes the same frame with no pop-in. While held off, do not send
@@ -713,7 +713,7 @@ consume: the native kiosk plays `rtsp` in mpv (hardware H.264 decode),
 the web kiosk subscribes to `whep` over WebRTC. Any credentials travel
 as query parameters inside those URLs; `streamId` is informational.
 Clients without a matching transport — or that don't implement the
-action at all (Spatialstash may ignore it) — drop the frame silently.
+action at all (Hypnos may ignore it) — drop the frame silently.
 A scene occupies the same screen tier as `playVideo`: starting either
 tears the other down, and both pre-empt a playing slideshow video,
 which resumes when the effect clears. The stream ending on its own
@@ -828,7 +828,7 @@ Implications for clients:
 
 Pick a stable `deviceId` for MQTT, display control, telemetry, and history.
 Browser kiosks read it from the `?ws=` URL parameter; node-display and
-Spatialstash pull it from config. Do not append transient window UUIDs.
+Hypnos pull it from config. Do not append transient window UUIDs.
 
 The server forms the slideshow channel identity from `(deviceId, sessionId)`.
 Multi-window clients therefore reuse the configured `deviceId` and assign

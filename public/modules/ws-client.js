@@ -62,7 +62,7 @@ function showFatalBanner(text) {
 }
 
 // Single-session client — every session-scoped action carries this
-// constant id. Multiplexing clients (Spatialstash multi-window) generate
+// constant id. Multiplexing clients (Hypnos multi-window) generate
 // per-window ids; the kiosk only ever has one slideshow per page.
 export const KIOSK_SESSION_ID = 'main';
 

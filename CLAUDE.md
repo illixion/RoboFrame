@@ -1,6 +1,6 @@
 # RoboFrame — Claude notes
 
-A modular digital photo frame. Browser kiosks (and Spatialstash visionOS
+A modular digital photo frame. Browser kiosks (and Hypnos visionOS
 windows) pull images from a local DuckDB-indexed library, sync across
 devices through a central WebSocket broker, and integrate with Home
 Assistant. One Node server process; one workspace per concern.
@@ -9,7 +9,7 @@ User-facing docs live in [README.md](README.md). This file is for
 Claude — repo orientation, how-to-run, and the few rules that aren't
 obvious from the code.
 
-Spatialstash is a separate app that implements the same protocol in Swift, it is located in the parent folder of this repo, make sure to keep it up-to-date with any protocol changes.
+Hypnos is a separate app that implements the same protocol in Swift, it is located in the parent folder of this repo, make sure to keep it up-to-date with any protocol changes.
 
 ## Layout
 
@@ -93,7 +93,7 @@ The CLI is the only writer to the DuckDB. The server opens it read-only.
 ## The protocol doc — keep it current
 
 The WebSocket protocol is the public contract for every client (web kiosk,
-Spatialstash, node-display, third-party). It lives in
+Hypnos, node-display, third-party). It lives in
 [docs/protocol.md](docs/protocol.md).
 
 **When you change anything in [`imagemirror/lib/broker.js`](imagemirror/lib/broker.js)
@@ -101,7 +101,7 @@ or [`imagemirror/lib/orchestrator.js`](imagemirror/lib/orchestrator.js)
 that affects the wire protocol — adding/removing/renaming actions,
 changing payload fields, changing semantics of an existing action —
 update `docs/protocol.md` in the same commit.** A drifted protocol doc
-is what put a "warning icon every other cycle" bug into Spatialstash;
+is what put a "warning icon every other cycle" bug into Hypnos;
 the fix had to ship in two repos. Treat the doc as part of the public
 API surface.
 
@@ -109,7 +109,7 @@ The shipped clients are the second source of truth. If they need
 updates to track a server change, ship those too:
 - Web kiosk: [`public/modules/ws-client.js`](public/modules/ws-client.js)
   + the action-specific module.
-- Spatialstash: `~/Projects/Spatialstash/SpatialStash/SpatialStash/Services/RemoteWebSocketClient.swift`
+- Hypnos: `~/Projects/Hypnos/SpatialStash/SpatialStash/Services/RemoteWebSocketClient.swift`
   + `Views/Remote/RemoteViewerModel.swift`.
 - node-display: [`node-display/server.js`](node-display/server.js).
 
@@ -266,7 +266,7 @@ the deadline) is the canary for the wake-advance class of bug.
     `0` = no cap) — for clients that render H.264 as an animated image.
   - `gif=1` → animated **GIF** (PSP); no flag → animated **WebP**.
   - `rawanimated=1` → the **untouched source** (no conversion) — for a client
-    that decodes animated formats itself. Spatialstash uses this: animated JXL
+    that decodes animated formats itself. Hypnos uses this: animated JXL
     goes to its on-device WASM decoder, GIF/WebP animate directly in `<img>`.
   The response `Content-Type` is the only signal — the post's `ext` stays
   `jxl` — so clients switch renderer by sniffing the fetched MIME type
@@ -280,7 +280,7 @@ the deadline) is the canary for the wake-advance class of bug.
   (`${id}.h264.${h}p.${fps}fps.mp4`). `width`/`height` on `/get` are
   optional — `0`/absent means no resize (source resolution).
 - **`vcodec=hls` streams a video post as HLS fMP4** for Safari/WebKit
-  `<video>` (Spatialstash's streaming fallback). Safari won't play an
+  `<video>` (Hypnos's streaming fallback). Safari won't play an
   unbounded chunked mp4 (no `Content-Length` → no media metadata), but plays
   HLS starting on segment 0 while the rest still encodes — the only way to
   *stream* a cold transcode to Safari. ffmpeg writes a growing `event`
@@ -289,7 +289,7 @@ the deadline) is the canary for the wake-advance class of bug.
   finish makes it replay as VOD. `/get?vcodec=hls` returns the playlist with
   segment URIs rewritten to authenticated `/get?vcodec=hlsseg&seg=…` URLs;
   `vcodec=hlsseg` serves one Range-capable segment (name validated against
-  path traversal). Spatialstash reaches this only after `<img src=`raw`>` and
+  path traversal). Hypnos reaches this only after `<img src=`raw`>` and
   `<video src=`raw`>` both fail — see its 3-tier video escalation.
 - **`bright` is direct RGB multiply, not alpha.** The old alpha-modulation
   path was equivalent (alpha-over-black ≡ RGB×α) but JPEG-incompatible.

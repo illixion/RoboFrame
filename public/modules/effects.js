@@ -119,7 +119,7 @@ export function playAudio(url) {
     document.body.appendChild(audioElement);
 
     // 30s safety net — keeps the web client's behaviour aligned with
-    // the spatialstash side (visionOS SystemSound APIs hard-cap at 30s)
+    // the hypnos side (visionOS SystemSound APIs hard-cap at 30s)
     // and stops a long stream from monopolising the page accidentally.
     audioElement.addEventListener('loadedmetadata', () => {
         if (Number.isFinite(audioElement.duration) && audioElement.duration > 30) {

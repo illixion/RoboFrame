@@ -25,7 +25,7 @@ let lastSavedPost = null;
 // hold resume server-driven playback. The server is never told to go back
 // (all renderers sharing this deviceId + sessionId share one channel —
 // yanking the whole channel backwards for one viewer's peek is the wrong scope), so this mirrors
-// Spatialstash's history-jump: a local suppression window, per client.
+// Hypnos's history-jump: a local suppression window, per client.
 const HISTORY_MAX = 100;
 let history = [];               // [{ id, ext }] chronological, newest last
 let backSteps = 0;              // how many steps back from newest we're viewing

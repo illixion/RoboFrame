@@ -202,13 +202,13 @@ test('multiplexed sessions on one device keep independent presence and queues', 
     const ws = makeFakeWs();
     const raw = orch.raw;
 
-    raw.register(ws, 'window-a', { deviceId: 'spatialstash', interval: 60000 });
+    raw.register(ws, 'window-a', { deviceId: 'hypnos', interval: 60000 });
     await tick(); await tick(); await tick();
-    raw.register(ws, 'window-b', { deviceId: 'spatialstash', interval: 60000 });
+    raw.register(ws, 'window-b', { deviceId: 'hypnos', interval: 60000 });
     await tick(); await tick(); await tick();
 
-    const a = raw._channelFor('spatialstash', 'window-a');
-    const b = raw._channelFor('spatialstash', 'window-b');
+    const a = raw._channelFor('hypnos', 'window-a');
+    const b = raw._channelFor('hypnos', 'window-b');
     assert.equal(orch._channels.size, 2, 'one socket still owns two independent channels');
     assert.notEqual(a.currentId, b.currentId);
     raw.notifyImageReady(ws, 'window-a', a.currentId);
@@ -486,7 +486,7 @@ test('a re-registering session resumes a stalled channel', async (t) => {
 test('readiness timeout is per-channel: one wedged deviceId does not promote a co-tenant', async (t) => {
     const { orch } = harness({ readyTimeout: 40 });
     t.after(() => orch.close());
-    // Two distinct deviceIds (as Spatialstash multiplexes over one socket).
+    // Two distinct deviceIds (as Hypnos multiplexes over one socket).
     const wedged = makeFakeWs();
     const healthy = makeFakeWs();
     orch.register(wedged, { deviceId: 'screenA', interval: 5000 });

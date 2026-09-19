@@ -738,7 +738,7 @@ async function computeVariant({ id, convert, bright, width, height, lowmem, wall
 
   if (animatedMode) {
     if (rawanimated) {
-      // Client decodes the animated source itself (Spatialstash: JXL via its
+      // Client decodes the animated source itself (Hypnos: JXL via its
       // WASM decoder, GIF/WebP via `<img>`). Hand back the untouched bytes so
       // no server-side WebP/GIF/mp4 conversion runs.
       finalBuffer = data;
@@ -755,7 +755,7 @@ async function computeVariant({ id, convert, bright, width, height, lowmem, wall
       // it — an H.264 mp4, sharing the video-post encode path (see
       // lib/videoTranscode.js). lowmem (Pi-class decoders) and convert (the web
       // kiosk, which can't decode JXL at all) cap it at 720p30; `vcodec=h264`
-      // (Spatialstash, which renders it via an <img>) takes the source
+      // (Hypnos, which renders it via an <img>) takes the source
       // resolution/frame rate unless vmaxh/vmaxfps say otherwise.
       const caps = (!lowmem && !convert && h264)
         ? { maxHeight: vmaxh, maxFps: vmaxfps }
@@ -814,14 +814,14 @@ function variantKeyParts(query) {
     wallpaper: Boolean(Number(query.wallpaper) || 0),
     gif: Boolean(Number(query.gif) || 0),
     // `vcodec=h264` on an animated post asks for H.264 mp4 (a client that
-    // renders video-as-image, e.g. Spatialstash). vmaxh/vmaxfps cap the encode
+    // renders video-as-image, e.g. Hypnos). vmaxh/vmaxfps cap the encode
     // (0 = source resolution / frame rate); absent → 0.
     h264: query.vcodec === 'h264',
     vmaxh: Math.max(0, Number(query.vmaxh) || 0),
     vmaxfps: Math.max(0, Number(query.vmaxfps) || 0),
     // `rawanimated=1`: deliver an animated post as its untouched source rather
     // than a converted WebP/GIF/mp4 — for clients that decode animated JXL/GIF/
-    // WebP themselves (Spatialstash: JXL via its WASM decoder, GIF/WebP via
+    // WebP themselves (Hypnos: JXL via its WASM decoder, GIF/WebP via
     // `<img>`). Stills are unaffected (already served raw).
     rawanimated: Boolean(Number(query.rawanimated) || 0),
   };
@@ -970,7 +970,7 @@ async function processRequestV2(req, res) {
         else res.status(503).send('mjpeg transcode unavailable');
         return;
       }
-      // vcodec=hls: HLS fMP4 for Safari/WebKit `<video>` (Spatialstash's
+      // vcodec=hls: HLS fMP4 for Safari/WebKit `<video>` (Hypnos's
       // streaming fallback). Safari won't play an unbounded chunked mp4, but
       // plays HLS starting on segment 0 while the rest still encodes. The
       // playlist's segment URIs are rewritten to authenticated
@@ -1027,7 +1027,7 @@ async function processRequestV2(req, res) {
       // live. Sources already in H.264 within the caps, a missing ffmpeg, or a
       // saturated transcoder all fall through to the raw file. `vmaxh`/`vmaxfps`
       // cap output height/frame rate; `0` means no cap (Pi kiosks send 720/30,
-      // Spatialstash sends 0/0 for the source geometry). Absent vmaxh keeps the
+      // Hypnos sends 0/0 for the source geometry). Absent vmaxh keeps the
       // legacy 1080 default; absent vmaxfps keeps 30.
       if (req.query.vcodec === 'h264' && await videoTranscoder.available()) {
         const vmaxh = req.query.vmaxh === '0'

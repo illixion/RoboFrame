@@ -29,13 +29,13 @@ function keyOf(parts) {
     const width = Number(parts.width) || 0;
     const height = Number(parts.height) || 0;
     // h264/vmaxh/vmaxfps drive the animated-post mp4 variant; keying on them
-    // keeps Spatialstash's original-resolution H.264 from colliding with a
+    // keeps Hypnos's original-resolution H.264 from colliding with a
     // kiosk's 720p30 mp4 (or a plain WebP) for the same id.
     const h264 = parts.h264 ? 1 : 0;
     const vmaxh = Number(parts.vmaxh) || 0;
     const vmaxfps = Number(parts.vmaxfps) || 0;
     // rawanimated serves an animated post as its untouched source (a client
-    // that decodes JXL/GIF/WebP itself, e.g. Spatialstash) — distinct bytes
+    // that decodes JXL/GIF/WebP itself, e.g. Hypnos) — distinct bytes
     // from the converted WebP/GIF/mp4 variants, so it must key separately.
     const ra = parts.rawanimated ? 1 : 0;
     return `${id}|c${convert}|b${bright}|l${lowmem}|wp${wallpaper}|g${gif}|w${width}|h${height}|x${h264}|vh${vmaxh}|vf${vmaxfps}|ra${ra}`;
