@@ -38,6 +38,10 @@ struct ProfileManagerView: View {
 
     @State private var didSeedDefaults = false
     @State private var newModTagPreset = ""
+    @State private var showBackupExporter = false
+    @State private var backupExportDocument: RoboFrameSettingsBackupDocument?
+    @State private var isPreparingBackup = false
+    @State private var backupImporter = SettingsBackupImporter()
     #if !os(visionOS)
     // iOS only: a single-window `.fullScreenCover` presentation. visionOS
     // instead opens the "slideshow-viewer" `WindowGroup` (see `launch(_:)`),
@@ -81,6 +85,7 @@ struct ProfileManagerView: View {
         NavigationStack {
             List {
                 savedProfilesSection
+                backupSection
                 editingSection
 
                 Section {
@@ -177,6 +182,15 @@ struct ProfileManagerView: View {
             }
             .manageWindow(ManagedWindows.main())
             #endif
+            .fileExporter(
+                isPresented: $showBackupExporter,
+                document: backupExportDocument,
+                contentType: .json,
+                defaultFilename: "RoboFrame-Backup-\(backupDateString()).json"
+            ) { _ in
+                backupExportDocument = nil
+            }
+            .settingsBackupImport(backupImporter)
         }
     }
 
@@ -296,6 +310,64 @@ struct ProfileManagerView: View {
                 .disabled(profile.launchError != nil)
                 .accessibilityIdentifier("roboframe.profile.open")
         }
+    }
+
+    // MARK: - Backup
+
+    /// Export/import for the client's own profiles and device-wide settings.
+    /// Also accepts a settings backup exported from Hypnos's Settings tab —
+    /// RoboFrame and Hypnos share a lineage, and `RoboFrameProfile` mirrors
+    /// Hypnos's `RemoteViewerConfig` closely enough that a user migrating
+    /// from Hypnos can bring their saved RoboFrame server profiles over
+    /// instead of retyping every endpoint, device ID and token by hand.
+    @ViewBuilder
+    private var backupSection: some View {
+        Section {
+            Button {
+                isPreparingBackup = true
+                let backup = store.exportBackup()
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                encoder.dateEncodingStrategy = .iso8601
+                if let data = try? encoder.encode(backup) {
+                    backupExportDocument = RoboFrameSettingsBackupDocument(data: data)
+                    showBackupExporter = true
+                }
+                isPreparingBackup = false
+            } label: {
+                if isPreparingBackup {
+                    HStack {
+                        ProgressView().scaleEffect(0.8)
+                        Text("Preparing...")
+                    }
+                } else {
+                    Label("Export Settings", systemImage: "square.and.arrow.up")
+                }
+            }
+            .disabled(isPreparingBackup)
+
+            Button {
+                backupImporter.pickFile()
+            } label: {
+                Label("Import Settings", systemImage: "square.and.arrow.down")
+            }
+
+            Button {
+                backupImporter.loadNewestFromDocuments()
+            } label: {
+                Label("Import from Documents Folder", systemImage: "folder")
+            }
+        } header: {
+            Text("Backup")
+        } footer: {
+            Text("Exports every saved profile and device-wide setting to a JSON file. Importing also accepts a settings backup exported from Hypnos, adding its RoboFrame server profiles to the list above.")
+        }
+    }
+
+    private func backupDateString() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: Date())
     }
 
     // MARK: - Editing status

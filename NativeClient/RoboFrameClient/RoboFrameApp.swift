@@ -101,4 +101,72 @@ final class ProfileStore {
     /// hook — kept as the seam Hypnos's `applySlideshowDefaults` occupies, in
     /// case a device-wide "new profile" preset is added later.
     func applyDefaults(to profile: inout RoboFrameProfile) {}
+
+    // MARK: - Settings backup
+
+    /// Snapshots profiles plus the device-wide settings that live outside
+    /// this store (`AppSettings`, `ModTagManager`) into one portable backup.
+    func exportBackup() -> RoboFrameSettingsBackup {
+        let appSettings = AppSettings.shared
+        let modTags = ModTagManager.shared
+        return RoboFrameSettingsBackup(
+            version: RoboFrameSettingsBackup.currentVersion,
+            exportDate: Date(),
+            appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown",
+            profiles: profiles,
+            defaultMaxImageResolution2D: appSettings.defaultMaxImageResolution2D,
+            defaultMaxImageResolution3D: appSettings.defaultMaxImageResolution3D,
+            globalVisualAdjustments: try? JSONEncoder().encode(appSettings.globalVisualAdjustments),
+            modTagLists: modTags.modTagLists,
+            modTagDefaultIndex: modTags.defaultIndex,
+            modTagLastActiveIndex: modTags.lastActiveIndex
+        )
+    }
+
+    /// Restores a RoboFrame-native backup. Profiles are wholesale-replaced
+    /// when present (a restore is expected to put the device back exactly as
+    /// the backup describes it); every other field only overwrites when
+    /// present, so an older/partial backup leaves the rest untouched.
+    func importBackup(_ backup: RoboFrameSettingsBackup) {
+        if let imported = backup.profiles {
+            profiles = imported
+            selectedID = profiles.first?.id
+            persist()
+        }
+
+        let appSettings = AppSettings.shared
+        if let v = backup.defaultMaxImageResolution2D { appSettings.defaultMaxImageResolution2D = v }
+        if let v = backup.defaultMaxImageResolution3D { appSettings.defaultMaxImageResolution3D = v }
+        if let data = backup.globalVisualAdjustments,
+           let decoded = try? JSONDecoder().decode(VisualAdjustments.self, from: data) {
+            appSettings.globalVisualAdjustments = decoded
+        }
+
+        let modTags = ModTagManager.shared
+        if let v = backup.modTagLists { modTags.modTagLists = v }
+        if let v = backup.modTagDefaultIndex { modTags.defaultIndex = v }
+        if let v = backup.modTagLastActiveIndex { modTags.switchToPreset(v) }
+    }
+
+    /// Migrates a Hypnos settings backup: converted profiles are added
+    /// alongside whatever RoboFrame already has (Hypnos knows nothing about
+    /// this device's existing profiles, so there's nothing to reconcile
+    /// against), and the device-wide resolution defaults are applied the same
+    /// way `RoboFrameSettingsBackup` does. Returns the number of profiles
+    /// added.
+    @discardableResult
+    func importHypnosBackup(_ backup: HypnosSettingsBackup) -> Int {
+        let converted = backup.convertedProfiles
+        if !converted.isEmpty {
+            profiles.append(contentsOf: converted)
+            selectedID = converted.first?.id
+            persist()
+        }
+
+        let appSettings = AppSettings.shared
+        if let v = backup.maxImageResolution { appSettings.defaultMaxImageResolution2D = v }
+        if let v = backup.spatial3DMaxResolution { appSettings.defaultMaxImageResolution3D = v }
+
+        return converted.count
+    }
 }
