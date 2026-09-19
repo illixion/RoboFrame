@@ -9,7 +9,7 @@ existing clients already navigated.
 
 The shipped clients are the canonical implementations: web kiosk
 ([`public/modules/`](../public/modules/)), Hypnos
-([`SpatialStash/SpatialStash/Services/RemoteWebSocketClient.swift`](https://github.com/illixion/Hypnos/blob/main/SpatialStash/SpatialStash/Services/RemoteWebSocketClient.swift)),
+([`Hypnos/Hypnos/Services/RemoteWebSocketClient.swift`](https://github.com/illixion/Hypnos/blob/main/Hypnos/Hypnos/Services/RemoteWebSocketClient.swift)),
 node-display
 ([`node-display/server.js`](../node-display/server.js)), and the native
 SDL2 kiosk ([`native-kiosk/kiosk.py`](../native-kiosk/kiosk.py)) for

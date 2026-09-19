@@ -109,7 +109,7 @@ The shipped clients are the second source of truth. If they need
 updates to track a server change, ship those too:
 - Web kiosk: [`public/modules/ws-client.js`](public/modules/ws-client.js)
   + the action-specific module.
-- Hypnos: `~/Projects/Hypnos/SpatialStash/SpatialStash/Services/RemoteWebSocketClient.swift`
+- Hypnos: `~/Projects/Hypnos/Hypnos/Hypnos/Services/RemoteWebSocketClient.swift`
   + `Views/Remote/RemoteViewerModel.swift`.
 - node-display: [`node-display/server.js`](node-display/server.js).
 
