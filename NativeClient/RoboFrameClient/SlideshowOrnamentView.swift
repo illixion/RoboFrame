@@ -10,6 +10,7 @@ import SwiftUI
 
 struct SlideshowOrnamentView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
     let model: SlideshowModel
     @Binding var showHistory: Bool
     @State private var showAdjustments = false
@@ -20,7 +21,13 @@ struct SlideshowOrnamentView: View {
         HStack(spacing: RAVEChromeMetrics.spacing) {
             // Back to the profile list — RoboFrame's equivalent of Hypnos's
             // "Grid" button, which returns to the app's main gallery window.
-            Button { dismiss() } label: {
+            Button {
+                #if os(visionOS)
+                openWindow(id: "main")
+                #else
+                dismiss()
+                #endif
+            } label: {
                 Image(systemName: "square.grid.2x2").font(.title3)
             }
             .raveChromeButtonStyle()
