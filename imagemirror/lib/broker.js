@@ -838,9 +838,40 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
     // action so they can render outdoor temperature, humidity, etc. All
     // control flow goes through the MQTT bridge above; this path never
     // calls services and never echoes anything back to HA.
+    //
+    // Liveness: a network blip (NAT rebind, tailscale hiccup, sleep/wake)
+    // can leave this socket ESTABLISHED at the TCP level with nothing ever
+    // arriving again — `close`/`error` never fire on a half-open connection,
+    // so relying on those alone wedges every kiosk on a stale snapshot
+    // forever (confirmed live 2026-09-24: this socket sat at 0 bytes for
+    // 35+ minutes with zero reconnect attempts, while the MQTT bridge below
+    // self-healed via its own keepalive the whole time). Same fix as
+    // RAVEWebSocketTransport (SpatialHome/Hypnos): send an app-level HA
+    // ping on an interval and force a reconnect if no frame at all — pong
+    // or otherwise — has arrived by the time the timeout elapses. A stale
+    // `readyState === OPEN` can't be trusted to tell a dead connection from
+    // a live one, so the recovery is an unconditional teardown, not a retry.
     let haSocket = null;
     let haMessageId = 1;
     let haGetStatesId = 0;
+    let haLastReceiveAt = 0;
+    let haReconnectAttempt = 0;
+    let haReconnectTimer = null;
+    let haHeartbeatTimer = null;
+    let haDisabled = false; // set on auth_invalid — a bad token won't fix itself on retry
+
+    const HA_PING_INTERVAL_MS = 25000;
+    const HA_PONG_TIMEOUT_MS = 10000;
+    const HA_RECONNECT_MIN_MS = 2000;
+    const HA_RECONNECT_MAX_MS = 30000;
+
+    function scheduleHaReconnect() {
+        if (haDisabled || haReconnectTimer) return;
+        const delay = Math.min(HA_RECONNECT_MAX_MS, HA_RECONNECT_MIN_MS * Math.pow(2, haReconnectAttempt++));
+        console.log(`Disconnected from Home Assistant, reconnecting in ${Math.round(delay / 1000)}s...`);
+        haReconnectTimer = setTimeout(() => { haReconnectTimer = null; connectToHA(); }, delay);
+        if (typeof haReconnectTimer.unref === 'function') haReconnectTimer.unref();
+    }
 
     function connectToHA() {
         haSocket = new WebSocket(HA_URL);
@@ -849,13 +880,16 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
             haSocket.send(JSON.stringify({ type: 'auth', access_token: HA_TOKEN }));
         });
         haSocket.on('message', (data) => {
+            haLastReceiveAt = Date.now();
             const message = JSON.parse(data);
             if (message.type === 'auth_invalid') {
                 console.error('HA authentication failed:', message.message, '— disabling HA sensor forwarding');
+                haDisabled = true;
                 haSocket.close();
                 return;
             }
             if (message.type === 'auth_ok') {
+                haReconnectAttempt = 0; // real traffic proves the connection; reset backoff
                 // Subscribe to future changes, then prime the cache with a
                 // one-shot get_states so reconnecting clients see current
                 // readings even if no state_changed event fired since the
@@ -894,16 +928,34 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
                 });
             }
         });
-        haSocket.on('close', () => {
-            console.log('Disconnected from Home Assistant, reconnecting in 5s...');
-            setTimeout(connectToHA, 5000);
-        });
+        haSocket.on('close', scheduleHaReconnect);
         haSocket.on('error', (err) => console.error('Home Assistant WebSocket Error:', err));
     }
 
     if (HA_ENABLED) {
         console.log('Home Assistant sensor forwarding enabled');
         connectToHA();
+        // App-level ping + staleness check, since HA's ping/pong is a JSON
+        // command over the same message stream, not a WS-protocol ping —
+        // any inbound frame (including a plain state_changed) counts as
+        // proof of life, same as the pong itself would.
+        haHeartbeatTimer = setInterval(() => {
+            if (haDisabled || !haSocket || haSocket.readyState !== WebSocket.OPEN) return;
+            const socket = haSocket;
+            const sentAt = Date.now();
+            try { socket.send(JSON.stringify({ id: haMessageId++, type: 'ping' })); }
+            catch (_) { return; }
+            setTimeout(() => {
+                // Only act if this is still the same connection attempt and
+                // nothing at all arrived since the ping went out. Terminate
+                // (not close) — a half-open peer won't ACK a close frame
+                // either, and terminate() tears the socket down immediately.
+                if (haSocket !== socket || haLastReceiveAt >= sentAt) return;
+                console.warn(`[HA] No response within ${HA_PONG_TIMEOUT_MS}ms — forcing reconnect`);
+                try { socket.terminate(); } catch (_) { try { socket.close(); } catch (__) { /* ignore */ } }
+            }, HA_PONG_TIMEOUT_MS);
+        }, HA_PING_INTERVAL_MS);
+        if (typeof haHeartbeatTimer.unref === 'function') haHeartbeatTimer.unref();
     } else {
         console.log('Home Assistant sensor forwarding disabled (HA_URL and HA_TOKEN not configured)');
     }
@@ -928,6 +980,9 @@ function setupBroker({ server, app, config, dataPath, search, reshuffle, increme
         if (dataWatcher) dataWatcher.close();
         if (orchestrator) orchestrator.close();
         if (mqtt) mqtt.close();
+        haDisabled = true;
+        if (haHeartbeatTimer) clearInterval(haHeartbeatTimer);
+        if (haReconnectTimer) clearTimeout(haReconnectTimer);
         if (haSocket) {
             haSocket.removeAllListeners('close');
             try { haSocket.close(); } catch (_) { /* ignore */ }
