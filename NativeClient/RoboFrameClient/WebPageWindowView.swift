@@ -7,6 +7,7 @@
  below — it is the sole way back once controls are hidden).
  */
 
+import RAVEUI
 import SwiftUI
 
 struct WebPageWindowView: View {
@@ -62,7 +63,15 @@ struct WebPageWindowView: View {
         // Backstop for the in-front catcher above (and the reveal path when
         // the page failed to load, so there's no WebView in the way at all).
         .onTapGesture { showControls() }
+        #if os(visionOS)
+        // The plain, resizable "slideshow-viewer" window: visionOS resets
+        // persistentSystemOverlays on every user resize regardless of this
+        // condition's value, so a plain conditional modifier only survives
+        // until the first resize. See RAVEUI's autoHidingSystemOverlays.
+        .autoHidingSystemOverlays(when: !controlsVisible)
+        #else
         .persistentSystemOverlays(controlsVisible ? .automatic : .hidden)
+        #endif
         #if os(iOS)
         .statusBarHidden(!controlsVisible)
         #endif

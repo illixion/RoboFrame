@@ -17,6 +17,7 @@
  */
 
 import Combine
+import RAVEUI
 import SwiftUI
 
 struct SlideshowWindowView: View {
@@ -94,7 +95,15 @@ struct SlideshowWindowView: View {
             withAnimation { controlsVisible.toggle() }
             resetAutoHideTimer()
         }
+        #if os(visionOS)
+        // The plain, resizable "slideshow-viewer" window: visionOS resets
+        // persistentSystemOverlays on every user resize regardless of this
+        // condition's value, so a plain conditional modifier only survives
+        // until the first resize. See RAVEUI's autoHidingSystemOverlays.
+        .autoHidingSystemOverlays(when: !controlsVisible)
+        #else
         .persistentSystemOverlays(controlsVisible ? .automatic : .hidden)
+        #endif
         #if os(iOS)
         .statusBarHidden(!controlsVisible)
         #endif
