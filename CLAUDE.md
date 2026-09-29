@@ -222,6 +222,18 @@ the deadline) is the canary for the wake-advance class of bug.
   all — a genuine DB view, immune to whatever the frames are doing. It still
   dedups arrivals by id as a belt-and-suspenders backstop for whatever order a
   user explicitly types in.
+- **`/history` shows the display's own variant.** Each history entry records
+  the `/get` query that produced it (`variantQuery` in `index.js`), and the
+  page re-requests exactly that (minus `bright`) — a variant-cache hit at
+  display resolution. Don't point it back at a fixed thumbnail size: every
+  other size is a fresh djxl + sharp decode of the original, and those
+  extra variants evict the kiosks' prefetched frames from the cache.
+- **Memory is bounded in three places.** DuckDB's buffer pool
+  (`server.duckdbMemoryLimit`, default 1GB — DuckDB's own default is 80% of
+  RAM and it keeps every file-DB page it reads), variant computes in flight
+  (`lib/computeLimiter.js`, shared by `/get` misses and prefetch), and the
+  variant cache's byte cap. A new code path that decodes originals goes
+  through the compute limiter.
 - **Two token tiers.** `accessToken` (kiosk tier) ≠ `rpcToken`
   (privileged tier). They must differ. `rpcsend` over WebSocket and
   HTTP `/rpc/send` both require the rpc tier.

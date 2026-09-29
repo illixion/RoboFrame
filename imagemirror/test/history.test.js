@@ -144,3 +144,18 @@ test('/history.json reflects empty state', async () => {
         await new Promise((resolve) => server.close(resolve));
     }
 });
+
+test('listGroups carries the variant a display fetched, and the latest fetch wins', () => {
+    const h = createHistory();
+    h.addEntry({ id: 5, ext: 'jpg', deviceId: 'pi', variant: 'convert=1&width=1920&height=1080&lowmem=1' });
+    h.addEntry({ id: 6, ext: 'mp4', deviceId: 'pi' });
+    h.addEntry({ id: 5, ext: 'jpg', deviceId: 'pi', variant: 'convert=1&width=1280&height=720' });
+    assert.deepEqual(h.listGroups(), [
+        { deviceId: 'pi', posts: [
+            { id: 5, ext: 'jpg', variant: 'convert=1&width=1280&height=720' },
+            { id: 6, ext: 'mp4' },
+        ] },
+    ]);
+    assert.deepEqual(h.listJson(), [{ id: 5, ext: 'jpg' }, { id: 6, ext: 'mp4' }],
+        '/history.json stream shape is unchanged');
+});

@@ -44,8 +44,12 @@ imagemirror/telemetry.jsonl.1
 # Per-install, never committed.
 imagemirror/custom_pages/
 
-# On-demand H.264 transcodes served by /get?vcodec=h264. Per-install cache.
-imagemirror/video_cache/
+# On-demand H.264 transcodes served by /get?vcodec=h264. Per-install cache
+# (no trailing slash, so a symlink to an external volume is ignored too).
+imagemirror/video_cache
+
+# DuckDB spill files past server.duckdbMemoryLimit.
+imagemirror/.duckdb_tmp/
 
 # Build artifacts
 dist/

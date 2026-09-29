@@ -18,6 +18,7 @@ const { createTagExpander, identityExpander } = require('./lib/tagExpansion');
 const { createHistory } = require('./lib/history');
 const { createImageCache } = require('./lib/imageCache');
 const { createPrefetcher } = require('./lib/prefetcher');
+const { createComputeLimiter } = require('./lib/computeLimiter');
 const { createVideoTranscoder } = require('./lib/videoTranscode');
 const { createSceneProducer } = require('./lib/sceneProducer');
 
@@ -121,6 +122,15 @@ const IMAGE_CACHE_MAX_BYTES = pickEnv('IMAGE_CACHE_MAX_BYTES', srv.cache?.maxByt
 const PREFETCH_CONCURRENCY = pickEnv('IMAGE_PREFETCH_CONCURRENCY', srv.cache?.prefetchConcurrency, 2, { type: 'number' });
 const PREFETCH_DISABLED = pickEnv('IMAGE_PREFETCH_DISABLED', srv.cache?.prefetchDisabled, false, { type: 'boolean' });
 const imageCache = createImageCache({ maxBytes: IMAGE_CACHE_MAX_BYTES });
+// Variant computes in flight at once, across /get misses and prefetch (see
+// lib/computeLimiter.js): each decodes a full-resolution original, so this
+// is what bounds transient memory.
+const COMPUTE_CONCURRENCY = pickEnv('IMAGE_COMPUTE_CONCURRENCY', srv.cache?.computeConcurrency, 2, { type: 'number' });
+const computeLimiter = createComputeLimiter({ concurrency: COMPUTE_CONCURRENCY });
+// libvips' operation cache would keep decoded intermediates of recent
+// originals alive; the variant cache above already holds every output we
+// reuse, so it only costs memory here.
+sharp.cache(false);
 const prefetcher = createPrefetcher({
   concurrency: PREFETCH_CONCURRENCY,
   enabled: !PREFETCH_DISABLED,
@@ -799,6 +809,23 @@ async function computeVariant({ id, convert, bright, width, height, lowmem, wall
   return { buffer: finalBuffer, mime: finalMimeType, ext, animated: animatedMode };
 }
 
+// The /get query that reproduces a variant (everything keyOf keys on but
+// the id). /history records it so its page can request exactly the bytes a
+// display was sent — a variant-cache hit — instead of re-converting the
+// original at some other size.
+function variantQuery(parts) {
+  const q = new URLSearchParams();
+  for (const flag of ['convert', 'bright', 'lowmem', 'wallpaper', 'gif', 'rawanimated']) {
+    if (parts[flag]) q.set(flag, '1');
+  }
+  if (parts.width) q.set('width', String(parts.width));
+  if (parts.height) q.set('height', String(parts.height));
+  if (parts.h264) q.set('vcodec', 'h264');
+  if (parts.vmaxh) q.set('vmaxh', String(parts.vmaxh));
+  if (parts.vmaxfps) q.set('vmaxfps', String(parts.vmaxfps));
+  return q.toString();
+}
+
 function variantKeyParts(query) {
   const id = Number(query.id) || 0;
   return {
@@ -1061,7 +1088,12 @@ async function processRequestV2(req, res) {
       return;
     }
 
-    const entry = await imageCache.getOrCompute(parts, () => computeVariant(parts));
+    // A viewer is waiting: jump a queued prefetch of this same variant (the
+    // cache's single-flight hands us its promise) and run interactive.
+    const variantKey = imageCache.keyOf(parts);
+    computeLimiter.promote(variantKey);
+    const entry = await imageCache.getOrCompute(parts,
+      () => computeLimiter.run(() => computeVariant(parts), { key: variantKey }));
     if (cancelled || res.headersSent) return;
     // Record in /history's per-display log. `deviceId` comes from the kiosk's
     // /get query; requests without one (iOS Shortcuts via /random, etc.)
@@ -1073,6 +1105,7 @@ async function processRequestV2(req, res) {
         id: parts.id,
         ext: entry.ext,
         deviceId: req.query.deviceId ? String(req.query.deviceId) : '',
+        variant: variantQuery(parts),
       });
     }
     res.setHeader('Content-Type', entry.mime);
@@ -1105,6 +1138,14 @@ const DUCKDB_PATH = pickEnv('DUCKDB_PATH', srv.duckdbPath, 'posts.duckdb');
 // responsive while the scan runs. Non-positive / non-finite → DuckDB default
 // (all cores). Applied at instance creation, not hot-reloadable.
 const DUCKDB_THREADS = pickEnv('DUCKDB_THREADS', srv.duckdbThreads, 4, { type: 'number' });
+// DuckDB's own default memory limit is 80% of RAM, and its buffer pool keeps
+// every page of the file DB it has read (a posts_tags scan pulls in over a GB)
+// until it hits that limit, so the process just grows. A bound makes it evict
+// file pages (re-readable) first; the in-memory state it must keep —
+// random_ranks and the materialized match sets — spills to the temp dir past
+// the limit instead of failing.
+const DUCKDB_MEMORY_LIMIT = pickEnv('DUCKDB_MEMORY_LIMIT', srv.duckdbMemoryLimit, '1GB');
+const DUCKDB_TEMP_DIR = pickEnv('DUCKDB_TEMP_DIR', srv.duckdbTempDir, path.join(__dirname, '.duckdb_tmp'));
 // How often the in-memory random_ranks table (random ordering + per-post
 // display_count) is rebuilt from scratch — reshuffling the deck and zeroing
 // view counts so the slideshow doesn't ossify around the same images.
@@ -1283,12 +1324,13 @@ async function saveRandomRanks() {
 (async () => {
   try {
     const threads = Number(DUCKDB_THREADS);
-    const instanceConfig = Number.isFinite(threads) && threads > 0
-      ? { threads: String(Math.floor(threads)) }
-      : undefined;
+    const instanceConfig = { temp_directory: DUCKDB_TEMP_DIR };
+    if (Number.isFinite(threads) && threads > 0) instanceConfig.threads = String(Math.floor(threads));
+    if (DUCKDB_MEMORY_LIMIT && String(DUCKDB_MEMORY_LIMIT) !== '0') instanceConfig.memory_limit = String(DUCKDB_MEMORY_LIMIT);
     const instance = await DuckDBInstance.create(':memory:', instanceConfig);
     db = wrapConnection(await instance.connect());
-    if (instanceConfig) console.log(`DuckDB threads capped at ${instanceConfig.threads}`);
+    if (instanceConfig.threads) console.log(`DuckDB threads capped at ${instanceConfig.threads}`);
+    console.log(`DuckDB memory limit ${instanceConfig.memory_limit || 'default (80% of RAM)'}, spill dir ${DUCKDB_TEMP_DIR}`);
     await attachReadOnlyFileDb();
     await loadRandomRanks();
     ranksReady = true;
@@ -1339,7 +1381,8 @@ async function saveRandomRanks() {
     // Prefetcher needs to invoke computeVariant through the cache so that a
     // /get arriving mid-compute shares the same promise.
     const prefetchVariant = (parts) =>
-      imageCache.getOrCompute(parts, () => computeVariant(parts));
+      imageCache.getOrCompute(parts, () => computeLimiter.run(() => computeVariant(parts),
+        { priority: 'background', key: imageCache.keyOf(parts) }));
     brokerRef = setupBroker({
       server, app, config, dataPath: DATA_PATH, search, reshuffle, incrementDisplayCount,
       imageCache, prefetcher, prefetchVariant,

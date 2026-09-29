@@ -28,7 +28,10 @@ function createHistory({ maxSize = 50 } = {}) {
     const existingIndex = arr.findIndex((e) => e.id === entry.id);
     if (existingIndex !== -1) arr.splice(existingIndex, 1);
     seq += 1;
-    arr.unshift({ id: entry.id, ext: entry.ext, deviceId, seq });
+    // `variant` is the /get query the display fetched (absent for entries
+    // recorded via /addtohistory or a video stream), so the /history page
+    // can re-request the identical, already-cached bytes.
+    arr.unshift({ id: entry.id, ext: entry.ext, deviceId, seq, variant: entry.variant || '' });
     if (arr.length > maxSize) arr.pop();
   }
 
@@ -42,14 +45,16 @@ function createHistory({ maxSize = 50 } = {}) {
 
   // /history (HTML) groups by display, newest-active display first. Each
   // group carries id + ext posts (ext lets the template tell a video from an
-  // image so it can render a first-frame preview instead of a broken <img>)
-  // plus the bucket size so the page can decide how many to show before
-  // expanding.
+  // image so it can render a first-frame preview instead of a broken <img>),
+  // the variant the display was sent, plus the bucket size so the page can
+  // decide how many to show before expanding.
   function listGroups() {
     return [...buckets.entries()]
       .map(([deviceId, arr]) => ({
         deviceId,
-        posts: arr.map((e) => ({ id: e.id, ext: e.ext })),
+        posts: arr.map((e) => (e.variant
+          ? { id: e.id, ext: e.ext, variant: e.variant }
+          : { id: e.id, ext: e.ext })),
         seq: arr.length ? arr[0].seq : 0,
       }))
       .filter((g) => g.posts.length > 0)

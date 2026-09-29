@@ -18,6 +18,8 @@
     "savePath": "/tmp",
     "duckdbPath": "./posts.duckdb",
     "duckdbThreads": 4,
+    "duckdbMemoryLimit": "1GB",
+    "_duckdbMemoryLimitComment": "DuckDB buffer-pool bound. Its own default is 80% of RAM, and it keeps every file-DB page it has read until then. File pages are evicted first; in-memory state spills to duckdbTempDir (default imagemirror/.duckdb_tmp). '0' = DuckDB default. Applied at startup. Env overrides: DUCKDB_MEMORY_LIMIT, DUCKDB_TEMP_DIR.",
     "_duckdbThreadsComment": "Max cores DuckDB may use per query. Match-set builds are full-table scans that would otherwise saturate every core; half the cores keeps image conversion and the event loop responsive. 0 or negative = DuckDB default (all cores). Applied at startup, NOT hot-reloaded. Env override: DUCKDB_THREADS.",
     "djxlPath": "djxl",
     "chunkSize": 0,
