@@ -50,7 +50,7 @@ private final class PooledConnection {
     init(url: URL) {
         transport = RAVEWebSocketTransport(
             configuration: .init(url: url),
-            logger: RoboFrameNetLogger(url: url),
+            logger: RoboFrameNetLogger(),
             pingFrameProvider: { #"{"action":"ping"}"# },
             failurePolicy: { failure in
                 failure.closeCode == .policyViolation
@@ -168,31 +168,18 @@ private final class PooledConnection {
     }
 }
 
-/// Where RAVENet's transport lines go. RAVENet hands them over as finished
-/// Strings, so they can't carry per-value privacy, and its default logger
-/// writes them `.public` — including "connecting to <url>", whose query holds
-/// this profile's access token. So the token is cut out first, and the rest is
-/// `.private`: the server address and URLError text read on this device's own
-/// console in a development build and as `<private>` in every export.
+/// Where RAVENet's transport lines go. RAVENet logs its endpoint without the
+/// query, so this profile's access token (`?token=`) never reaches a log, and
+/// hashes the host in exports; the rest keeps RAVENet's per-value privacy.
 private struct RoboFrameNetLogger: RAVENetLogger {
     private static let logger = DebugLogger(subsystem: "com.illixion.roboframe.client", category: "websocket")
-    /// The token as it appears in the query, decoded and percent-encoded.
-    private let secrets: [String]
 
-    init(url: URL) {
-        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        let decoded = components?.queryItems?.first { $0.name == "token" }?.value
-        let encoded = components?.percentEncodedQueryItems?.first { $0.name == "token" }?.value
-        secrets = Array(Set([decoded, encoded].compactMap { $0 }.filter { !$0.isEmpty }))
-    }
-
-    func log(_ level: RAVENetLogLevel, _ message: String) {
-        let line = secrets.reduce(message) { $0.replacingOccurrences(of: $1, with: "<sensitive>") }
+    func log(_ level: RAVENetLogLevel, _ message: DebugLogMessage) {
         switch level {
-        case .debug: Self.logger.debug("\(line, privacy: .private)")
-        case .info: Self.logger.info("\(line, privacy: .private)")
-        case .warning: Self.logger.warning("\(line, privacy: .private)")
-        case .error: Self.logger.error("\(line, privacy: .private)")
+        case .debug: Self.logger.debug(message)
+        case .info: Self.logger.info(message)
+        case .warning: Self.logger.warning(message)
+        case .error: Self.logger.error(message)
         }
     }
 }
