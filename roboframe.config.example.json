@@ -87,7 +87,7 @@
   },
 
   "kiosk": {
-    "_comment": "Optional. Native SDL2 frontend (native-kiosk/kiosk.py) — a Chromium replacement for memory-constrained boards (Pi 3) running X11 + Openbox. Connects to the same WebSocket as the browser kiosk and renders pixels with pygame + Pillow. Env overrides: WS_URL, ACCESS_TOKEN, INTERVAL, BRIGHT, LOWMEM, RATIO_FILTER, WALLPAPER, MOD_TAGS, GRAB_KEYBOARD.",
+    "_comment": "Optional. Native SDL2 frontend (native-kiosk/kiosk.py) — a Chromium replacement for memory-constrained boards (Pi 3) running X11 + Openbox. Connects to the same WebSocket as the browser kiosk and renders pixels with pygame + Pillow. Env overrides: WS_URL, ACCESS_TOKEN, INTERVAL, BRIGHT, LOWMEM, RATIO_FILTER, WALLPAPER, MOD_TAGS, GRAB_KEYBOARD, MPV_DEMUXER_MAX_BYTES, MPV_DEMUXER_MAX_BACK_BYTES, MAX_MEDIA_BYTES.",
     "wsUrl": "ws://localhost:3123/rpc/ws",
     "interval": 15000,
     "bright": false,
@@ -98,6 +98,11 @@
     "_wallpaperComment": "When true, /get composes each frame onto a width×height canvas so it always fills the screen (cover-crop when the aspect is close, fit-with-fill otherwise). Relies on and forces ratioFilter on so the queue is biased to matching-aspect posts that cover-crop edge to edge. Env override: WALLPAPER.",
     "grabKeyboard": true,
     "_grabKeyboardComment": "When true (default), the kiosk reads the keypad/keyboard directly from /dev/input (evdev) and EVIOCGRABs the devices, instead of relying on X11 keyboard focus. This is what keeps the GPIO keypad and any USB keyboard working while a video is on screen — an mpv window (even embedded via --wid) can take X input focus and otherwise swallow every shortcut for the clip's duration. Requires the process to be in the 'input' group; falls back to the pygame/X-focus path when evdev is unavailable (e.g. macOS). Env override: GRAB_KEYBOARD.",
-    "modTags": []
+    "modTags": [],
+    "mpvDemuxerMaxBytes": "32MiB",
+    "mpvDemuxerMaxBackBytes": "32MiB",
+    "_mpvDemuxerComment": "Bounds on mpv's network read-ahead / back buffer for slideshow videos. mpv's own defaults (150 MiB + 50 MiB) let one long clip take ~200 MB of a 1 GB board. The back buffer must hold a whole short (shorter-than-interval) clip so --loop-file can rewind it in-cache on a live transcode stream; 32 MiB covers ~50 s at the server's 720p budget. Env overrides: MPV_DEMUXER_MAX_BYTES, MPV_DEMUXER_MAX_BACK_BYTES.",
+    "maxMediaBytes": 67108864,
+    "_maxMediaBytesComment": "Largest /get response accepted for a still or an animated clip (bytes). Stills arrive as server-resized JPEGs far below this; the cap guards against a long animated clip being staged into RAM (/tmp is tmpfs on an overlayroot Pi). A post over the cap is skipped. Env override: MAX_MEDIA_BYTES."
   }
 }

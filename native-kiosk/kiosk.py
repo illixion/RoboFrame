@@ -55,6 +55,7 @@ import json
 import logging
 import os
 import queue
+import re
 import selectors
 import shutil
 import signal
@@ -91,6 +92,21 @@ except Exception:
     ecodes = None
 
 log = logging.getLogger("kiosk")
+
+
+class _RedactTokens(logging.Filter):
+    """Blank `token=` query values in every log line. requests' HTTPError
+    messages and the playVideo/playAudio URLs carry the access token, and
+    this journal is shipped off-box."""
+
+    _RE = re.compile(r"(token=)[^&\s'\"]+")
+
+    def filter(self, record):
+        msg = record.getMessage()
+        redacted = self._RE.sub(r"\1REDACTED", msg)
+        if redacted != msg:
+            record.msg, record.args = redacted, None
+        return True
 
 KIOSK_SESSION_ID = "main"
 SESSION = requests.Session()
@@ -158,6 +174,18 @@ def load_config():
     # headroom but only ~realtime at 1080p, where real content stutters. A
     # roomier board can set 1080 to keep full resolution.
     video_max_height = int(pick("VIDEO_MAX_HEIGHT", kiosk.get("videoMaxHeight"), 720))
+    # mpv's network demuxer cache. mpv's own defaults (150 MiB ahead + 50 MiB
+    # behind) let a single long clip pull ~200 MB into a 1 GB board. The
+    # back buffer must still hold a whole short clip for --loop-file to
+    # rewind in-cache on a live (non-seekable) transcode stream; at the
+    # server's 720p budget (5 Mbit/s) 32 MiB covers ~50 s.
+    mpv_cache_ahead = str(pick("MPV_DEMUXER_MAX_BYTES", kiosk.get("mpvDemuxerMaxBytes"), "32MiB"))
+    mpv_cache_back = str(pick("MPV_DEMUXER_MAX_BACK_BYTES", kiosk.get("mpvDemuxerMaxBackBytes"), "32MiB"))
+    # Largest /get response the kiosk accepts for a still or an animated
+    # clip. Stills are server-resized JPEGs well under this; the cap only
+    # bites on a long animated clip, which would otherwise sit in RAM
+    # (/tmp is tmpfs on an overlayroot Pi) twice over.
+    max_media_bytes = int(pick("MAX_MEDIA_BYTES", kiosk.get("maxMediaBytes"), 64 * 1024 * 1024))
     # When on (default), advertise the screen's aspect ratio in slideshowConfig
     # so the server constrains the queue to matching-aspect posts (ratio:lo..hi).
     # Off drops the advert entirely, so every post is eligible regardless of
@@ -202,6 +230,9 @@ def load_config():
         "vcodec": vcodec,
         "hwdec": hwdec,
         "video_max_height": video_max_height,
+        "mpv_cache_ahead": mpv_cache_ahead,
+        "mpv_cache_back": mpv_cache_back,
+        "max_media_bytes": max_media_bytes,
         "ratio_filter": ratio_filter,
         "wallpaper": wallpaper,
         "mod_tags": mod_tags,
@@ -301,6 +332,17 @@ class Connection:
 
 # ---------- image fetch ----------------------------------------------------
 
+def _read_capped(response, limit):
+    """Read a streamed response body, refusing anything past `limit` bytes
+    so a misbehaving server can't balloon the kiosk's memory."""
+    buf = bytearray()
+    for chunk in response.iter_content(chunk_size=256 * 1024):
+        buf += chunk
+        if len(buf) > limit:
+            raise ValueError(f"response exceeds maxMediaBytes ({limit})")
+    return bytes(buf)
+
+
 class AnimatedClip:
     """A slideshow post the server delivered as mp4 rather than a still.
 
@@ -318,10 +360,24 @@ class AnimatedClip:
         self.path = path
 
     @classmethod
-    def write(cls, pid, data):
+    def download(cls, pid, response, limit):
+        """Stream the clip straight to its staging file — never whole in
+        memory — and give up past `limit` bytes."""
         path = os.path.join(cls._dir, f"roboframe-anim-{pid}.mp4")
-        with open(path, "wb") as f:
-            f.write(data)
+        size = 0
+        try:
+            with open(path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=256 * 1024):
+                    size += len(chunk)
+                    if size > limit:
+                        raise ValueError(f"animated clip exceeds {limit} bytes")
+                    f.write(chunk)
+        except BaseException:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
         return cls(pid, path)
 
     def unlink(self):
@@ -403,16 +459,23 @@ class Fetcher:
             result = None
             try:
                 url = self._build_url(post)
-                r = SESSION.get(url, timeout=20)
-                r.raise_for_status()
-                ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-                if ctype.startswith("video/"):
-                    # An animated post — the server converts animated JXL to
-                    # mp4 under convert/lowmem. Stage it for mpv; the render
-                    # path plays it like any slideshow video.
-                    result = AnimatedClip.write(pid, r.content)
-                else:
-                    img = Image.open(io.BytesIO(r.content))
+                limit = self.cfg["max_media_bytes"]
+                with SESSION.get(url, timeout=20, stream=True) as r:
+                    r.raise_for_status()
+                    ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                    declared = int(r.headers.get("Content-Length") or 0)
+                    if declared > limit:
+                        raise ValueError(f"{declared} bytes exceeds maxMediaBytes ({limit})")
+                    if ctype.startswith("video/"):
+                        # An animated post — the server converts animated JXL
+                        # to mp4 under convert/lowmem. Stage it for mpv; the
+                        # render path plays it like any slideshow video.
+                        result = AnimatedClip.download(pid, r, limit)
+                        data = None
+                    else:
+                        data = _read_capped(r, limit)
+                if data is not None:
+                    img = Image.open(io.BytesIO(data))
                     img.load()
                     # The server's /get uses `fit: inside, withoutEnlargement:
                     # true`, so it returns the source unchanged when it's
@@ -790,6 +853,19 @@ class Kiosk:
 
     def _process_ws(self, msg):
         action = msg.get("action")
+        if action == "_videoRetry":
+            # Posted by _slideshow_video_worker when mpv exited before
+            # playing (the server's 503 for a busy transcoder, or a broken
+            # stream). Respawn once, here on the main thread, if the clip is
+            # still the one that failed.
+            p = msg.get("payload") or {}
+            sv = self.slideshow_video
+            if sv and sv.get("gen") == p.get("gen") and sv.get("id") == p.get("id"):
+                post = self._post_for(p["id"])
+                src = sv.get("src")
+                self._stop_slideshow_video(preserve_current=True)
+                self._play_slideshow_video(post, src=src, attempt=1)
+            return
         if action == "_open":
             log.info("ws open")
             self.connected = True
@@ -1219,11 +1295,18 @@ class Kiosk:
             "--no-input-terminal", "--no-terminal", "--really-quiet",
             "--no-audio", "--keep-open=yes", "--loop-file=inf",
             *self._mpv_wid_args(), *self._mpv_focus_args(), *self._mpv_hwdec_args(),
+            *self._mpv_cache_args(),
             f"--input-ipc-server={ipc_path}", url,
         ]
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
+
+    def _mpv_cache_args(self):
+        # Bound mpv's demuxer cache (see load_config): its defaults would let
+        # one long clip take ~200 MB of a 1 GB board.
+        return [f"--demuxer-max-bytes={self.cfg['mpv_cache_ahead']}",
+                f"--demuxer-max-back-bytes={self.cfg['mpv_cache_back']}"]
 
     def _mpv_hwdec_args(self):
         # mpv falls back to software decode on its own if the requested
@@ -1272,7 +1355,7 @@ class Kiosk:
         # where mpv opens its own window.
         return [f"--wid={self._wid}"] if getattr(self, "_wid", None) else []
 
-    def _play_slideshow_video(self, post, src=None):
+    def _play_slideshow_video(self, post, src=None, attempt=0):
         # `src`, when given, is a local file path (an animated post staged as
         # mp4) played instead of the streamed /get URL. Everything else — the
         # generation fencing, duration probe, overlay socket, teardown — is
@@ -1321,9 +1404,9 @@ class Kiosk:
         except OSError:
             pass
         proc = self._spawn_mpv_slideshow(url, ipc_path)
-        self.slideshow_video = {"proc": proc, "id": pid,
+        self.slideshow_video = {"proc": proc, "id": pid, "src": src,
                                 "ipc_path": ipc_path, "gen": gen}
-        log.info("slideshow video %s", pid)
+        log.info("slideshow video %s%s", pid, " (retry)" if attempt else "")
         # The server carries the indexed clip length in the playback frame.
         # Prefer it: the live-transcoded H.264 arrives as a header-less
         # fragmented MP4, so querying mpv for `duration` would poll for the
@@ -1331,7 +1414,7 @@ class Kiosk:
         # image interval mid-playback.
         known_dur = int(post.get("durationMs") or 0)
         threading.Thread(target=self._slideshow_video_worker,
-                         args=(proc, ipc_path, pid, gen, known_dur, save_kind),
+                         args=(proc, ipc_path, pid, gen, known_dur, save_kind, attempt),
                          daemon=True).start()
 
     def _stop_slideshow_video(self, preserve_current=False):
@@ -1370,7 +1453,7 @@ class Kiosk:
             self.current_id = None
 
     def _slideshow_video_worker(self, proc, ipc_path, pid, gen, known_dur_ms=0,
-                                save_kind="video"):
+                                save_kind="video", attempt=0):
         """Off-thread: connect mpv's IPC socket, wait for it to actually be
         rendering the clip (not merely spawned), learn the clip length (from
         the server-supplied duration when present, else by querying mpv), set
@@ -1388,10 +1471,14 @@ class Kiosk:
         """
         duration_ms = int(known_dur_ms) if known_dur_ms and known_dur_ms > 0 else 0
         sock = None
+        playing = False
         try:
             sock = self._mpv_connect(ipc_path, proc, timeout=5)
             if sock is not None:
-                if not self._mpv_wait_playing(sock, timeout=8):
+                playing = self._mpv_wait_playing(sock, timeout=8)
+                if playing:
+                    self._log_video_stream(sock, pid)
+                elif proc.poll() is None:
                     log.warning("mpv never reported a playback position for "
                                "%s within timeout; promoting anyway", pid)
                 # Only fall back to demuxing mpv when the server didn't tell us
@@ -1414,6 +1501,27 @@ class Kiosk:
                 except OSError:
                     pass
                 sock = None
+        if not playing and proc.poll() is not None:
+            # mpv exited without showing a frame: the server refused the
+            # transcode (503 while its encoders are busy) or the stream is
+            # broken. Retry once shortly after, then move the channel on
+            # rather than dwelling a whole clip length on a blank screen.
+            if sock is not None:
+                sock.close()
+            sv = self.slideshow_video
+            if not sv or sv.get("gen") != gen:
+                return
+            if attempt == 0:
+                log.warning("slideshow video %s failed to start (mpv exit %s); "
+                            "retrying", pid, proc.returncode)
+                time.sleep(3)
+                self.frame_q.put({"action": "_videoRetry",
+                                  "payload": {"id": pid, "gen": gen}})
+            else:
+                log.warning("slideshow video %s failed to start again; skipping", pid)
+                if self.connected and not self._is_off():
+                    self.conn.send({"sessionId": KIOSK_SESSION_ID, "action": "requestNext"})
+            return
         # Hand the socket to the overlay pusher iff this clip is still
         # current; the worker never touches it again after this point.
         sv = self.slideshow_video
@@ -1494,6 +1602,20 @@ class Kiosk:
                 return True
             time.sleep(0.1)
         return False
+
+    def _log_video_stream(self, sock, pid):
+        # One line per clip naming what the decoder actually got, so a
+        # stall or OOM in the journal can be tied to a codec/resolution
+        # and to whether the hardware decoder took it.
+        props = {}
+        for name in ("video-codec", "width", "height", "container-fps", "hwdec-current"):
+            reply = self._mpv_command(sock, ["get_property", name])
+            props[name] = reply.get("data") if reply and reply.get("error") == "success" else None
+        fps = props["container-fps"]
+        log.info("video %s playing codec=%s %sx%s fps=%s hwdec=%s", pid,
+                 props["video-codec"], props["width"], props["height"],
+                 round(fps, 2) if isinstance(fps, (int, float)) else fps,
+                 props["hwdec-current"] or "no")
 
     def _mpv_get_duration(self, sock, timeout):
         # `duration` is unknown until mpv has demuxed the file, so poll.
@@ -1688,7 +1810,8 @@ class Kiosk:
             "mpv", "--fs", "--no-osc", "--no-input-default-bindings",
             "--no-input-terminal", "--no-terminal", "--really-quiet",
             "--keep-open=no", "--loop-file=no",
-            *self._mpv_wid_args(), *self._mpv_focus_args(), *self._mpv_hwdec_args(), url,
+            *self._mpv_wid_args(), *self._mpv_focus_args(), *self._mpv_hwdec_args(),
+            *self._mpv_cache_args(), url,
         ]
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
@@ -1704,7 +1827,8 @@ class Kiosk:
             "--no-input-terminal", "--no-terminal", "--really-quiet",
             "--no-audio", "--profile=low-latency", "--rtsp-transport=tcp",
             "--keep-open=no", "--loop-file=no",
-            *self._mpv_wid_args(), *self._mpv_focus_args(), *self._mpv_hwdec_args(), url,
+            *self._mpv_wid_args(), *self._mpv_focus_args(), *self._mpv_hwdec_args(),
+            *self._mpv_cache_args(), url,
         ]
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
@@ -2402,6 +2526,8 @@ def main():
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(_RedactTokens())
     cfg = load_config()
     log.info("device_id=%s ws=%s", cfg["device_id"], cfg["ws_url"])
     # SDL2 video driver hint: under Openbox/X11 the default is fine; on
