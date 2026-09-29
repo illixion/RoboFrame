@@ -7,6 +7,7 @@
  */
 
 import DebugTrace
+import DebugTraceServer
 import SwiftUI
 
 @main
@@ -17,6 +18,8 @@ struct RoboFrameApp: App {
         // The app, its RAVENet transport lines and RAVEMedia all log under
         // the bundle id.
         DebugTrace.configure(.init(subsystems: ["com.illixion.roboframe.client"]))
+        // Only in a `build-and-sign --mcp` launch; a no-op otherwise.
+        DebugTraceServer.startIfRequested()
     }
 
     var body: some Scene {
