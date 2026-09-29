@@ -1,3 +1,4 @@
+import DebugTrace
 import Foundation
 import Observation
 import RAVENet
@@ -49,6 +50,7 @@ private final class PooledConnection {
     init(url: URL) {
         transport = RAVEWebSocketTransport(
             configuration: .init(url: url),
+            logger: RoboFrameNetLogger(url: url),
             pingFrameProvider: { #"{"action":"ping"}"# },
             failurePolicy: { failure in
                 failure.closeCode == .policyViolation
@@ -163,5 +165,34 @@ private final class PooledConnection {
     private func post(_ object: Any?) -> RemotePost? {
         guard let item = object as? [String: Any], let id = item["id"] as? Int, let ext = item["ext"] as? String else { return nil }
         return .init(id: id, ext: ext, durationMs: item["durationMs"] as? Int)
+    }
+}
+
+/// Where RAVENet's transport lines go. RAVENet hands them over as finished
+/// Strings, so they can't carry per-value privacy, and its default logger
+/// writes them `.public` — including "connecting to <url>", whose query holds
+/// this profile's access token. So the token is cut out first, and the rest is
+/// `.private`: the server address and URLError text read on this device's own
+/// console in a development build and as `<private>` in every export.
+private struct RoboFrameNetLogger: RAVENetLogger {
+    private static let logger = DebugLogger(subsystem: "com.illixion.roboframe.client", category: "websocket")
+    /// The token as it appears in the query, decoded and percent-encoded.
+    private let secrets: [String]
+
+    init(url: URL) {
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let decoded = components?.queryItems?.first { $0.name == "token" }?.value
+        let encoded = components?.percentEncodedQueryItems?.first { $0.name == "token" }?.value
+        secrets = Array(Set([decoded, encoded].compactMap { $0 }.filter { !$0.isEmpty }))
+    }
+
+    func log(_ level: RAVENetLogLevel, _ message: String) {
+        let line = secrets.reduce(message) { $0.replacingOccurrences(of: $1, with: "<sensitive>") }
+        switch level {
+        case .debug: Self.logger.debug("\(line, privacy: .private)")
+        case .info: Self.logger.info("\(line, privacy: .private)")
+        case .warning: Self.logger.warning("\(line, privacy: .private)")
+        case .error: Self.logger.error("\(line, privacy: .private)")
+        }
     }
 }

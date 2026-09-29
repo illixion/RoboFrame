@@ -10,8 +10,8 @@
  */
 
 import Foundation
+import DebugTrace
 import Observation
-import os
 
 @MainActor
 @Observable
@@ -51,7 +51,7 @@ final class ModTagManager {
     private static let modTagListsKey = "ModTagManager.modTagLists"
     private static let defaultIndexKey = "ModTagManager.defaultIndex"
     private static let lastActiveIndexKey = "ModTagManager.lastActiveIndex"
-    private static let logger = Logger(subsystem: "com.illixion.roboframe.client", category: "ModTagManager")
+    private static let logger = DebugLogger(subsystem: "com.illixion.roboframe.client", category: "ModTagManager")
 
     private init() {
         load()

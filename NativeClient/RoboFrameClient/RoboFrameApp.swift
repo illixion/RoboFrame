@@ -6,11 +6,18 @@
  files (1:1 ports of Hypnos's Remote tab / Remote Viewer).
  */
 
+import DebugTrace
 import SwiftUI
 
 @main
 struct RoboFrameApp: App {
     @State private var store = ProfileStore()
+
+    init() {
+        // The app, its RAVENet transport lines and RAVEMedia all log under
+        // the bundle id.
+        DebugTrace.configure(.init(subsystems: ["com.illixion.roboframe.client"]))
+    }
 
     var body: some Scene {
         WindowGroup(id: "main") {
