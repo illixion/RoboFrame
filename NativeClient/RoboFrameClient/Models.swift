@@ -179,7 +179,14 @@ struct RemotePost: Identifiable, Equatable, Hashable, Decodable {
     let id: Int
     let ext: String
     let durationMs: Int?
-    var isVideo: Bool { ["mp4", "webm", "mov", "m4v"].contains(ext.lowercased()) }
+    /// The server's video containers (`packages/shared/src/mediaTypes.js`).
+    var isVideo: Bool { Self.videoExtensions.contains(ext.lowercased()) }
+    /// ISO BMFF containers AVPlayer opens directly. The rest (Matroska, WebM,
+    /// AVI, ASF, FLV) play through the server's HLS transcode.
+    var isNativeVideo: Bool { Self.nativeVideoExtensions.contains(ext.lowercased()) }
+
+    private static let videoExtensions: Set<String> = ["mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "flv", "3gp"]
+    private static let nativeVideoExtensions: Set<String> = ["mp4", "m4v", "mov", "3gp"]
 }
 
 struct SensorReading: Identifiable, Equatable {

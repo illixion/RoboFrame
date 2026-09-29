@@ -274,7 +274,7 @@
       const endpoint = (name, query) => new URL(name + '?' + query, BASE).toString();
 
       const ROW = 2, GAP = 14, EDGE = 26;
-      const VIDEO_EXT = /^(webm|mp4|mkv|mov|m4v)$/i;
+      const VIDEO_EXT = /^(mp4|m4v|mov|mkv|webm|avi|wmv|flv|3gp)$/i;
 
       const grid = document.getElementById('grid');
       const input = document.getElementById('q');
@@ -324,7 +324,11 @@
         + '&rawanimated=1&record=0' + tokenParam);
       // Video posts bypass the image pipeline: /get streams the file with Range
       // support, so a metadata-only preload pulls just the head.
-      const streamUrl = (post) => endpoint('get', 'id=' + post.id + '&record=0' + tokenParam);
+      // Containers <video> can't open raw go through the server's H.264 mp4
+      // transcode.
+      const BROWSER_VIDEO_EXT = /^(mp4|m4v|mov|webm)$/i;
+      const streamUrl = (post) => endpoint('get', 'id=' + post.id + '&record=0'
+        + (BROWSER_VIDEO_EXT.test(post.ext) ? '' : '&vcodec=h264&vmaxh=0&vmaxfps=0') + tokenParam);
 
       // ---- fetching -------------------------------------------------------
       // /search defaults to the slideshow's shuffled deck, ordered by

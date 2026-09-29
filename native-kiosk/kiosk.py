@@ -16,7 +16,7 @@ Protocol summary as implemented here:
   - On every `playback` frame whose `current` is an image: fetch via HTTP
     /get (server-resized, lowmem JPEG), blit fullscreen, then send
     imageReady { id }.
-  - On every `playback` frame whose `current.ext` is a video (mp4/webm):
+  - On every `playback` frame whose `current.ext` is a video (VIDEO_EXTS):
     stream it straight from /get into a fullscreen mpv process (no decode
     in-process, no blob cache), then send imageReady { id, durationMs } so
     the server sizes the dwell to the clip. A clip that fits the interval
@@ -110,6 +110,10 @@ class _RedactTokens(logging.Filter):
 
 KIOSK_SESSION_ID = "main"
 SESSION = requests.Session()
+
+# The server's video containers (packages/shared/src/mediaTypes.js). mpv
+# plays every one of them from the raw file.
+VIDEO_EXTS = frozenset(("mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "flv", "3gp"))
 
 # Depth of the client-local "previous" stack (LEFT arrow). See _show_previous.
 HISTORY_MAX = 100
@@ -742,7 +746,7 @@ class Kiosk:
         self._mpv_ok = None              # shutil.which("mpv"), resolved once
         self._mpv_focus_args_cache = None  # probed once from --list-options
 
-        # Slideshow video: a `playback.current` whose ext is mp4/webm plays
+        # Slideshow video: a `playback.current` with a video ext plays
         # in its own fullscreen mpv (base layer, same tier as a photo — not
         # an effect). `slideshow_video` is {proc, id, ipc_path, gen} or None;
         # `gen` fences the async duration/imageReady worker against a newer
@@ -760,7 +764,7 @@ class Kiosk:
         # ~1s after crossfade start (slideshow.js finishLoad). A post the
         # user asked for (NEXT/PREVIOUS) promotes immediately instead — see
         # `_nav_intent_until`. `kind` is one of "still" | "video" |
-        # "animated" (a still image, a true mp4/webm post, or an animated
+        # "animated" (a still image, a true video post, or an animated
         # source played as a clip) — it picks how the save toast fetches its
         # preview thumbnail.
         self.save_target = (None, "still")
@@ -1262,9 +1266,9 @@ class Kiosk:
 
     @staticmethod
     def _is_video(post):
-        return bool(post) and str(post.get("ext") or "").lower() in ("mp4", "webm")
+        return bool(post) and str(post.get("ext") or "").lower() in VIDEO_EXTS
 
-    # -- slideshow video (a `playback.current` that's mp4/webm) -------------
+    # -- slideshow video (a `playback.current` with a video ext) ------------
 
     def _build_video_url(self, post):
         # /get streams videos straight from disk with Range support; convert/
@@ -2410,8 +2414,8 @@ class Kiosk:
         mpv clip) has no cheap preview: `/get?convert=1` transcodes the
         *whole clip* to mp4 server-side (see CLAUDE.md's "Animated posts are
         served as video" note) rather than returning a still, and `poster=1`
-        only fires for a true video source (imagemirror/index.js gates it on
-        VIDEO_EXTS) — so skip the fetch entirely rather than downloading a
+        only fires for a true video source (the server gates it on its video
+        extension list) — so skip the fetch entirely rather than downloading a
         multi-MB clip just to fail to decode it as an image. Best-effort
         otherwise; any failure just drops the thumbnail and the toast falls
         back to text-only.

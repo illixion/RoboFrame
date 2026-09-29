@@ -92,10 +92,18 @@ export function buildGetUrl(post) {
     // this display's images; omitted when the kiosk has no channel id.
     const device = params.ws ? `&deviceId=${encodeURIComponent(params.ws)}` : '';
     const wp = wallpaper ? '&wallpaper=1' : '';
-    return api(`/get?id=${post.id}&convert=${convert}&bright=${bright}&width=${screenWidth}&height=${screenHeight}&lowmem=${lowmem}${wp}${device}`);
+    // A container `<video>` can't open goes through the server's H.264 mp4
+    // transcode instead of the raw file.
+    const ext = String(post.ext || '').toLowerCase();
+    const vc = VIDEO_EXTS.has(ext) && !BROWSER_VIDEO_EXTS.has(ext) ? '&vcodec=h264&vmaxh=0&vmaxfps=0' : '';
+    return api(`/get?id=${post.id}&convert=${convert}&bright=${bright}&width=${screenWidth}&height=${screenHeight}&lowmem=${lowmem}${wp}${device}${vc}`);
 }
 
+// The server's video containers (packages/shared/src/mediaTypes.js), and the
+// ones browsers play from the raw file.
+const VIDEO_EXTS = new Set(['mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi', 'wmv', 'flv', '3gp']);
+const BROWSER_VIDEO_EXTS = new Set(['mp4', 'm4v', 'mov', 'webm']);
+
 export function isVideoExt(ext) {
-    const e = String(ext || '').toLowerCase();
-    return e === 'webm' || e === 'mp4';
+    return VIDEO_EXTS.has(String(ext || '').toLowerCase());
 }

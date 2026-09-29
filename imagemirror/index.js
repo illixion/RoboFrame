@@ -11,7 +11,7 @@ const { DuckDBInstance } = require('@duckdb/node-api');
 const bodyParser = require("body-parser");
 const cors = require('cors');
 const zlib = require('zlib');
-const { loadConfig, pickEnv } = require('@roboframe/shared');
+const { loadConfig, pickEnv, isVideoExt, VIDEO_EXTS, VIDEO_MIME } = require('@roboframe/shared');
 const { setupBroker } = require('./lib/broker');
 const { createSearch } = require('./lib/searchQuery');
 const { createTagExpander, identityExpander } = require('./lib/tagExpansion');
@@ -688,11 +688,8 @@ const EXT_MIME = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', apng: 'image/apng',
   gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', heic: 'image/heic',
   heif: 'image/heif', jxl: 'image/jxl', bmp: 'image/bmp', tif: 'image/tiff', tiff: 'image/tiff',
-  webm: 'video/webm', mp4: 'video/mp4',
+  ...VIDEO_MIME,
 };
-// Videos bypass the sharp pipeline and the imageCache — a single clip can be
-// up to ~100MB, and they get streamed straight from disk with Range support.
-const VIDEO_EXTS = new Set(['webm', 'mp4']);
 const MIME_EXT = {
   'image/webp': 'webp', 'image/jpeg': 'jpg', 'image/png': 'png',
   'image/apng': 'apng', 'image/gif': 'gif', 'video/mp4': 'mp4',
@@ -936,7 +933,7 @@ async function processRequestV2(req, res) {
       return;
     }
     const srcExt = path.extname(row.path).slice(1).toLowerCase();
-    if (VIDEO_EXTS.has(srcExt)) {
+    if (isVideoExt(srcExt)) {
       const filePath = resolveFilePath(row.path);
       if (!filePath) {
         res.status(500).send('An error occurred while sending the file.');
@@ -1632,7 +1629,7 @@ app.get('/search', async (req, res) => {
 //   convert/bright/width/height/lowmem/gif  passthrough to the variant pipeline
 //   wallpaper=1 compose onto a width×height canvas (see /get) — for setting a
 //          device wallpaper / lock screen of a fixed resolution. Also
-//          excludes video posts (file_ext webm/mp4) — a wallpaper target
+//          excludes video posts (any video file_ext) — a wallpaper target
 //          can't play video, so there's no point drawing one into the pick.
 //   exclude= comma-separated tags to exclude, additive to any `-tag` terms
 //          already in `q` (e.g. `exclude=animated` to skip animated posts).
@@ -1674,8 +1671,8 @@ app.get('/random', async (req, res) => {
   const canvasW = Number(req.query.width) || 0;
   const canvasH = Number(req.query.height) || 0;
 
-  // A wallpaper target can't play video — skip webm/mp4 posts by extension.
-  if (wantWallpaper) parts.push('-file_ext:webm', '-file_ext:mp4');
+  // A wallpaper target can't play video — skip video posts by extension.
+  if (wantWallpaper) parts.push(...[...VIDEO_EXTS].map((ext) => `-file_ext:${ext}`));
 
   // `wallpaper=1&ratio=1` is the fit-bias toggle: soft-prefer posts whose
   // aspect is closest to the wallpaper canvas (width/height), with no hard

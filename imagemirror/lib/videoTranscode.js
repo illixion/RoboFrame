@@ -107,11 +107,14 @@ function fitSize(width, height, maxHeight) {
 }
 
 // A source already fits the client's decoder when it is 8-bit 4:2:0 H.264
-// within the height, width and fps caps. Either cap set to `0` means "no
-// cap": 0/0 accepts any H.264 as-is. The +1 fps tolerance keeps 29.97 NTSC
-// on its native cadence.
+// in an MP4/QuickTime container, within the height, width and fps caps.
+// Either cap set to `0` means "no cap": 0/0 accepts any such H.264 as-is. The
+// container matters because the raw file goes to `<video>`/`<img>` and
+// AVFoundation, which play ISO BMFF but not Matroska, AVI, ASF or FLV — an
+// H.264 .mkv is re-encoded into mp4 like any other misfit. The +1 fps
+// tolerance keeps 29.97 NTSC on its native cadence.
 function fitsRaw(info, maxHeight, maxFps) {
-  if (!info || info.codec !== 'h264' || !(info.fps > 0)) return false;
+  if (!info || info.codec !== 'h264' || !info.isoBmff || !(info.fps > 0)) return false;
   if (maxHeight <= 0 && maxFps <= 0) return true;
   if (!RAW_PIX_FMTS.has(info.pixFmt)) return false;
   const sizeOk = maxHeight <= 0
@@ -256,7 +259,7 @@ function createVideoTranscoder({
       const fp = spawn(probeBin, [
         '-v', 'error', '-select_streams', 'v:0',
         '-show_entries',
-        'stream=codec_name,width,height,avg_frame_rate,pix_fmt,sample_aspect_ratio:stream_tags=rotate:stream_side_data=rotation',
+        'stream=codec_name,width,height,avg_frame_rate,pix_fmt,sample_aspect_ratio:stream_tags=rotate:stream_side_data=rotation:format=format_name',
         '-of', 'json', filePath,
       ], { stdio: ['ignore', 'pipe', 'ignore'] });
       let out = '';
@@ -266,7 +269,8 @@ function createVideoTranscoder({
         let info = null;
         if (code === 0) {
           try {
-            const s = (JSON.parse(out).streams || [])[0];
+            const probe = JSON.parse(out);
+            const s = (probe.streams || [])[0];
             if (s) {
               const [num, den] = String(s.avg_frame_rate || '').split('/').map(Number);
               const sideRot = (s.side_data_list || []).find((d) => d.rotation !== undefined);
@@ -280,6 +284,9 @@ function createVideoTranscoder({
                 pixFmt: s.pix_fmt || '',
                 rotated: rotation % 360 !== 0,
                 squarePixels: sar === '1:1' || sar === '0:1' || sar === 'N/A',
+                // ffprobe names the whole ISO BMFF family (mp4, mov, m4v,
+                // 3gp) "mov,mp4,m4a,3gp,3g2,mj2".
+                isoBmff: /(^|,)mp4(,|$)/.test(String((probe.format || {}).format_name || '')),
               };
             }
           } catch { /* fall through */ }

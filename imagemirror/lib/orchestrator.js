@@ -64,12 +64,8 @@
 //   belongs to this channel. One frame can therefore satisfy N sessions
 //   when multiple windows on one device share a connection.
 
+const { isVideoExt } = require('@roboframe/shared');
 const { randomSeed } = require('./searchQuery');
-
-const VIDEO_EXTS = new Set(['webm', 'mp4']);
-function isVideoExt(ext) {
-    return VIDEO_EXTS.has(String(ext || '').toLowerCase());
-}
 
 function createOrchestrator({
     search,

@@ -147,7 +147,7 @@ test('video upcoming entries are skipped by prefetch', async (t) => {
             { _id: 2, file_ext: 'jxl' },
             { _id: 3, file_ext: 'mp4' },
             { _id: 4, file_ext: 'jxl' },
-            { _id: 5, file_ext: 'webm' },
+            { _id: 5, file_ext: 'mkv' },
         ],
         nextCursor: null,
     }];

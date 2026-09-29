@@ -1,8 +1,11 @@
 import sharp from 'sharp';
 import { spawnSync } from 'node:child_process';
+import shared from '@roboframe/shared';
 
 const STILL_EXTS = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', 'jxl', 'avif', 'tiff', 'bmp']);
-const VIDEO_EXTS = new Set(['mp4', 'mov', 'm4v', 'mkv', 'webm', 'avi', 'wmv', 'flv', '3gp']);
+// The server streams and transcodes exactly these, so the index takes the
+// same list.
+export const { VIDEO_EXTS } = shared;
 
 export function classify(ext) {
     const lower = ext.toLowerCase();

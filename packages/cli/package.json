@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@duckdb/node-api": "^1.5.3-r.2",
+    "@roboframe/shared": "*",
     "sharp": "^0.34.5"
   },
   "license": "MIT"

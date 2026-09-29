@@ -22,6 +22,16 @@ actor RoboFrameAPI {
         items.append(URLQueryItem(name: "record", value: record ? "1" : "0"))
         if !profile.deviceId.isEmpty { items.append(URLQueryItem(name: "deviceId", value: profile.deviceId)) }
         if !profile.accessToken.isEmpty { items.append(URLQueryItem(name: "token", value: profile.accessToken)) }
+        // AVPlayer can't open these containers, and won't play an unbounded
+        // chunked mp4 either, so it gets the server's source-resolution HLS
+        // encode, which starts playing on its first segment.
+        if post.isVideo && !post.isNativeVideo {
+            items += [
+                URLQueryItem(name: "vcodec", value: "hls"),
+                URLQueryItem(name: "vmaxh", value: "0"),
+                URLQueryItem(name: "vmaxfps", value: "0"),
+            ]
+        }
         components.queryItems = items
         guard let url = components.url else { throw RoboFrameAPIError.invalidEndpoint }
         return url

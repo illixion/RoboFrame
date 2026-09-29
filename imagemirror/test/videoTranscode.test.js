@@ -190,6 +190,32 @@ test('0/0 caps serve any H.264 source raw; an fps cap forces a transcode', { ski
     assert.equal(await t.sourceNeedsTranscode(11, src, 0, 30), true);
 });
 
+test('H.264 outside an ISO BMFF container is transcoded to mp4 even at 0/0', { skip: !hasFfmpeg() }, async () => {
+    const dir = tmpDir();
+    const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
+    const make = (name) => {
+        const src = path.join(dir, name);
+        execFileSync('ffmpeg', [
+            '-hide_banner', '-loglevel', 'error',
+            '-f', 'lavfi', '-i', 'testsrc=duration=0.5:size=640x360:rate=30',
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', src,
+        ], { stdio: 'ignore' });
+        return src;
+    };
+    try {
+        make('probe.mp4');
+    } catch {
+        return; // ffmpeg built without libx264
+    }
+    let id = 20;
+    for (const name of ['clip.mov', 'clip.m4v', 'clip.3gp']) {
+        assert.equal(await t.sourceNeedsTranscode(id++, make(name), 0, 0), false, `${name} plays raw`);
+    }
+    for (const name of ['clip.mkv', 'clip.avi', 'clip.flv']) {
+        assert.equal(await t.sourceNeedsTranscode(id++, make(name), 0, 0), true, `${name} is re-encoded`);
+    }
+});
+
 test('hasFreeSlot respects maxConcurrent', () => {
     const t = createVideoTranscoder({ cachePath: tmpDir(), maxConcurrent: 0, log: quietLog });
     assert.equal(t.hasFreeSlot(), false);
@@ -399,8 +425,10 @@ function makeSource(dir, name, args) {
 }
 
 test('fitsRaw only passes hardware-decodable H.264 within the cap box', () => {
-    const base = { codec: 'h264', width: 1280, height: 720, fps: 30, pixFmt: 'yuv420p' };
+    const base = { codec: 'h264', width: 1280, height: 720, fps: 30, pixFmt: 'yuv420p', isoBmff: true };
     assert.equal(fitsRaw(base, 720, 30), true);
+    assert.equal(fitsRaw({ ...base, isoBmff: false }, 720, 30), false, 'H.264 in Matroska/AVI');
+    assert.equal(fitsRaw({ ...base, isoBmff: false }, 0, 0), false, '0/0 still needs an mp4 container');
     assert.equal(fitsRaw({ ...base, pixFmt: 'yuv420p10le' }, 720, 30), false, '10-bit H.264');
     assert.equal(fitsRaw({ ...base, pixFmt: 'yuv444p' }, 720, 30), false, '4:4:4 H.264');
     assert.equal(fitsRaw({ ...base, width: 2560 }, 720, 30), false, 'wider than the 16:9 box');

@@ -561,66 +561,39 @@ static int httpGet(const char *path, unsigned char **body_out, int *len_out,
 
 /* ---------------------------------------------------------------- fetcher */
 
-static const char *VIDEO_EXTS[] = { "mp4", "webm", "mov", "mkv", "m4v", NULL };
-
-static int extIsVideo(const char *ext) {
-    for (int i = 0; VIDEO_EXTS[i]; i++)
-        if (!strcasecmp(ext, VIDEO_EXTS[i])) return 1;
-    return 0;
-}
-
-/* Server-playable videos: imagemirror only treats webm/mp4 as video posts,
- * so only those reach its vcodec=mjpeg transcoder. */
-static int extIsPlayableVideo(const char *ext) {
-    return !strcasecmp(ext, "mp4") || !strcasecmp(ext, "webm");
-}
-
 /* MJPEG request shape — the delay baked into playback must match the fps
  * asked of the server. 12 fps / 15 s keeps a clip ~2-4 MB: streamable over
  * 802.11b inside the broker's 15 s readiness window. */
 #define VIDEO_FPS 12
 #define VIDEO_MAX_SEC 15
 
-/* Pick a random non-video post id via /random?json=1. Returns id or -1. */
+/* Pick a random post id via /random?json=1. Returns id or -1. Video posts
+ * are fine: fetchImage asks for vcodec=mjpeg, which the server honours for
+ * every video container it indexes. */
 static long pickPostId(void) {
-    for (int attempt = 0; attempt < 5 && g_running; attempt++) {
-        char list_q[24] = "";
-        if (g_active_list >= 0)
-            snprintf(list_q, sizeof(list_q), "&list=%d", g_active_list);
-        char path[768];
-        snprintf(path, sizeof(path),
-                 "/random?json=1&token=%s&width=%d&height=%d%s%s",
-                 cfg.token, SCR_W, SCR_H, list_q, cfg.extra_query);
-        unsigned char *body; int blen, status;
-        if (httpGet(path, &body, &blen, &status, NULL, 0) < 0) return -1;
-        if (status != 200) {
-            char msg[64];
-            snprintf(msg, sizeof(msg), "server: HTTP %d on /random", status);
-            setStatus(msg, 1);
-            free(body);
-            return -1;
-        }
-        /* {"id":123,"ext":"jpg"} */
-        char json[256] = {0};
-        memcpy(json, body, blen < 255 ? blen : 255);
+    char list_q[24] = "";
+    if (g_active_list >= 0)
+        snprintf(list_q, sizeof(list_q), "&list=%d", g_active_list);
+    char path[768];
+    snprintf(path, sizeof(path),
+             "/random?json=1&token=%s&width=%d&height=%d%s%s",
+             cfg.token, SCR_W, SCR_H, list_q, cfg.extra_query);
+    unsigned char *body; int blen, status;
+    if (httpGet(path, &body, &blen, &status, NULL, 0) < 0) return -1;
+    if (status != 200) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "server: HTTP %d on /random", status);
+        setStatus(msg, 1);
         free(body);
-        char *idp = strstr(json, "\"id\":");
-        if (!idp) { setStatus("bad /random json", 1); return -1; }
-        long id = atol(idp + 5);
-        char ext[16] = {0};
-        char *extp = strstr(json, "\"ext\":\"");
-        if (extp) {
-            extp += 7;
-            int i = 0;
-            while (*extp && *extp != '"' && i < 15) ext[i++] = *extp++;
-        }
-        /* webm/mp4 play via the server's MJPEG transcode; exotic containers
-         * would go down the image pipeline and fail, so re-pick those. */
-        if (extIsVideo(ext) && !extIsPlayableVideo(ext)) continue;
-        return id;
+        return -1;
     }
-    setStatus("only videos came up, giving up", 1);
-    return -1;
+    /* {"id":123,"ext":"jpg"} */
+    char json[256] = {0};
+    memcpy(json, body, blen < 255 ? blen : 255);
+    free(body);
+    char *idp = strstr(json, "\"id\":");
+    if (!idp) { setStatus("bad /random json", 1); return -1; }
+    return atol(idp + 5);
 }
 
 /* ------------------------------------------------------------ gif decode */
@@ -995,26 +968,8 @@ static void handleWsFrame(int s, const char *json) {
         const char *cur = strstr(json, "\"current\"");
         if (!cur) return;
         long id = jsonLong(cur, "id", 0);
-        char ext[16] = "";
-        jsonStr(cur, "ext", ext, sizeof(ext));
         if (id <= 0) return;
 
-        if (extIsVideo(ext) && !extIsPlayableVideo(ext)) {
-            /* Exotic container the server won't transcode — confirm
-             * readiness so the channel dwells normally instead of waiting
-             * out the readiness timeout. webm/mp4 fall through and fetch
-             * the MJPEG variant like any image. */
-            if (g_last_ready_id != id) {
-                g_last_ready_id = id;
-                char msg[160];
-                snprintf(msg, sizeof(msg),
-                         "{\"sessionId\":\"" SESSION_ID "\",\"action\":\"imageReady\","
-                         "\"payload\":{\"id\":%ld}}", id);
-                wsSendText(s, msg);
-                setToast("video post (not supported) - dwelling", 0, 3000);
-            }
-            return;
-        }
         if (id == g_slot[g_front].id || id == g_req_id) return;
         g_req_id = id;
         g_req_replay = 0;

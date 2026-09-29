@@ -105,8 +105,8 @@
             <h2><%= group.deviceId %> <span class="count"><%= group.posts.length %> item<%= group.posts.length === 1 ? '' : 's' %></span></h2>
             <div class="grid">
               <% group.posts.forEach(function(post, i){ %>
-                <% var isVideo = /^(webm|mp4)$/i.test(post.ext || ''); %>
-                <div class="card<%= i >= visible ? ' hidden' : '' %>" data-id="<%= post.id %>"<%= isVideo ? ' data-video="1"' : '' %><% if (post.variant) { %> data-variant="<%= post.variant %>"<% } %>>
+                <% var isVideo = /^(mp4|m4v|mov|mkv|webm|avi|wmv|flv|3gp)$/i.test(post.ext || ''); %>
+                <div class="card<%= i >= visible ? ' hidden' : '' %>" data-id="<%= post.id %>"<% if (isVideo) { %> data-video="<%= String(post.ext).toLowerCase() %>"<% } %><% if (post.variant) { %> data-variant="<%= post.variant %>"<% } %>>
                   <div class="thumb">
                     <div class="spinner">Loading…</div>
                     <img alt="Preview <%= post.id %>" />
@@ -151,7 +151,11 @@
       // Streaming URL for a video post. Videos bypass the sharp pipeline —
       // /get streams the raw file with Range support, so convert/width/lowmem
       // are ignored; record=0 keeps history views from re-recording.
-      const videoUrl = (id) => endpoint('get', 'id=' + encodeURIComponent(id) + '&record=0' + tokenParam);
+      // Containers <video> can't open raw go through the server's H.264 mp4
+      // transcode.
+      const BROWSER_VIDEO_EXT = /^(mp4|m4v|mov|webm)$/;
+      const videoUrl = (id, ext) => endpoint('get', 'id=' + encodeURIComponent(id) + '&record=0'
+        + (BROWSER_VIDEO_EXT.test(ext) ? '' : '&vcodec=h264&vmaxh=0&vmaxfps=0') + tokenParam);
 
       // The exact variant a display was sent (recorded by /get), minus the
       // night-light dim: dimming is the room's lighting, not the picture.
@@ -285,7 +289,7 @@
             viewerImg.hidden = true;
             viewerImg.src = '';
             viewerVideo.hidden = false;
-            viewerVideo.src = videoUrl(id);
+            viewerVideo.src = videoUrl(id, card.dataset.video);
             viewerVideo.play().catch(() => {});
           } else {
             viewerVideo.hidden = true;

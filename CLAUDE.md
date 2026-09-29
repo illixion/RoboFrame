@@ -52,7 +52,7 @@ Hypnos is a separate app that implements the same protocol in Swift, it is locat
   rendering, intraFont clock overlay). Full WS slideshow session
   (`sessionId "main"`, hand-rolled RFC6455 in `ws.c`): server-pushed
   `playback` ids fetched via `/get?width=480&height=272&lowmem=1`
-  (JPEG via libjpeg-turbo, animated lowmem GIF via giflib, webm/mp4 as
+  (JPEG via libjpeg-turbo, animated lowmem GIF via giflib, video posts as
   silent server-transcoded MJPEG via `/get?vcodec=mjpeg` — see
   imagemirror's lib/videoTranscode.js), `imageReady`
   confirmations, `displayState` → panel off/on through `kdisp.prx` (tiny
@@ -303,6 +303,15 @@ the deadline) is the canary for the wake-advance class of bug.
   `vcodec=hlsseg` serves one Range-capable segment (name validated against
   path traversal). Hypnos reaches this only after `<img src=`raw`>` and
   `<video src=`raw`>` both fail — see its 3-tier video escalation.
+- **One video-extension list.** `packages/shared/src/mediaTypes.js` is what
+  the CLI indexes and the server streams/transcodes (mp4, m4v, mov, mkv,
+  webm, avi, wmv, flv, 3gp). The clients can't import it and carry copies —
+  `public/modules/config.js`, `native-kiosk/kiosk.py`, `NativeClient`'s
+  `RemotePost`, Hypnos's `SlideshowEngine.videoExtensions` — update them
+  together. The raw file keeps its container, so the browser-facing clients
+  (web kiosk, `/history`, `/browse`) ask for `vcodec=h264` on anything but
+  mp4/m4v/mov/webm, and NativeClient asks for `vcodec=hls` on anything
+  AVPlayer can't open; `fitsRaw` never passes a non-ISO-BMFF source through.
 - **`bright` is direct RGB multiply, not alpha.** The old alpha-modulation
   path was equivalent (alpha-over-black ≡ RGB×α) but JPEG-incompatible.
   `applyDimAndConvertToJpeg` uses `.linear(dim, 0)`. No contrast bump —

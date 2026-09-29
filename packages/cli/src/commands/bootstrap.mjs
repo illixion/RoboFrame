@@ -2,8 +2,10 @@ import { parseArgs } from 'node:util';
 import { readdir, stat } from 'node:fs/promises';
 import { join, extname, resolve } from 'node:path';
 import { open, ensureSchema, insertPosts, insertPaths, refreshPostsTags } from '../db.mjs';
-import { classify, probeStill, probeVideo, hasFfprobe } from '../metadata.mjs';
+import { classify, probeStill, probeVideo, hasFfprobe, VIDEO_EXTS } from '../metadata.mjs';
 import { tagsFromFolders, readSidecar, sanitizeTag } from '../tags.mjs';
+
+const DEFAULT_EXTS = ['jxl', 'jpg', 'jpeg', 'png', 'webp', 'gif', ...VIDEO_EXTS];
 
 const HELP = `roboframe-cli bootstrap <imageDir> [options]
 
@@ -17,14 +19,12 @@ Options:
   --tags-from-sidecar        Read <stem>.tags.json sidecars next to each file (default: off)
   --include-videos           Probe .mp4/.webm/.mov etc. via ffprobe (default: on if ffprobe in PATH)
   --no-include-videos        Skip videos
-  --extensions <csv>         File extensions to include (default: jxl,jpg,jpeg,png,webp,gif,mp4,webm,mov,mkv)
+  --extensions <csv>         File extensions to include (default: ${DEFAULT_EXTS.join(',')})
   --start-id <n>             First _id to assign (default: 1)
   --batch-size <n>           Rows per INSERT batch (default: 500)
   --resume                   Skip files already in posts_paths
   --dry-run                  Print summary without writing
   --help                     Show this help`;
-
-const DEFAULT_EXTS = ['jxl', 'jpg', 'jpeg', 'png', 'webp', 'gif', 'mp4', 'webm', 'mov', 'mkv'];
 
 export async function run(argv) {
     const { values, positionals } = parseArgs({

@@ -573,16 +573,22 @@ with `sessionIds: ["win1", ..., "win10"]`).
   usable H.264 encoder. A single fetch either way, so a client can pass
   its preferred flag on every request without knowing in advance whether
   a post is animated.
-- `ext` can also be `mp4` or `webm` — those entries are videos, and they
-  carry `durationMs` (the indexed clip length; absent when the library
+- `ext` can also be a video container — `mp4`, `m4v`, `mov`, `mkv`,
+  `webm`, `avi`, `wmv`, `flv` or `3gp` (the list lives in
+  `packages/shared/src/mediaTypes.js`; classify by it, not by `mp4`/`webm`
+  alone). Those entries are videos, and they carry `durationMs` (the indexed clip length; absent when the library
   indexed 0). `/get` streams them straight from disk (`convert`,
   `bright`, `lowmem`, `width`, `height` are ignored) with
   `Accept-Ranges: bytes` and single-range support; `vcodec=h264`
   requests a hardware-decodable H.264 variant, capped by `vmaxh`/`vmaxfps`
   (height/fps; default 1080/30, `0` = source resolution / frame rate).
-  A source already in 8-bit 4:2:0 H.264 inside the caps (height ≤ `vmaxh`,
-  width ≤ the 16:9 box around it, fps ≤ `vmaxfps`) is served raw;
-  anything else is transcoded. Encoded via VideoToolbox when available,
+  A source already in 8-bit 4:2:0 H.264 in an MP4/QuickTime container
+  inside the caps (height ≤ `vmaxh`, width ≤ the 16:9 box around it,
+  fps ≤ `vmaxfps`) is served raw; anything else is transcoded to mp4,
+  including H.264 in Matroska, AVI, ASF or FLV. The raw file keeps its
+  container, so a client whose player can't open one (`<video>` and
+  AVPlayer can't open mkv/avi/wmv/flv) should request `vcodec=h264` or
+  `vcodec=hls` for those instead of the bare URL. Encoded via VideoToolbox when available,
   else libx264 `-preset ultrafast`. A cold transcode streams as it
   encodes, and concurrent requests for the same clip share one encode
   (each receives the stream from its first byte). When the transcode
