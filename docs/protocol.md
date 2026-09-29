@@ -580,8 +580,19 @@ with `sessionIds: ["win1", ..., "win10"]`).
   `Accept-Ranges: bytes` and single-range support; `vcodec=h264`
   requests a hardware-decodable H.264 variant, capped by `vmaxh`/`vmaxfps`
   (height/fps; default 1080/30, `0` = source resolution / frame rate).
-  Encoded via VideoToolbox when available, else libx264 `-preset ultrafast`.
-  Clients
+  A source already in 8-bit 4:2:0 H.264 inside the caps (height ≤ `vmaxh`,
+  width ≤ the 16:9 box around it, fps ≤ `vmaxfps`) is served raw;
+  anything else is transcoded. Encoded via VideoToolbox when available,
+  else libx264 `-preset ultrafast`. A cold transcode streams as it
+  encodes, and concurrent requests for the same clip share one encode
+  (each receives the stream from its first byte). When the transcode
+  can't run — every encode slot is serving a live viewer, ffmpeg is
+  missing, or the cache volume is gone — a **capped** request
+  (`vmaxh` or `vmaxfps` non-zero) gets **`503`** with `Retry-After`,
+  never the raw file: a capped client is saying its decoder can't take
+  arbitrary sources. Treat it like a failed fetch and let the channel
+  move on. An uncapped request (`vmaxh=0&vmaxfps=0`) falls back to the
+  raw file. Clients
   should render with `<video autoplay muted playsInline>` pointed at the
   `/get` URL directly — do **not** fetch-to-blob and reuse, the clip
   may be ~100 MB and is likely to be cut off mid-loop by the next

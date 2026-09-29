@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { PassThrough } = require('stream');
-const { createVideoTranscoder } = require('../lib/videoTranscode');
+const { createVideoTranscoder, fitsRaw, fitSize, bitrateTier } = require('../lib/videoTranscode');
 
 const quietLog = { log() {}, warn() {}, error() {} };
 
@@ -378,4 +378,144 @@ test('hls() returns null when no encoder is available', async () => {
         log: quietLog,
     });
     assert.equal(await t.hls(1, '/nope.mp4', 0, 0), null);
+});
+
+// Collect a fakeRes body once the stream ends (or is destroyed).
+function drained(res) {
+    return new Promise((resolve) => {
+        res.on('end', () => resolve(Buffer.concat(res.chunks)));
+        res.on('close', () => resolve(Buffer.concat(res.chunks)));
+    });
+}
+
+function makeSource(dir, name, args) {
+    const src = path.join(dir, name);
+    try {
+        execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', ...args, src], { stdio: 'ignore' });
+        return src;
+    } catch {
+        return null; // this ffmpeg build lacks the encoder — caller skips
+    }
+}
+
+test('fitsRaw only passes hardware-decodable H.264 within the cap box', () => {
+    const base = { codec: 'h264', width: 1280, height: 720, fps: 30, pixFmt: 'yuv420p' };
+    assert.equal(fitsRaw(base, 720, 30), true);
+    assert.equal(fitsRaw({ ...base, pixFmt: 'yuv420p10le' }, 720, 30), false, '10-bit H.264');
+    assert.equal(fitsRaw({ ...base, pixFmt: 'yuv444p' }, 720, 30), false, '4:4:4 H.264');
+    assert.equal(fitsRaw({ ...base, width: 2560 }, 720, 30), false, 'wider than the 16:9 box');
+    assert.equal(fitsRaw({ ...base, codec: 'vp9' }, 720, 30), false);
+    assert.equal(fitsRaw({ ...base, pixFmt: 'yuv420p10le', width: 3840 }, 0, 0), true,
+        '0/0 caps take any H.264');
+});
+
+test('fitSize fits inside the cap box, never upscales, keeps even dims', () => {
+    assert.deepEqual(fitSize(3840, 2160, 720), { width: 1280, height: 720 });
+    const portrait = fitSize(1080, 1920, 720);
+    assert.equal(portrait.height, 720);
+    assert.ok(portrait.width <= 406 && portrait.width % 2 === 0);
+    assert.deepEqual(fitSize(641, 361, 720), { width: 640, height: 360 });
+    assert.deepEqual(fitSize(3841, 2161, 0), { width: 3840, height: 2160 });
+});
+
+test('bitrateTier drops the budget for Pi-sized outputs', () => {
+    assert.equal(bitrateTier(720).rate, '5M');
+    assert.equal(bitrateTier(1080).rate, '12M');
+    assert.equal(bitrateTier(0).rate, '12M', 'unknown height keeps the large tier');
+});
+
+test('a cache dir under a missing parent disables transcoding instead of creating it', async () => {
+    const cachePath = path.join(tmpDir(), 'not-mounted', 'video_cache');
+    const t = createVideoTranscoder({ cachePath, log: quietLog });
+    assert.equal(await t.available(), false);
+    assert.equal(await t.stream({}, fakeRes(), 1, '/nope.mp4', 720, 30), false);
+    assert.equal(fs.existsSync(path.dirname(cachePath)), false, 'nothing was created');
+});
+
+test('concurrent requests for one video share a single encode; a late joiner gets the whole file', { skip: !hasFfmpeg() }, async () => {
+    const dir = tmpDir();
+    const src = makeSource(dir, 'share.mp4', ['-f', 'lavfi', '-i', 'testsrc=duration=3:size=1280x720:rate=30', '-c:v', 'mpeg4']);
+    const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
+    if (!src || !await t.available()) return;
+
+    const a = fakeRes();
+    const b = fakeRes();
+    const bodies = Promise.all([drained(a), drained(b)]);
+    const started = [t.stream({}, a, 21, src, 720, 30), t.stream({}, b, 21, src, 720, 30)];
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(t.stats().encodes.length, 1, 'one encode for both viewers');
+    // Joins after output has started flowing, still from byte 0.
+    const late = fakeRes();
+    const lateBody = drained(late);
+    started.push(t.stream({}, late, 21, src, 720, 30));
+    await Promise.all(started);
+    const [bodyA, bodyB] = await bodies;
+    assert.ok(bodyA.length > 0);
+    assert.deepEqual(bodyB, bodyA);
+    assert.deepEqual(await lateBody, bodyA, 'late joiner received the full stream');
+    for (let i = 0; i < 50 && !t.cachedFile(21, 720, 30); i++) await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(fs.readFileSync(t.cachedFile(21, 720, 30)), bodyA);
+});
+
+// An ffmpeg that holds every encode open for `delaySec` before running it,
+// so a test can observe encodes while they are deterministically in flight.
+// The encoder probe passes straight through; ffprobe sits beside it because
+// the transcoder derives its path from ffmpeg's.
+function slowFfmpeg(dir, delaySec) {
+    const binDir = path.join(dir, 'bin');
+    fs.mkdirSync(binDir);
+    const real = execFileSync('/bin/sh', ['-c', 'command -v ffmpeg']).toString().trim();
+    const realProbe = execFileSync('/bin/sh', ['-c', 'command -v ffprobe']).toString().trim();
+    const wrapper = path.join(binDir, 'ffmpeg');
+    fs.writeFileSync(wrapper, `#!/bin/sh\n[ "$2" = "-encoders" ] || sleep ${delaySec}\nexec "${real}" "$@"\n`);
+    fs.chmodSync(wrapper, 0o755);
+    fs.symlinkSync(realProbe, path.join(binDir, 'ffprobe'));
+    return wrapper;
+}
+
+test('a viewer preempts an orphaned encode; busy slots with live viewers refuse', { skip: !hasFfmpeg() }, async () => {
+    const dir = tmpDir();
+    const src = makeSource(dir, 'src.mp4', ['-f', 'lavfi', '-i', 'testsrc=duration=1:size=640x360:rate=30', '-c:v', 'mpeg4']);
+    if (!src) return;
+    const t = createVideoTranscoder({
+        cachePath: dir, ffmpegPath: slowFfmpeg(dir, 1), maxConcurrent: 1, log: quietLog,
+    });
+    if (!await t.available()) return;
+
+    // A: the viewer leaves at once, leaving an orphaned encode on the slot.
+    const a = fakeRes();
+    const aDone = t.stream({}, a, 31, src, 720, 30);
+    await new Promise((r) => setTimeout(r, 200));
+    a.destroy();
+    await aDone;
+    assert.equal(t.stats().encodes[0].orphan, true);
+
+    // B takes the slot by killing A.
+    const b = fakeRes();
+    const bBody = drained(b);
+    const bServed = t.stream({}, b, 32, src, 720, 30);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.deepEqual(t.stats().encodes.map((e) => e.id), [32]);
+    // C arrives while B's viewer is live: nothing to preempt.
+    assert.equal(await t.stream({}, fakeRes(), 33, src, 720, 30), false);
+    assert.equal(await bServed, true);
+    assert.ok((await bBody).length > 0);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(t.cachedFile(31, 720, 30), null, 'the preempted encode never committed');
+    assert.ok(!fs.readdirSync(dir).some((n) => n.startsWith('.31.')), 'its temp file was removed');
+    assert.ok(t.cachedFile(32, 720, 30), 'the viewer\'s encode committed');
+});
+
+test('a codec VideoToolbox cannot decode falls back to software decode', { skip: !hasFfmpeg() }, async () => {
+    const dir = tmpDir();
+    const src = makeSource(dir, 'av1.mkv', ['-f', 'lavfi', '-i', 'testsrc=duration=1:size=640x360:rate=30', '-c:v', 'libsvtav1', '-preset', '12']);
+    const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
+    if (!src || !await t.available()) return;
+    const res = fakeRes();
+    const body = drained(res);
+    assert.equal(await t.stream({}, res, 41, src, 720, 30), true);
+    assert.ok((await body).includes(Buffer.from('moof')), 'produced fragmented MP4');
+    // Only hosts whose VT lacks AV1 record the failure (M1/M2 do; M3+ decode it).
+    const failed = t.stats().hwDecodeFailed;
+    assert.ok(failed.length === 0 || failed.includes('av1'));
 });

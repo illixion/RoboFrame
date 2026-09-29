@@ -74,7 +74,6 @@ const JXLINFO_PATH = pickEnv('JXLINFO_PATH', srv.jxlinfoPath, 'jxlinfo');
 // `/get?vcodec=h264` for video posts — Pi-class kiosks only hardware-decode
 // H.264, so the server re-encodes other codecs on demand (see
 // lib/videoTranscode.js), capping height to `vmaxh` (default 1080, kiosks 720).
-// Degrades to raw streaming when ffmpeg is absent.
 const videoTranscoder = createVideoTranscoder({
   cachePath: pickEnv('VIDEO_CACHE_PATH', srv.video?.cachePath, path.join(__dirname, 'video_cache')),
   maxCacheBytes: pickEnv('VIDEO_CACHE_MAX_BYTES', srv.video?.cacheMaxBytes, 2 * 1024 * 1024 * 1024, { type: 'number' }),
@@ -1017,33 +1016,44 @@ async function processRequestV2(req, res) {
           res.status(400).send('bad segment');
           return;
         }
+        // A segment fetch marks the encode as watched, so it isn't
+        // preempted as an orphan mid-playback.
+        videoTranscoder.touchHls(parts.id, vmaxh, vmaxfps);
         const segPath = path.join(videoTranscoder.hlsDir(parts.id, vmaxh, vmaxfps), seg);
         if (fs.existsSync(segPath)) streamVideo(req, res, segPath, 'video/mp4', parts.id, 'mp4');
         else res.status(404).send('segment not found');
         return;
       }
       // vcodec=h264: serve/build the hardware-decodable variant. Cache hits
-      // stream like any file (Range-capable); a miss pipes ffmpeg's output
-      // live. Sources already in H.264 within the caps, a missing ffmpeg, or a
-      // saturated transcoder all fall through to the raw file. `vmaxh`/`vmaxfps`
-      // cap output height/frame rate; `0` means no cap (Pi kiosks send 720/30,
-      // Hypnos sends 0/0 for the source geometry). Absent vmaxh keeps the
-      // legacy 1080 default; absent vmaxfps keeps 30.
-      if (req.query.vcodec === 'h264' && await videoTranscoder.available()) {
+      // stream like any file (Range-capable); a miss joins or starts the
+      // shared encode and streams it live. Sources already fitting the caps
+      // go raw. `vmaxh`/`vmaxfps` cap output height/frame rate; `0` means no
+      // cap (Pi kiosks send 720/30, Hypnos sends 0/0 for the source
+      // geometry). Absent vmaxh keeps the 1080 default; absent vmaxfps keeps
+      // 30. A capped request comes from a decoder-limited client, so when
+      // the transcode can't run (busy, ffmpeg missing, cache volume gone)
+      // it gets a 503 — the client skips the post — never a raw file its
+      // decoder can't take. An uncapped request falls back to raw.
+      if (req.query.vcodec === 'h264') {
         const vmaxh = req.query.vmaxh === '0'
           ? 0 : Math.min(4320, Math.max(240, Number(req.query.vmaxh) || 1080));
         const vmaxfps = req.query.vmaxfps === '0'
           ? 0 : Math.max(1, Number(req.query.vmaxfps) || 30);
+        const capped = vmaxh > 0 || vmaxfps > 0;
         const cached = videoTranscoder.cachedFile(parts.id, vmaxh, vmaxfps);
         if (cached) {
           streamVideo(req, res, cached, 'video/mp4', parts.id, 'mp4');
           return;
         }
-        if (await videoTranscoder.sourceNeedsTranscode(parts.id, filePath, vmaxh, vmaxfps)
-            && videoTranscoder.hasFreeSlot()) {
+        if (await videoTranscoder.sourceNeedsTranscode(parts.id, filePath, vmaxh, vmaxfps)) {
           if (cancelled || res.headersSent) return;
-          await videoTranscoder.stream(req, res, parts.id, filePath, vmaxh, vmaxfps);
-          return;
+          if (await videoTranscoder.stream(req, res, parts.id, filePath, vmaxh, vmaxfps)) return;
+          if (capped) {
+            if (cancelled || res.headersSent) return;
+            res.setHeader('Retry-After', '5');
+            res.status(503).send('transcoder busy or unavailable');
+            return;
+          }
         }
       }
       if (cancelled || res.headersSent) return;
