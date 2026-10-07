@@ -8,6 +8,7 @@
 
 import DebugTrace
 import DebugTraceServer
+import DebugTraceUI
 import SwiftUI
 
 @main
@@ -26,7 +27,15 @@ struct RoboFrameApp: App {
         WindowGroup(id: "main") {
             ProfileManagerView()
                 .environment(store)
+                .debugApprovalPrompts()
         }
+
+        // The debug server's access and code-change prompts, in a window of
+        // their own that opens in front of the person (DebugTraceUI), rather
+        // than a system alert that 3D content or an immersive space can hide.
+        #if os(visionOS)
+        DebugApprovalWindow()
+        #endif
 
         #if os(visionOS)
         // Genuine independent windows so multiple slideshows/web pages can
