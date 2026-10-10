@@ -181,6 +181,7 @@ struct SlideshowOrnamentView: View {
             Text("New Mod Tag Preset").font(.headline)
             Text("Space-separated tags. Negate with a leading `-`.").font(.caption).foregroundColor(.secondary)
             TextField("rating:s -blood", text: $newPresetText)
+                .textFieldTapTarget()
                 .textFieldStyle(.roundedBorder)
                 .font(.body.monospaced())
                 .autocorrectionDisabled()

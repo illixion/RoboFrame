@@ -376,6 +376,7 @@ struct ProfileManagerView: View {
     private var editingSection: some View {
         Section {
             TextField("Name", text: $editingProfile.name)
+                .textFieldTapTarget()
                 .accessibilityIdentifier("roboframe.profile.name")
 
             HStack(spacing: 8) {
@@ -548,6 +549,7 @@ struct ProfileManagerView: View {
     private var webPageSection: some View {
         Section {
             TextField("Page URL", text: $editingProfile.webPageURL)
+                .textFieldTapTarget()
                 .textContentType(.URL)
                 .autocorrectionDisabled()
                 .textInputAutocapitalization(.never)
@@ -606,12 +608,14 @@ struct ProfileManagerView: View {
     private var slideshowSections: some View {
         Section {
             TextField("RoboFrame Server URL", text: $editingProfile.endpoint)
+                .textFieldTapTarget()
                 .textContentType(.URL)
                 .autocorrectionDisabled()
                 .textInputAutocapitalization(.never)
                 .accessibilityIdentifier("roboframe.profile.endpoint")
 
             TextField("Display ID", text: $editingProfile.deviceId)
+                .textFieldTapTarget()
                 .autocorrectionDisabled()
                 .textInputAutocapitalization(.never)
                 .accessibilityIdentifier("roboframe.profile.deviceId")
@@ -621,6 +625,7 @@ struct ProfileManagerView: View {
                 .foregroundColor(.secondary)
 
             SecureField("Access Token", text: $editingProfile.accessToken)
+                .textFieldTapTarget()
                 .autocorrectionDisabled()
                 .textInputAutocapitalization(.never)
 
@@ -697,6 +702,7 @@ struct ProfileManagerView: View {
                             }
                         )
                     )
+                    .textFieldTapTarget()
                     .font(.body.monospaced())
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
@@ -706,6 +712,7 @@ struct ProfileManagerView: View {
 
             HStack {
                 TextField("Tags (space-separated)", text: $newModTagPreset)
+                    .textFieldTapTarget()
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
                 Button("Add Preset") {
