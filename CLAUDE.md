@@ -48,6 +48,15 @@ Hypnos is a separate app that implements the same protocol in Swift, it is locat
   clip. Needs the kiosk user in the `input` group; `grabKeyboard: false`
   (or no evdev, e.g. macOS) falls back to the pygame/X-focus path. Video
   embeds via `--wid` purely for correct rendering/stacking, not input.
+- `swift-kiosk/` — Swift successor to `native-kiosk/` for the Pi, built
+  on RAVESDK's shared `RAVERoboFrame` client and `RAVESlideshowCore`
+  engine (the same code Hypnos's remote viewer and NativeClient run), so
+  every Swift frontend follows the server identically. Reads native-kiosk's
+  `roboframe.config.json` `kiosk` block and env names. Headless so far:
+  it joins, follows `playback`, loads frames and reports them, without
+  drawing; an SDL3/GLES2 renderer and libmpv video come next. Built in
+  Docker (`swift:6.2.4-noble`, arm64) with `--static-swift-stdlib`, run on
+  Debian 13; see its README.
 - `psp-kiosk/` — native Sony PSP homebrew client (C + pspdev SDK, GU
   rendering, intraFont clock overlay). Full WS slideshow session
   (`sessionId "main"`, hand-rolled RFC6455 in `ws.c`): server-pushed
@@ -109,8 +118,13 @@ The shipped clients are the second source of truth. If they need
 updates to track a server change, ship those too:
 - Web kiosk: [`public/modules/ws-client.js`](public/modules/ws-client.js)
   + the action-specific module.
-- Hypnos: `~/Projects/Hypnos/Hypnos/Hypnos/Services/RemoteWebSocketClient.swift`
-  + `Views/Remote/RemoteViewerModel.swift`.
+- The Swift clients (Hypnos, NativeClient, swift-kiosk) share one
+  protocol client: `~/Projects/RAVESDK/Sources/RAVERoboFrame` (frames,
+  connection, present/visibility, URLs). A wire change lands there once,
+  with its tests, then in each client's message handling:
+  - Hypnos: `Services/RemoteWSSession.swift` + `Views/Remote/RemoteViewerModel.swift`.
+  - NativeClient: `SlideshowModel.swift`.
+  - swift-kiosk: `Sources/KioskCore/KioskSession.swift`.
 - node-display: [`node-display/server.js`](node-display/server.js).
 
 ## Orchestrator model (one-screen summary)
@@ -306,9 +320,9 @@ the deadline) is the canary for the wake-advance class of bug.
 - **One video-extension list.** `packages/shared/src/mediaTypes.js` is what
   the CLI indexes and the server streams/transcodes (mp4, m4v, mov, mkv,
   webm, avi, wmv, flv, 3gp). The clients can't import it and carry copies —
-  `public/modules/config.js`, `native-kiosk/kiosk.py`, `NativeClient`'s
-  `RemotePost`, Hypnos's `SlideshowEngine.videoExtensions` — update them
-  together. The raw file keeps its container, so the browser-facing clients
+  `public/modules/config.js`, `native-kiosk/kiosk.py`, RAVERoboFrame's
+  `RoboFramePost.videoExtensions` (NativeClient and swift-kiosk), Hypnos's
+  `SlideshowEngine.videoExtensions` — update them together. The raw file keeps its container, so the browser-facing clients
   (web kiosk, `/history`, `/browse`) ask for `vcodec=h264` on anything but
   mp4/m4v/mov/webm, and NativeClient asks for `vcodec=hls` on anything
   AVPlayer can't open; `fitsRaw` never passes a non-ISO-BMFF source through.
