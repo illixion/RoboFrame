@@ -2,7 +2,7 @@
  RoboFrame Native Client - Slideshow Model
 
  Per-window model driving one slideshow viewer, backed by the shared
- `RAVESlideshowEngine` and this app's WebSocket session pool. Exposes the same
+ `RAVESlideshowEngine` and a session on the shared `RoboFrameConnection`. Exposes the same
  display-setting/adjustment surface Hypnos's `RemoteViewerModel` does, so
  `SlideshowOrnamentView` can be a close port of `RemoteViewerOrnamentView`.
  */
@@ -10,6 +10,7 @@
 import AVFoundation
 import Foundation
 import Observation
+import RAVERoboFrame
 import RAVESlideshow
 
 @MainActor @Observable
@@ -18,12 +19,13 @@ final class SlideshowModel {
     let sessionID: String
     let engine: RAVESlideshowEngine
     private let pool: RemoteSessionPool
+    private var connection: RoboFrameConnection?
     private let api = RoboFrameAPI()
 
     private(set) var tagLists: [[String]] = []
     private(set) var currentList = 0
-    private(set) var sensors: [String: SensorReading] = [:]
-    private(set) var alert: RemoteAlert?
+    private(set) var sensors: [String: RoboFrameSensorReading] = [:]
+    private(set) var alert: RoboFrameAlert?
     private(set) var effectVideoURL: URL?
     private(set) var audioPlayer: AVPlayer?
     private(set) var error: String?
@@ -84,7 +86,7 @@ final class SlideshowModel {
         set { engine.visualSettings = newValue.slideshowVisualSettings }
     }
 
-    var sortedSensors: [SensorReading] { sensors.values.sorted { $0.name < $1.name } }
+    var sortedSensors: [RoboFrameSensorReading] { sensors.values.sorted { $0.friendlyName < $1.friendlyName } }
 
     // MARK: - Display setting proxies (Adjustments popover "Viewer" tab + ornament)
 
@@ -158,7 +160,14 @@ final class SlideshowModel {
 
     func start() {
         engine.start()
-        pool.attach(sessionID: sessionID, profile: profile) { [weak self] message in self?.handle(message) }
+        guard let (connection, handlers) = pool.attach(sessionID: sessionID, profile: profile) else {
+            error = "Invalid RoboFrame WebSocket URL."
+            return
+        }
+        self.connection = connection
+        handlers.onMessage = { [weak self] message in self?.handle(message) }
+        handlers.onConnected = { [weak self] in self?.sendSlideshowConfig() }
+        reportScene(active: true)
         ModTagManager.shared.addSendHandler(id: sessionID) { [weak self] tags in self?.setModTags(tags) }
         let initialTags = profile.modTags.isEmpty ? ModTagManager.shared.activeTags : profile.modTags
         if !initialTags.isEmpty { setModTags(initialTags) }
@@ -167,32 +176,44 @@ final class SlideshowModel {
     func stop() {
         ModTagManager.shared.removeSendHandler(id: sessionID)
         pool.detach(sessionID: sessionID, profile: profile)
+        connection = nil
         engine.stop()
         audioPlayer?.pause()
         audioPlayer = nil
         toastTask?.cancel()
     }
 
-    func reportScene(active: Bool) {
-        engine.setVisible(active)
-        pool.send(sessionID: sessionID, profile: profile, action: "present", payload: ["deviceId": profile.deviceId, "present": active])
-        pool.send(sessionID: sessionID, profile: profile, action: "visibility", payload: ["deviceId": profile.deviceId, "visible": active])
+    /// Joins this window's channel. The connection calls it after every
+    /// (re)connect, ahead of replaying the scene state.
+    private func sendSlideshowConfig() {
+        connection?.sendSlideshowConfig(sessionId: sessionID, RoboFrameSlideshowConfig(
+            deviceId: profile.deviceId,
+            intervalMs: Int(max(2, profile.interval) * 1_000),
+            modTags: profile.modTags
+        ))
     }
 
-    func next() { pool.send(sessionID: sessionID, profile: profile, action: "requestNext") }
+    /// A shown window is present (it drives its channel) and visible (HA's
+    /// motion telemetry, OR-ed across windows sharing the deviceId).
+    func reportScene(active: Bool) {
+        engine.setVisible(active)
+        connection?.reportSceneState(sessionId: sessionID, deviceId: profile.deviceId, present: active, visible: active)
+    }
+
+    func next() { connection?.sendRequestNext(sessionId: sessionID) }
     func previous() { engine.previous() }
     func reshuffle() {
-        pool.send(sessionID: sessionID, profile: profile, action: "reshuffle")
+        connection?.sendReshuffle(sessionId: sessionID)
         showToast("Reshuffled", isError: false)
     }
     func block() {
         guard let current else { return }
-        pool.send(sessionID: sessionID, profile: profile, action: "block", payload: ["id": current.id])
+        connection?.sendBlock(postId: current.id)
         showToast("Blocked", isError: false)
     }
-    func setTagList(_ index: Int) { pool.send(sessionID: sessionID, profile: profile, action: "setTagList", payload: ["listNumber": index]) }
-    func setModTags(_ tags: [String]) { pool.send(sessionID: sessionID, profile: profile, action: "setModTags", payload: ["tags": tags]) }
-    func setDisplaySync(_ enabled: Bool) { pool.send(sessionID: sessionID, profile: profile, action: "displaySync", payload: ["enabled": enabled]) }
+    func setTagList(_ index: Int) { connection?.sendSetTagList(sessionId: sessionID, listNumber: index) }
+    func setModTags(_ tags: [String]) { connection?.sendSetModTags(sessionId: sessionID, tags: tags) }
+    func setDisplaySync(_ enabled: Bool) { connection?.sendDisplaySync(sessionId: sessionID, enabled: enabled) }
     func clearError() { error = nil }
 
     func save() async -> String? {
@@ -222,20 +243,18 @@ final class SlideshowModel {
     private func markRendered(postID: Int?, durationMs: Int?) {
         guard isDisplayOn, let postID, reportedReadyID != postID else { return }
         reportedReadyID = postID
-        var payload: [String: Any] = ["id": postID]
-        if let durationMs, durationMs > 0 { payload["durationMs"] = durationMs }
-        pool.send(sessionID: sessionID, profile: profile, action: "imageReady", payload: payload)
+        connection?.sendImageReady(sessionId: sessionID, postId: postID, durationMs: durationMs)
     }
 
-    private func handle(_ message: RemoteMessage) {
+    private func handle(_ message: RoboFrameMessage) {
         switch message {
-        case .playback(let current, let upcoming, let interval, let list, let tags):
-            updateDisplaySettings { $0.delay = interval }
-            engine.setAuthoritativeNextItemID(upcoming.first.map { String($0.id) })
-            engine.prunePrefetched(keeping: Set(upcoming.map { String($0.id) }))
-            engine.setAuthoritativeCurrent(current?.slideshowItem)
-            currentList = list
-            modTags = tags
+        case .playback(let playback):
+            if let interval = playback.interval { updateDisplaySettings { $0.delay = interval } }
+            engine.setAuthoritativeNextItemID(playback.upcoming.first.map { String($0.id) })
+            engine.prunePrefetched(keeping: Set(playback.upcoming.map { String($0.id) }))
+            engine.setAuthoritativeCurrent(playback.current?.slideshowItem)
+            if let list = playback.currentList { currentList = list }
+            if let tags = playback.modTags { modTags = tags }
             reportedReadyID = nil
         case .tagLists(let lists): tagLists = lists
         case .sensor(let reading): sensors[reading.id] = reading
@@ -255,7 +274,8 @@ final class SlideshowModel {
             // A refresh is a server request to reconcile its current frame, not
             // a client-side advance. The authoritative playback frame follows.
             engine.resetSource()
-        case .searchEmpty(let message), .fatalError(let message): error = message
+        case .searchEmpty(let query): error = query.isEmpty ? "No matching posts." : "No posts match \(query)."
+        case .halted(let reason): error = reason
         default: break
         }
     }

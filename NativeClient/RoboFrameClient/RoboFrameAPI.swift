@@ -1,4 +1,5 @@
 import Foundation
+import RAVERoboFrame
 import RAVESlideshow
 
 struct RoboFrameHistory: Decodable, Equatable {
@@ -16,24 +17,18 @@ actor RoboFrameAPI {
     private let session: URLSession = .shared
 
     func mediaURL(for post: RemotePost, profile: RoboFrameProfile, record: Bool = false) throws -> URL {
-        guard let base = profile.normalizedEndpoint else { throw RoboFrameAPIError.invalidEndpoint }
-        var components = URLComponents(url: base.appending(path: "get"), resolvingAgainstBaseURL: false)!
-        var items = [URLQueryItem(name: "id", value: String(post.id))]
-        items.append(URLQueryItem(name: "record", value: record ? "1" : "0"))
-        if !profile.deviceId.isEmpty { items.append(URLQueryItem(name: "deviceId", value: profile.deviceId)) }
-        if !profile.accessToken.isEmpty { items.append(URLQueryItem(name: "token", value: profile.accessToken)) }
+        var options = RoboFrameMediaOptions(record: record)
         // AVPlayer can't open these containers, and won't play an unbounded
         // chunked mp4 either, so it gets the server's source-resolution HLS
         // encode, which starts playing on its first segment.
-        if post.isVideo && !post.isNativeVideo {
-            items += [
-                URLQueryItem(name: "vcodec", value: "hls"),
-                URLQueryItem(name: "vmaxh", value: "0"),
-                URLQueryItem(name: "vmaxfps", value: "0"),
-            ]
+        if post.isVideo && !post.isISOMedia {
+            options.vcodec = "hls"
+            options.videoMaxHeight = 0
+            options.videoMaxFPS = 0
         }
-        components.queryItems = items
-        guard let url = components.url else { throw RoboFrameAPIError.invalidEndpoint }
+        guard let url = profile.roboFrameEndpoint?.mediaURL(postID: post.id, options: options) else {
+            throw RoboFrameAPIError.invalidEndpoint
+        }
         return url
     }
 
@@ -58,14 +53,9 @@ actor RoboFrameAPI {
     }
 
     private func endpoint(_ path: String, profile: RoboFrameProfile, postID: Int? = nil) throws -> URL {
-        guard let base = profile.normalizedEndpoint else { throw RoboFrameAPIError.invalidEndpoint }
-        var components = URLComponents(url: base.appending(path: path), resolvingAgainstBaseURL: false)!
-        var items: [URLQueryItem] = []
-        if let postID { items.append(URLQueryItem(name: "id", value: String(postID))) }
-        if !profile.deviceId.isEmpty { items.append(URLQueryItem(name: "deviceId", value: profile.deviceId)) }
-        if !profile.accessToken.isEmpty { items.append(URLQueryItem(name: "token", value: profile.accessToken)) }
-        components.queryItems = items
-        guard let url = components.url else { throw RoboFrameAPIError.invalidEndpoint }
+        guard let url = profile.roboFrameEndpoint?.url(path: path, postID: postID) else {
+            throw RoboFrameAPIError.invalidEndpoint
+        }
         return url
     }
 }
@@ -100,22 +90,5 @@ final class RoboFrameSlideshowProvider: RAVESlideshowContentProvider {
     func didDisplay(_ item: RAVESlideshowItem) async {
         guard let post = RemotePost(slideshowItem: item) else { return }
         try? await api.addToHistory(postID: post.id, profile: profile)
-    }
-}
-
-extension RemotePost {
-    var slideshowItem: RAVESlideshowItem {
-        RAVESlideshowItem(
-            id: String(id),
-            mediaKind: isVideo ? .video : .image,
-            fileExtension: ext,
-            duration: durationMs.map { Double($0) / 1_000 },
-            metadata: ["postID": String(id)]
-        )
-    }
-
-    init?(slideshowItem: RAVESlideshowItem) {
-        guard let id = Int(slideshowItem.metadata["postID"] ?? slideshowItem.id) else { return nil }
-        self.init(id: id, ext: slideshowItem.fileExtension, durationMs: slideshowItem.duration.map { Int($0 * 1_000) })
     }
 }

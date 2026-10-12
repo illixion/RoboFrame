@@ -1,4 +1,5 @@
 import Foundation
+import RAVERoboFrame
 
 enum ProfileMode: String, Codable, CaseIterable, Identifiable {
     case slideshow
@@ -75,23 +76,14 @@ struct RoboFrameProfile: Codable, Identifiable, Equatable {
         maxImageResolution3D = try values.decodeIfPresent(Int.self, forKey: .maxImageResolution3D)
     }
 
-    var normalizedEndpoint: URL? {
-        let value = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return nil }
-        return URL(string: value.contains("://") ? value : "https://\(value)")
+    /// The server this profile points at, with its token and deviceId.
+    var roboFrameEndpoint: RoboFrameEndpoint? {
+        RoboFrameEndpoint(server: endpoint, accessToken: accessToken, deviceId: deviceId)
     }
 
-    var webSocketURL: URL? {
-        guard var components = URLComponents(url: normalizedEndpoint ?? URL(string: "https://invalid")!, resolvingAgainstBaseURL: false),
-              components.host != nil else { return nil }
-        components.scheme = components.scheme == "https" ? "wss" : "ws"
-        components.path = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/rpc/ws"
-        components.path = "/" + components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        if !accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            components.queryItems = [URLQueryItem(name: "token", value: accessToken)]
-        }
-        return components.url
-    }
+    var normalizedEndpoint: URL? { roboFrameEndpoint?.baseURL }
+
+    var webSocketURL: URL? { roboFrameEndpoint?.webSocketURL }
 
     var resolvedWebPageURL: URL? {
         let value = webPageURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -116,16 +108,7 @@ struct RoboFrameProfile: Codable, Identifiable, Equatable {
     }
 
     func mediaURL(for post: RemotePost, record: Bool = false) -> URL? {
-        guard let base = normalizedEndpoint else { return nil }
-        var components = URLComponents(url: base.appending(path: "get"), resolvingAgainstBaseURL: false)
-        var items = [
-            URLQueryItem(name: "id", value: String(post.id)),
-            URLQueryItem(name: "record", value: record ? "1" : "0"),
-        ]
-        if !deviceId.isEmpty { items.append(URLQueryItem(name: "deviceId", value: deviceId)) }
-        if !accessToken.isEmpty { items.append(URLQueryItem(name: "token", value: accessToken)) }
-        components?.queryItems = items
-        return components?.url
+        roboFrameEndpoint?.mediaURL(postID: post.id, options: RoboFrameMediaOptions(record: record))
     }
 
     func duplicated(named name: String) -> Self {
@@ -175,50 +158,7 @@ enum Slideshow3DPreference: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-struct RemotePost: Identifiable, Equatable, Hashable, Decodable {
-    let id: Int
-    let ext: String
-    let durationMs: Int?
-    /// The server's video containers (`packages/shared/src/mediaTypes.js`).
-    var isVideo: Bool { Self.videoExtensions.contains(ext.lowercased()) }
-    /// ISO BMFF containers AVPlayer opens directly. The rest (Matroska, WebM,
-    /// AVI, ASF, FLV) play through the server's HLS transcode.
-    var isNativeVideo: Bool { Self.nativeVideoExtensions.contains(ext.lowercased()) }
-
-    private static let videoExtensions: Set<String> = ["mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "flv", "3gp"]
-    private static let nativeVideoExtensions: Set<String> = ["mp4", "m4v", "mov", "3gp"]
-}
-
-struct SensorReading: Identifiable, Equatable {
-    let id: String
-    var state: String
-    var name: String
-    var unit: String
-}
-
-struct RemoteAlert: Identifiable, Equatable {
-    let id = UUID()
-    let text: String
-    let colorHex: String
-    let imageURL: URL?
-}
-
-enum RemoteMessage: Equatable {
-    case connected
-    case playback(current: RemotePost?, upcoming: [RemotePost], interval: Double, currentList: Int, modTags: [String])
-    case tagLists([[String]])
-    case sensor(SensorReading)
-    case alert(RemoteAlert)
-    case dismissAlert
-    case playVideo(URL)
-    case stopVideo
-    case playAudio(URL)
-    case stopAudio
-    case displayState(target: String, isOn: Bool)
-    case refresh
-    case searchEmpty(String)
-    case fatalError(String)
-}
+typealias RemotePost = RoboFramePost
 
 enum RoboFrameAPIError: LocalizedError {
     case invalidEndpoint

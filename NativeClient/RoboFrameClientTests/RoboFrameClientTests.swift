@@ -47,12 +47,14 @@ final class RoboFrameClientTests: XCTestCase {
         }
         await MainActor.run { engine.start() }
         try? await Task.sleep(for: .milliseconds(30))
-        XCTAssertNil(await MainActor.run { engine.current })
+        let before = await MainActor.run { engine.current }
+        XCTAssertNil(before)
 
         let item = RAVESlideshowItem(id: "17", fileExtension: "jpg")
         await MainActor.run { engine.setAuthoritativeCurrent(item) }
         await engine.waitUntilIdleForTesting()
-        XCTAssertEqual(await MainActor.run { engine.current?.item.id }, "17")
+        let after = await MainActor.run { engine.current?.item.id }
+        XCTAssertEqual(after, "17")
         await MainActor.run { engine.stop() }
     }
 }

@@ -156,7 +156,7 @@ struct SlideshowWindowView: View {
                 VStack(alignment: .trailing, spacing: 4) {
                     ForEach(model.sortedSensors) { sensor in
                         HStack(spacing: 4) {
-                            Text(sensor.name + ":")
+                            Text(sensor.friendlyName + ":")
                             Text(sensor.state)
                             if !sensor.unit.isEmpty { Text(sensor.unit) }
                         }

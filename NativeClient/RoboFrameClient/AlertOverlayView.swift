@@ -5,10 +5,11 @@
  WebSocket `showText` alerts.
  */
 
+import RAVERoboFrame
 import SwiftUI
 
 struct AlertOverlayView: View {
-    let alert: RemoteAlert
+    let alert: RoboFrameAlert
 
     var body: some View {
         ZStack {
@@ -32,7 +33,7 @@ struct AlertOverlayView: View {
     }
 
     private var backgroundColor: Color {
-        Color(hex: alert.colorHex) ?? .black
+        Color(hex: alert.backgroundHex) ?? .black
     }
 }
 
