@@ -64,6 +64,8 @@ public struct KioskToasts: Sendable {
     public struct Toast: Equatable, Sendable {
         public let id: Int
         public let text: String
+        /// A small JPEG shown beside the text (the save confirmation's preview).
+        public let thumbnail: Data?
         public let expires: TimeInterval
     }
 
@@ -75,9 +77,9 @@ public struct KioskToasts: Sendable {
 
     public init() {}
 
-    public mutating func add(_ text: String, now: TimeInterval) {
+    public mutating func add(_ text: String, thumbnail: Data? = nil, now: TimeInterval) {
         nextID += 1
-        all.append(Toast(id: nextID, text: text, expires: now + Self.duration))
+        all.append(Toast(id: nextID, text: text, thumbnail: thumbnail, expires: now + Self.duration))
         if all.count > Self.limit { all.removeFirst(all.count - Self.limit) }
     }
 

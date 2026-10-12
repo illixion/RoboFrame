@@ -587,8 +587,11 @@ public final class KioskRenderer {
         if toasts.map(\.id) != toastTextures.map(\.id) {
             toastTextures = toasts.compactMap { toast in
                 if let existing = toastTextures.first(where: { $0.id == toast.id }) { return existing }
+                let edge = session.thumbnailSize
+                let thumbnail = toast.thumbnail.flatMap { RGBAImage.decode($0, maxWidth: edge, maxHeight: edge) }
                 guard let image = text.box([toast.text], size: Int(22 * fontScale), rightAligned: false, padding: (10, 6),
-                                           background: (51, 51, 51, 230), color: SDL_Color(r: 255, g: 255, b: 255, a: 255)) else { return nil }
+                                           background: (51, 51, 51, 230), color: SDL_Color(r: 255, g: 255, b: 255, a: 255),
+                                           leading: thumbnail, imageGap: Int(8 * fontScale)) else { return nil }
                 return (toast.id, image.texture())
             }
             dirty = true
@@ -650,10 +653,11 @@ public final class KioskRenderer {
             session.handleKey(.left)
         case Int(SDLK_RETURN.rawValue), Int(SDLK_KP_ENTER.rawValue):
             break
-        case Int(SDLK_KP_0.rawValue)...Int(SDLK_KP_9.rawValue):
-            // SDL numbers the keypad 1-9 then 0.
-            let digit = Int(key.sym) == Int(SDLK_KP_0.rawValue) ? 0 : Int(key.sym) - Int(SDLK_KP_1.rawValue) + 1
-            session.handleKey(.character(Character(String(digit))))
+        case Int(SDLK_KP_0.rawValue):
+            session.handleKey(.character("0"))
+        case Int(SDLK_KP_1.rawValue)...Int(SDLK_KP_9.rawValue):
+            // SDL numbers the keypad 1-9 and then 0, so 0 is its own case.
+            session.handleKey(.character(Character(String(Int(key.sym) - Int(SDLK_KP_1.rawValue) + 1))))
         case 32..<127:
             session.handleKey(.character(Character(UnicodeScalar(UInt8(key.sym))), control: control))
         default:

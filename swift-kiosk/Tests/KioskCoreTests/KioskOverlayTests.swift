@@ -68,4 +68,27 @@ struct KioskKeyTests {
         session.handleKey(.character("d"))
         #expect(session.toasts.all.map(\.text) == ["Next", "Display Sync ON"])
     }
+
+    @Test("← steps back through what the server sent and holds there; → lets go")
+    func previous() throws {
+        let session = try session()
+        #expect(session.handleKey(.left) == "No earlier image")
+        for id in [1, 2, 2, 3] {
+            session.handle(.playback(RoboFramePlayback(current: RoboFramePost(id: id, ext: "jpg"))))
+        }
+        #expect(session.history.map(\.id) == [1, 2, 3])
+        #expect(session.handleKey(.left) == "Previous" && session.isHolding)
+        #expect(session.handleKey(.left) == "Previous")
+        #expect(session.handleKey(.left) == "No earlier image")
+
+        // A frame that arrives during the hold waits for it to end.
+        session.handle(.playback(RoboFramePlayback(current: RoboFramePost(id: 4, ext: "jpg"))))
+        #expect(session.history.map(\.id) == [1, 2, 3])
+        session.endHold(resume: true)
+        #expect(!session.isHolding && session.history.map(\.id) == [1, 2, 3, 4])
+
+        session.handleKey(.left)
+        session.handleKey(.right)
+        #expect(!session.isHolding)
+    }
 }

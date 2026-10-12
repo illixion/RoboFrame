@@ -143,22 +143,37 @@ final class TextSetter {
         return line
     }
 
-    /// Lines in a translucent black box, like the web kiosk's overlay boxes.
+    /// Lines in a translucent black box, like the web kiosk's overlay boxes,
+    /// with an optional image to their left (a toast's preview).
     func box(_ lines: [String], size: Int, rightAligned: Bool, padding: (x: Int, y: Int) = (14, 10),
              background: (UInt8, UInt8, UInt8, UInt8) = (0, 0, 0, 178),
-             color: SDL_Color = SDL_Color(r: 222, g: 222, b: 222, a: 255)) -> RGBAImage? {
+             color: SDL_Color = SDL_Color(r: 222, g: 222, b: 222, a: 255),
+             leading image: RGBAImage? = nil, imageGap: Int = 8) -> RGBAImage? {
         let surfaces = lines.compactMap { line($0, size: size, color: color) }
         defer { surfaces.forEach { SDL_FreeSurface($0) } }
         guard !surfaces.isEmpty else { return nil }
         let gap = 4
-        let width = surfaces.map { Int($0.pointee.w) }.max()! + padding.x * 2
-        let height = surfaces.reduce(0) { $0 + Int($1.pointee.h) } + gap * (surfaces.count - 1) + padding.y * 2
+        let imageWidth = image.map { $0.width + imageGap } ?? 0
+        let textHeight = surfaces.reduce(0) { $0 + Int($1.pointee.h) } + gap * (surfaces.count - 1)
+        let width = surfaces.map { Int($0.pointee.w) }.max()! + imageWidth + padding.x * 2
+        let height = max(textHeight, image?.height ?? 0) + padding.y * 2
         guard let box = SDL_CreateRGBSurfaceWithFormat(0, Int32(width), Int32(height), 32, SDL_PIXELFORMAT_RGBA32.rawValue) else { return nil }
         defer { SDL_FreeSurface(box) }
         SDL_FillRect(box, nil, SDL_MapRGBA(box.pointee.format, background.0, background.1, background.2, background.3))
-        var y = padding.y
+        if let image {
+            var pixels = image.pixels
+            pixels.withUnsafeMutableBytes { bytes in
+                guard let surface = SDL_CreateRGBSurfaceWithFormatFrom(bytes.baseAddress, Int32(image.width), Int32(image.height), 32,
+                                                                        Int32(image.width * 4), SDL_PIXELFORMAT_RGBA32.rawValue) else { return }
+                defer { SDL_FreeSurface(surface) }
+                SDL_SetSurfaceBlendMode(surface, SDL_BLENDMODE_NONE)
+                var target = SDL_Rect(x: Int32(padding.x), y: Int32((height - image.height) / 2), w: Int32(image.width), h: Int32(image.height))
+                SDL_UpperBlit(surface, nil, box, &target)
+            }
+        }
+        var y = padding.y + (height - padding.y * 2 - textHeight) / 2
         for surface in surfaces {
-            let x = rightAligned ? width - padding.x - Int(surface.pointee.w) : padding.x
+            let x = rightAligned ? width - padding.x - Int(surface.pointee.w) : padding.x + imageWidth
             SDL_SetSurfaceBlendMode(surface, SDL_BLENDMODE_BLEND)
             var target = SDL_Rect(x: Int32(x), y: Int32(y), w: surface.pointee.w, h: surface.pointee.h)
             SDL_UpperBlit(surface, nil, box, &target)

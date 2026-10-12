@@ -14,12 +14,20 @@
    outside the readiness barrier), on reports it back. node-display, running
    alongside, is what actually powers the panel. Hiding the photo from the
    keypad (`p`) reports the same way, but leaves the clock on screen.
+ - `←` steps back through the posts this display was sent, seeded from the
+   server's `/history.json`, and holds the earlier post for one interval.
+   The server is never told: sessions sharing this channel share one queue,
+   so going back is this display's alone. Playback frames that arrive during
+   the hold wait for it to end, then the latest one applies.
 
  What it never does, per the protocol: run its own dwell timer, advance on a
  wake, or filter posts locally.
  */
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import RAVENet
 import RAVERoboFrame
 import RAVESlideshowCore
@@ -47,7 +55,13 @@ public final class KioskSession {
     /// A `playAudio` clip, played alongside whatever is on screen.
     public private(set) var audio: URL?
     public private(set) var toasts = KioskToasts()
-    /// The post on screen, as far as the server is concerned.
+    /// Posts the server put on screen, oldest first, for `←`.
+    public private(set) var history: [RoboFramePost] = []
+    public static let historyLimit = 100
+    /// `←` is holding an earlier post on screen.
+    public var isHolding: Bool { holdTask != nil }
+    /// The post on screen, which is what `b` blocks and space saves (during
+    /// a `←` hold, the earlier post).
     public var currentPostID: Int? { engine.current.flatMap { RoboFramePost(slideshowItem: $0.item) }?.id }
     public var sensors: [RoboFrameSensorReading] { Array(connection.sensors.values) }
 
@@ -65,6 +79,11 @@ public final class KioskSession {
     private var handlers: RoboFrameSessionHandlers?
     private var reportedReadyID: Int?
     private var screen: (width: Int, height: Int)
+    var screenHeight: Int { screen.height }
+    private var lastPlayback: RoboFramePlayback?
+    private var backSteps = 0
+    private var holdTask: Task<Void, Never>?
+    private var historySeeded = false
     var awaitingTagList = false
     var isDisplaySyncOn = false
 
@@ -138,10 +157,67 @@ public final class KioskSession {
         showingChanged()
     }
 
-    public func toast(_ text: String) {
+    public func toast(_ text: String, thumbnail: Data? = nil) {
         logger.log(.info, "toast: \(text)")
-        toasts.add(text, now: ProcessInfo.processInfo.systemUptime)
+        toasts.add(text, thumbnail: thumbnail, now: ProcessInfo.processInfo.systemUptime)
         onChange?()
+    }
+
+    // MARK: - Previous (←)
+
+    /// Shows the post before the one on screen (or before the one `←` is
+    /// already holding) for one interval. Returns the toast.
+    func showPrevious() -> String {
+        let index = history.count - 2 - backSteps
+        guard index >= 0 else {
+            seedHistory()
+            return "No earlier image"
+        }
+        backSteps += 1
+        let seconds = max(2, engine.displaySettings.delay)
+        holdTask?.cancel()
+        holdTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled else { return }
+            self?.endHold(resume: true)
+        }
+        engine.setAuthoritativeCurrent(history[index].slideshowItem)
+        return "Previous"
+    }
+
+    /// Back to live playback: the latest frame when the hold runs out, or
+    /// nothing yet when a key just asked the server for a new one.
+    func endHold(resume: Bool) {
+        guard let holdTask else { return }
+        holdTask.cancel()
+        self.holdTask = nil
+        backSteps = 0
+        if resume, let lastPlayback { apply(lastPlayback) }
+    }
+
+    private func record(_ post: RoboFramePost?) {
+        guard let post, history.last?.id != post.id else { return }
+        history.append(post)
+        if history.count > Self.historyLimit { history.removeFirst(history.count - Self.historyLimit) }
+    }
+
+    /// Fills the history from the server's request log once, so `←` works
+    /// straight after a start. What this display recorded itself stays newest.
+    private func seedHistory() {
+        guard !historySeeded, let url = provider.endpoint.url(path: "history.json") else { return }
+        historySeeded = true
+        Task {
+            do {
+                let (data, response) = try await URLSession.shared.data(from: url)
+                guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw KioskMediaError.status((response as? HTTPURLResponse)?.statusCode ?? 0) }
+                let served = try JSONDecoder().decode(RoboFrameHistory.self, from: data).history
+                let local = Set(history.map(\.id))
+                history = Array((served.reversed().filter { !local.contains($0.id) } + history).suffix(Self.historyLimit))
+            } catch {
+                historySeeded = false
+                logger.log(.warning, "history seed failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     public func expireToasts() {
@@ -165,6 +241,7 @@ public final class KioskSession {
         logger.log(.info, "connected")
         sendSlideshowConfig()
         connection.sendGetDisplayState(target: config.deviceId)
+        seedHistory()
     }
 
     private func sendSlideshowConfig() {
@@ -236,6 +313,9 @@ public final class KioskSession {
     }
 
     private func apply(_ playback: RoboFramePlayback) {
+        lastPlayback = playback
+        guard !isHolding else { return }
+        record(playback.current)
         if let interval = playback.interval {
             var settings = engine.displaySettings
             settings.delay = interval
@@ -273,7 +353,8 @@ public final class KioskSession {
     }
 
     private func didDisplay(_ displayed: RAVESlideshowDisplayedMedia) {
-        guard isShowing, let post = RoboFramePost(slideshowItem: displayed.item), reportedReadyID != post.id else { return }
+        // A post `←` brought back isn't the channel's, so it isn't reported.
+        guard isShowing, !isHolding, let post = RoboFramePost(slideshowItem: displayed.item), reportedReadyID != post.id else { return }
         reportedReadyID = post.id
         logger.log(.info, "showing post \(post.id) (\(post.ext, privacy: .public))")
         connection.sendImageReady(sessionId: Self.sessionId, postId: post.id, durationMs: post.durationMs)
