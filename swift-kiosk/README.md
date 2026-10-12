@@ -6,14 +6,20 @@ client and slideshow engine as Hypnos's remote viewer and the NativeClient
 app (RAVESDK's `RAVERoboFrame` and `RAVESlideshowCore`), so every Swift
 frontend joins, reports and follows the server the same way.
 
-**Status:** runs on the Pi 3 as a full frontend, tested against a throwaway
-server; not yet the kiosk's default. It joins its channel, follows
-`playback`, crossfades photos and videos fullscreen (SDL2 + OpenGL ES 2 on
-the VideoCore IV, video through libmpv), draws the clock, date, sensors and
-toasts, shows `showText` alerts and `playVideo`/`playScene`/`playAudio`
-effects, follows `displayState`, and takes the keypad's keys. Not done yet:
-`←` (previous post), toast thumbnails after a save, and an install/deploy
-path.
+**Status:** the Pi 3 kiosk's frontend (kiosk-pi3), with native-kiosk as
+its fallback. It joins its channel, follows `playback`, crossfades photos
+and videos fullscreen (SDL2 + OpenGL ES 2 on the VideoCore IV, video through
+libmpv), draws the clock, date, sensors and toasts, shows `showText` alerts
+and `playVideo`/`playScene`/`playAudio` effects, follows `displayState`, and
+takes the keypad's keys. A save's toast shows a preview of what was saved.
+
+## Keys
+
+The same as native-kiosk and the web kiosk; gpio-agent's keypad types them.
+`→` next, `←` previous (held for one interval; this display only, the
+server isn't told), space save, `b` block, `s` then a digit for a tag list,
+`d` display sync, `p` hide the photo (the clock stays), `t` reshuffle,
+ctrl+r reload, Esc quit.
 
 ## Layout
 
@@ -43,16 +49,17 @@ On a Mac, for development:
 swift build && swift test
 ```
 
-For Linux, in an arm64 image with the Swift toolchain and the renderer's
-headers (the Pi is aarch64). `docker/build.Dockerfile` is that image.
-Colima only shares your home directory, so copy the checkout and its sibling
-packages (RAVESDK, DebugTrace, vergence) under `~` first, then:
+For the Pi (Linux, aarch64), in Docker:
 
 ```bash
-docker build -t roboframe-kiosk-build -f docker/build.Dockerfile docker
-docker run --rm -v ~/src:/w -w /w/RoboFrame/swift-kiosk roboframe-kiosk-build \
-  swift build -c release --static-swift-stdlib
+scripts/build-linux.sh        # → dist/roboframe-kiosk
 ```
+
+It builds `docker/build.Dockerfile` (the Swift toolchain plus the renderer's
+headers) the first time, copies this package and its sibling checkouts
+(RAVESDK, DebugTrace, vergence) under `~/Library/Caches` (Colima only shares
+the home directory), and keeps the build there, so later builds are
+incremental.
 
 `--static-swift-stdlib` links the Swift runtime and Foundation into the
 binary (56 MB stripped). What's left is dynamic: SDL2, SDL2_ttf, SDL2_image,
@@ -73,7 +80,8 @@ ROBOFRAME_CONFIG=/opt/RoboFrame/roboframe.config.json ./roboframe-kiosk
 
 Logs go to stderr (the journal), with every value that isn't public
 withheld. `RAVE_LOG_PRIVATE=1` shows private values, such as error details,
-while debugging at the device.
+while debugging at the device, and `RAVE_LOG_DEBUG=1` adds debug lines (every
+frame the socket sends and receives).
 
 To try it beside a live kiosk without joining that kiosk's channel, give it
 its own `DEVICE_ID`. A new deviceId gets its own Home Assistant device
@@ -83,8 +91,32 @@ unset).
 
 ## On the Pi
 
-On the Pi 3 it uses about 5% CPU on photos and 270 MB of RAM. Two things
-about the board shape the renderer:
+```bash
+scripts/build-linux.sh && scripts/deploy-pi.sh root@kiosk-pi3 --restart
+```
+
+`deploy-pi.sh` copies the binary and `pi/run-kiosk` to `/opt/swift-kiosk`
+(on the SD card's real filesystem, so it survives overlayroot), refuses a
+binary the Pi lacks a library for, and with `--restart` restarts the X
+session onto it. A running kiosk keeps its old binary until then.
+
+`run-kiosk` is the session's frontend: the Swift kiosk, logging to the
+journal as `roboframe-kiosk`, and native-kiosk for the rest of the session if
+it dies (a crash, a missing library), so a bad build can't leave getty
+restarting X every few seconds. Stopping it on purpose (SIGTERM, Esc) ends
+the session and getty starts a fresh one. `touch /opt/swift-kiosk/disabled`
+goes back to native-kiosk.
+
+Once per Pi:
+
+- `libmpv2`, the one library the Pi's Debian 13 lacks (the same version as
+  its `mpv`), installed offline: `overlayroot-chroot dpkg -i libmpv2_*.deb`.
+- The launcher's last line (`/usr/local/bin/start-kiosk`, which `.xinitrc`
+  execs) becomes `exec env ROBOFRAME_CONFIG=… /opt/swift-kiosk/run-kiosk`,
+  in the overlay and in the lower layer (`/media/root-ro/…`).
+
+It uses about 5% CPU on photos, 15–55% during a hardware-decoded video,
+and 140 MB of RAM, flat. Two things about the board shape the renderer:
 
 - **GPU memory is the kernel's CMA pool** (256 MB), shared by X, the
   compositor, every GL texture and the hardware video decoder, which needs

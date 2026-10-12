@@ -1,0 +1,25 @@
+#!/bin/bash
+# The kiosk session's frontend, exec'd by start-kiosk once X is up: the Swift
+# kiosk, with native-kiosk taking over for the rest of the session if it dies.
+# The fallback matters: a session that exits straight away (a crash, a missing
+# library) makes getty respawn X every few seconds.
+#
+# Stopping it on purpose (SIGTERM, or ESC at a keyboard) ends the session
+# instead, and getty starts a fresh one on the Swift kiosk; that's how a
+# deploy restarts it. Its log goes to the journal as `roboframe-kiosk`.
+# `touch /opt/swift-kiosk/disabled` goes back to native-kiosk for good.
+set -u
+
+config=${ROBOFRAME_CONFIG:-/opt/RoboFrame/roboframe.config.json}
+dir=$(dirname "$(readlink -f "$0")")
+
+if [ -x "$dir/roboframe-kiosk" ] && [ ! -e "$dir/disabled" ]; then
+    ROBOFRAME_CONFIG=$config "$dir/roboframe-kiosk" 2>&1 | systemd-cat -t roboframe-kiosk
+    status=${PIPESTATUS[0]}
+    case $status in
+        0|143) exit 0 ;;
+    esac
+    echo "roboframe-kiosk exited with $status; native-kiosk takes over until the session restarts" \
+        | systemd-cat -t roboframe-kiosk -p warning
+fi
+exec env ROBOFRAME_CONFIG="$config" /usr/bin/python3 /opt/RoboFrame/native-kiosk/kiosk.py

@@ -57,9 +57,10 @@ Hypnos is a separate app that implements the same protocol in Swift, it is locat
   (crossfades either way, no evdev grab needed). Big GL surfaces are
   allocated once and reused: VC4's CMA pool is shared with the hardware
   decoder, and running it out wedged the Pi's firmware decoder until a
-  reboot. Tested on kiosk-pi3 against a throwaway server; not the kiosk's
-  default yet. Built in Docker (`swift-kiosk/docker/build.Dockerfile`,
-  arm64) with `--static-swift-stdlib`, run on Debian 13 (needs `libmpv2`);
+  reboot. kiosk-pi3's frontend: `swift-kiosk/pi/run-kiosk` runs it and
+  falls back to native-kiosk if it dies. `swift-kiosk/scripts/build-linux.sh`
+  builds it in Docker (arm64, `--static-swift-stdlib`; the Pi needs
+  `libmpv2`), `scripts/deploy-pi.sh` installs it in `/opt/swift-kiosk`;
   see its README.
 - `psp-kiosk/` — native Sony PSP homebrew client (C + pspdev SDK, GU
   rendering, intraFont clock overlay). Full WS slideshow session
