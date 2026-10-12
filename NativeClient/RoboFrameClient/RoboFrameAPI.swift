@@ -2,17 +2,6 @@ import Foundation
 import RAVERoboFrame
 import RAVESlideshow
 
-struct RoboFrameHistory: Decodable, Equatable {
-    struct Group: Decodable, Identifiable, Equatable {
-        let deviceId: String
-        let posts: [RemotePost]
-        var id: String { deviceId }
-    }
-
-    let history: [RemotePost]
-    let groups: [Group]
-}
-
 actor RoboFrameAPI {
     private let session: URLSession = .shared
 
