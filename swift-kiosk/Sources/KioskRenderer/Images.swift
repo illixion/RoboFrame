@@ -67,6 +67,7 @@ final class TextSetter {
     private let emojiPath: String?
     private var fonts: [Int: OpaquePointer] = [:]
     private var emoji: OpaquePointer?
+    private var triedEmoji = false
 
     static let fontCandidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -78,8 +79,6 @@ final class TextSetter {
     init() {
         path = Self.fontCandidates.first { FileManager.default.fileExists(atPath: $0) }
         emojiPath = Self.emojiCandidates.first { FileManager.default.fileExists(atPath: $0) }
-        // NotoColorEmoji is a bitmap font with a single 109 px strike.
-        if let emojiPath { emoji = TTF_OpenFont(emojiPath, 109) }
     }
 
     var hasFont: Bool { path != nil }
@@ -87,6 +86,19 @@ final class TextSetter {
     deinit {
         fonts.values.forEach { TTF_CloseFont($0) }
         if let emoji { TTF_CloseFont(emoji) }
+    }
+
+    /// NotoColorEmoji is a bitmap font with a single 109 px strike. Opened on
+    /// first use: SDL_ttf isn't initialised yet when the renderer builds this.
+    private func emojiFont() -> OpaquePointer? {
+        if !triedEmoji {
+            triedEmoji = true
+            if let emojiPath {
+                emoji = TTF_OpenFont(emojiPath, 109)
+                if emoji == nil { FileHandle.standardError.write(Data("emoji font \(emojiPath) failed: \(String(cString: SDL_GetError()))\n".utf8)) }
+            }
+        }
+        return emoji
     }
 
     private func font(size: Int) -> OpaquePointer? {
@@ -100,11 +112,23 @@ final class TextSetter {
         font(size: size).map { Int(TTF_FontLineSkip($0)) } ?? size
     }
 
+    /// The width `line` will have: emoji runs are measured in the emoji font
+    /// and scaled to the text's line height, as `line` draws them.
     func width(of text: String, size: Int) -> Int {
         guard let font = font(size: size) else { return 0 }
-        var width: Int32 = 0, height: Int32 = 0
-        TTF_SizeUTF8(font, text, &width, &height)
-        return Int(width)
+        let height = Int(TTF_FontHeight(font))
+        var total = 0
+        for (run, isEmoji) in Self.runs(text) {
+            var width: Int32 = 0, runHeight: Int32 = 0
+            if isEmoji, let emoji = emojiFont() {
+                TTF_SizeUTF8(emoji, run, &width, &runHeight)
+                total += runHeight > 0 ? max(1, Int(width) * height / Int(runHeight)) : 0
+            } else {
+                TTF_SizeUTF8(font, run, &width, &runHeight)
+                total += Int(width)
+            }
+        }
+        return total
     }
 
     /// One line as an RGBA32 surface (caller frees it).
@@ -114,8 +138,9 @@ final class TextSetter {
         var runs: [UnsafeMutablePointer<SDL_Surface>] = []
         defer { runs.forEach { SDL_FreeSurface($0) } }
         for (run, isEmoji) in Self.runs(text) {
-            let useEmoji = isEmoji && emoji != nil
-            guard let rendered = TTF_RenderUTF8_Blended(useEmoji ? emoji : font, run, color),
+            let emoji = isEmoji ? emojiFont() : nil
+            let useEmoji = emoji != nil
+            guard let rendered = TTF_RenderUTF8_Blended(emoji ?? font, run, color),
                   let rgba = SDL_ConvertSurfaceFormat(rendered, SDL_PIXELFORMAT_RGBA32.rawValue, 0) else { continue }
             SDL_FreeSurface(rendered)
             if useEmoji, rgba.pointee.h > 0 {
