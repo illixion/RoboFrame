@@ -39,7 +39,7 @@ public enum KioskMediaError: Error, CustomStringConvertible {
 
 @MainActor
 public final class KioskMediaProvider: RAVESlideshowContentProvider {
-    private var endpoint: RoboFrameEndpoint
+    public private(set) var endpoint: RoboFrameEndpoint
     private let config: KioskConfig
     private let session: URLSession
     private var screen: (width: Int, height: Int)

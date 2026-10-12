@@ -52,11 +52,15 @@ Hypnos is a separate app that implements the same protocol in Swift, it is locat
   on RAVESDK's shared `RAVERoboFrame` client and `RAVESlideshowCore`
   engine (the same code Hypnos's remote viewer and NativeClient run), so
   every Swift frontend follows the server identically. Reads native-kiosk's
-  `roboframe.config.json` `kiosk` block and env names. Headless so far:
-  it joins, follows `playback`, loads frames and reports them, without
-  drawing; an SDL3/GLES2 renderer and libmpv video come next. Built in
-  Docker (`swift:6.2.4-noble`, arm64) with `--static-swift-stdlib`, run on
-  Debian 13; see its README.
+  `roboframe.config.json` `kiosk` block and env names. Renders with SDL2 +
+  OpenGL ES 2 (VC4) and plays video through libmpv inside its own window
+  (crossfades either way, no evdev grab needed). Big GL surfaces are
+  allocated once and reused: VC4's CMA pool is shared with the hardware
+  decoder, and running it out wedged the Pi's firmware decoder until a
+  reboot. Tested on kiosk-pi3 against a throwaway server; not the kiosk's
+  default yet. Built in Docker (`swift-kiosk/docker/build.Dockerfile`,
+  arm64) with `--static-swift-stdlib`, run on Debian 13 (needs `libmpv2`);
+  see its README.
 - `psp-kiosk/` — native Sony PSP homebrew client (C + pspdev SDK, GU
   rendering, intraFont clock overlay). Full WS slideshow session
   (`sessionId "main"`, hand-rolled RFC6455 in `ws.c`): server-pushed

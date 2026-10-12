@@ -12,7 +12,8 @@
  - `displayState` for this deviceId is the panel: off reports the session
    absent and invisible and stops reporting `imageReady` (a hidden session is
    outside the readiness barrier), on reports it back. node-display, running
-   alongside, is what actually powers the panel.
+   alongside, is what actually powers the panel. Hiding the photo from the
+   keypad (`p`) reports the same way, but leaves the clock on screen.
 
  What it never does, per the protocol: run its own dwell timer, advance on a
  wake, or filter posts locally.
@@ -34,11 +35,21 @@ public final class KioskSession {
 
     /// Panel power as the server last reported it.
     public private(set) var isPanelOn = true
+    /// The photo hidden from the keypad; the overlay stays.
+    public private(set) var isImageHidden = false
+    /// Whether the slideshow is on screen: the panel on and the photo not hidden.
+    public var isShowing: Bool { isPanelOn && !isImageHidden }
     public private(set) var tagLists: [[String]] = []
     public private(set) var currentList = 0
     public private(set) var alert: RoboFrameAlert?
     /// The latest effect video or live scene, for the renderer to play over the slideshow.
     public private(set) var effect: Effect?
+    /// A `playAudio` clip, played alongside whatever is on screen.
+    public private(set) var audio: URL?
+    public private(set) var toasts = KioskToasts()
+    /// The post on screen, as far as the server is concerned.
+    public var currentPostID: Int? { engine.current.flatMap { RoboFramePost(slideshowItem: $0.item) }?.id }
+    public var sensors: [RoboFrameSensorReading] { Array(connection.sensors.values) }
 
     public enum Effect: Equatable, Sendable {
         case video(URL)
@@ -54,6 +65,8 @@ public final class KioskSession {
     private var handlers: RoboFrameSessionHandlers?
     private var reportedReadyID: Int?
     private var screen: (width: Int, height: Int)
+    var awaitingTagList = false
+    var isDisplaySyncOn = false
 
     public init(config: KioskConfig, logger: any RAVENetLogger = RAVENetOSLogger(subsystem: "roboframe.kiosk", category: "session")) throws {
         guard let endpoint = RoboFrameEndpoint(webSocketURL: config.webSocketURL, accessToken: config.accessToken, deviceId: config.deviceId),
@@ -119,6 +132,33 @@ public final class KioskSession {
         connection.sendBlock(postId: post.id)
     }
 
+    public func setImageHidden(_ hidden: Bool) {
+        guard hidden != isImageHidden else { return }
+        isImageHidden = hidden
+        showingChanged()
+    }
+
+    public func toast(_ text: String) {
+        logger.log(.info, "toast: \(text)")
+        toasts.add(text, now: ProcessInfo.processInfo.systemUptime)
+        onChange?()
+    }
+
+    public func expireToasts() {
+        if toasts.expire(now: ProcessInfo.processInfo.systemUptime) { onChange?() }
+    }
+
+    /// The renderer finished (or couldn't play) the effect.
+    public func effectEnded() {
+        guard effect != nil else { return }
+        effect = nil
+        onChange?()
+    }
+
+    public func audioEnded() {
+        audio = nil
+    }
+
     // MARK: - Protocol
 
     private func didConnect() {
@@ -145,7 +185,7 @@ public final class KioskSession {
     }
 
     private func reportScene() {
-        connection.reportSceneState(sessionId: Self.sessionId, deviceId: config.deviceId, present: isPanelOn, visible: isPanelOn)
+        connection.reportSceneState(sessionId: Self.sessionId, deviceId: config.deviceId, present: isShowing, visible: isShowing)
     }
 
     func handle(_ message: RoboFrameMessage) {
@@ -177,6 +217,12 @@ public final class KioskSession {
         case .stopScene:
             // A stopScene never tears down a playVideo.
             if case .scene = effect { effect = nil; onChange?() }
+        case .playAudio(let url):
+            audio = url
+            onChange?()
+        case .stopAudio:
+            audio = nil
+            onChange?()
         case .refresh:
             logger.log(.info, "refresh requested")
             onRefresh?()
@@ -214,7 +260,11 @@ public final class KioskSession {
         guard on != isPanelOn else { return }
         logger.log(.info, "panel \(on ? "on" : "off", privacy: .public)")
         isPanelOn = on
-        engine.setVisible(on)
+        showingChanged()
+    }
+
+    private func showingChanged() {
+        engine.setVisible(isShowing)
         // Back on, the server commits a fresh post (it dark-advanced while the
         // panel was off) and announces it; that frame's transition is the
         // next report. The parked one is never re-confirmed.
@@ -223,7 +273,7 @@ public final class KioskSession {
     }
 
     private func didDisplay(_ displayed: RAVESlideshowDisplayedMedia) {
-        guard isPanelOn, let post = RoboFramePost(slideshowItem: displayed.item), reportedReadyID != post.id else { return }
+        guard isShowing, let post = RoboFramePost(slideshowItem: displayed.item), reportedReadyID != post.id else { return }
         reportedReadyID = post.id
         logger.log(.info, "showing post \(post.id) (\(post.ext, privacy: .public))")
         connection.sendImageReady(sessionId: Self.sessionId, postId: post.id, durationMs: post.durationMs)

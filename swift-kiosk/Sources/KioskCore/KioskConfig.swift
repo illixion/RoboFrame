@@ -30,6 +30,8 @@ public struct KioskConfig: Equatable, Sendable {
     /// Cap on the transcode's height: a Pi 3 decodes 720p30 with headroom
     /// but 1080p only at about realtime.
     public var videoMaxHeight: Int
+    /// mpv's `hwdec`: `v4l2m2m-copy` on a Pi under X11, `no` for software.
+    public var hwdec: String
     /// The largest `/get` response accepted for a still.
     public var maxMediaBytes: Int
     /// Crossfade length between frames, in seconds.
@@ -51,6 +53,7 @@ public struct KioskConfig: Equatable, Sendable {
         wallpaper: Bool = false,
         vcodec: String? = "h264",
         videoMaxHeight: Int = 720,
+        hwdec: String = "no",
         maxMediaBytes: Int = 64 * 1024 * 1024,
         transitionDuration: TimeInterval = 1,
         screenWidth: Int = 1920,
@@ -67,6 +70,7 @@ public struct KioskConfig: Equatable, Sendable {
         self.wallpaper = wallpaper
         self.vcodec = vcodec
         self.videoMaxHeight = videoMaxHeight
+        self.hwdec = hwdec
         self.maxMediaBytes = maxMediaBytes
         self.transitionDuration = transitionDuration
         self.screenWidth = screenWidth
@@ -133,6 +137,7 @@ public struct KioskConfig: Equatable, Sendable {
             wallpaper: pick("WALLPAPER", kiosk["wallpaper"])?.bool ?? false,
             vcodec: vcodec.isEmpty ? nil : vcodec,
             videoMaxHeight: pick("VIDEO_MAX_HEIGHT", kiosk["videoMaxHeight"])?.int ?? 720,
+            hwdec: pick("HWDEC", kiosk["hwdec"])?.string ?? "no",
             maxMediaBytes: pick("MAX_MEDIA_BYTES", kiosk["maxMediaBytes"])?.int ?? 64 * 1024 * 1024,
             transitionDuration: Double(pick("TRANSITION_MS", kiosk["transitionMs"])?.int ?? 1_000) / 1_000,
             screenWidth: size?.width ?? 1920,
