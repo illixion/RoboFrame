@@ -6,8 +6,59 @@
 // server under a sub-path (e.g. /mywallpaperpage/) without code changes.
 
 export const urlParams = new URLSearchParams(window.location.search);
-export const params = {};
-urlParams.forEach((value, key) => { params[key.toLowerCase()] = value; });
+
+// The URL's own values, lowercased — what the settings panel reports as the
+// "URL" source for a field.
+export const urlValues = {};
+urlParams.forEach((value, key) => { urlValues[key.toLowerCase()] = value; });
+
+// Settings the panel (settings.js) can override. Kiosks launch from a fixed
+// bookmarked / launcher URL, so a value saved in the panel outranks the URL:
+// panel > URL > default. Connection plumbing and secrets (ws, token,
+// endpoint, wsurl, homeendpoint) are deliberately absent — they stay in the
+// URL and a stray stored copy is never merged.
+export const SETTINGS_STORAGE_KEY = 'roboframe.settings';
+export const PANEL_KEYS = new Set([
+    'delay', 'static', 'fit', 'blurbg',
+    'noclock', 'nosensors', 'nobutton', 'nobg', 'top-offset',
+    'bright', 'convert', 'lowmem', 'wallpaper', 'ratio', 'width', 'height',
+    'nightlight', 'nightlightstart', 'nightlightend',
+    'opacity', 'list',
+]);
+
+export function readStoredSettings() {
+    try {
+        const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+        const out = {};
+        for (const [k, v] of Object.entries(parsed)) {
+            if (PANEL_KEYS.has(k) && (typeof v === 'string' || typeof v === 'number')) out[k] = String(v);
+        }
+        return out;
+    } catch (_) {
+        return {};
+    }
+}
+
+export function writeStoredSettings(values) {
+    try {
+        if (!values || Object.keys(values).length === 0) localStorage.removeItem(SETTINGS_STORAGE_KEY);
+        else localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(values));
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+// The overrides as they stood at page load — the ones `params` reflects.
+export const storedSettings = readStoredSettings();
+
+// Every reader in the kiosk goes through `params`, so the merge happens here,
+// once, before any other module reads it. (nightlight.js reads it lazily for
+// the circular-import reason noted there.)
+export const params = { ...urlValues, ...storedSettings };
 
 export const endpoint = params.endpoint || '';
 export const homeEndpoint = params.homeendpoint || '';
@@ -38,7 +89,33 @@ export function wsUrl() {
     return `${base}${sep}token=${encodeURIComponent(token)}`;
 }
 
-export const defaultInterval = Number(params.delay) > 0 ? Number(params.delay) * 1000 : 15000;
+// How a photo fills the screen: `height` fills the height and crops the sides
+// (centred), `contain` letterboxes the whole frame, `cover` fills the screen
+// edge to edge. An explicit `fit` wins; without one a hidden clock means
+// `contain`, which is how `noclock` kiosks have always framed their photos.
+export const FITS = ['height', 'contain', 'cover'];
+export function resolveFit(p = params) {
+    const fit = String(p.fit || '').toLowerCase();
+    if (FITS.includes(fit)) return fit;
+    return Number(p.noclock) ? 'contain' : 'height';
+}
+
+// The blurred backdrop behind a letterboxed photo costs a second full-screen
+// decode + blur, so low-memory kiosks leave it off unless asked.
+export function resolveBlurBg(p = params) {
+    if (p.blurbg !== undefined && p.blurbg !== '') return Number(p.blurbg) ? true : false;
+    return Number(p.lowmem) !== 1;
+}
+
+// Media-layer opacity in percent (10–100), the persisted form of the 1–9 / 0
+// digit keys.
+export function resolveOpacity(p = params) {
+    const n = Number(p.opacity);
+    if (!Number.isFinite(n) || n <= 0) return 100;
+    return Math.min(100, Math.max(10, Math.round(n)));
+}
+
+export const defaultInterval =Number(params.delay) > 0 ? Number(params.delay) * 1000 : 15000;
 
 export function getScreenSize() {
     if (params.height && params.width) {
@@ -97,6 +174,17 @@ export function buildGetUrl(post) {
     const ext = String(post.ext || '').toLowerCase();
     const vc = VIDEO_EXTS.has(ext) && !BROWSER_VIDEO_EXTS.has(ext) ? '&vcodec=h264&vmaxh=0&vmaxfps=0' : '';
     return api(`/get?id=${post.id}&convert=${convert}&bright=${bright}&width=${screenWidth}&height=${screenHeight}&lowmem=${lowmem}${wp}${device}${vc}`);
+}
+
+// A toast-sized thumbnail of a post: 72px at 1080p, scaled with the screen,
+// doubled for a sharp downscale. `record=0` keeps it out of /history; a
+// video post gets its first-frame `poster=1` JPEG.
+export function buildPreviewUrl(id, ext) {
+    if (!id) return null;
+    const { height } = getScreenSize();
+    const box = Math.max(64, Math.round((72 / 1080) * height * 2));
+    const variant = isVideoExt(ext) ? 'poster=1' : 'convert=1&bright=0';
+    return api(`/get?id=${encodeURIComponent(id)}&width=${box}&height=${box}&${variant}&record=0`);
 }
 
 // The server's video containers (packages/shared/src/mediaTypes.js), and the

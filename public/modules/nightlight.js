@@ -3,7 +3,8 @@
 // Schedules `bright` mode to follow a [start, end) clock window so the
 // kiosk dims itself during sleeping hours without server-side support.
 // Reads `?nightlightstart=HH:MM&nightlightend=HH:MM`. Either missing or
-// equal disables the feature.
+// equal disables the feature, as does `nightlight=0` (the settings panel's
+// switch, which keeps the times around for turning it back on).
 //
 // On every boundary we fire a callback the bootstrap has wired to
 // slideshow.invalidateMediaCache. The current image keeps showing
@@ -35,7 +36,7 @@ function schedule() {
     cached = {
         startMin,
         endMin,
-        enabled: startMin !== null && endMin !== null && startMin !== endMin,
+        enabled: params.nightlight !== '0' && startMin !== null && endMin !== null && startMin !== endMin,
     };
     return cached;
 }

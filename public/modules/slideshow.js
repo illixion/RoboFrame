@@ -10,7 +10,7 @@
 //   - run a setInterval timer (server runs the timer; we just receive ticks)
 //   - drive a per-client queue (server holds the queue; we hold a bounded local buffer)
 
-import { params, api, buildGetUrl, isVideoExt } from './config.js';
+import { params, api, buildGetUrl, buildPreviewUrl, isVideoExt, resolveFit, resolveBlurBg } from './config.js';
 import { state } from './state.js';
 import { showToast } from './toast.js';
 import { tags } from './tags.js';
@@ -78,6 +78,15 @@ const LOW_MEM = Number(params.lowmem) === 1;
 const UPCOMING_CACHE_TARGET = LOW_MEM ? 1 : 3;
 const MAX_MEDIA_CACHE_ITEMS = LOW_MEM ? 2 : 8;
 const PREFETCH_CONCURRENCY = LOW_MEM ? 1 : 2;
+
+// Photo framing is fixed for the page's lifetime (the settings panel applies
+// it with a reload), so resolve it once.
+const FIT = resolveFit();
+const BLUR_BACKDROP = resolveBlurBg() && FIT !== 'cover';
+const FIT_CLASS = FIT === 'contain' ? 'fit-contain' : FIT === 'cover' ? 'fit-cover' : null;
+// The height fit centres with translateX(-50%), so its zoom keyframes carry
+// that translate; contain and cover are positioned without one.
+const KENBURNS_NAME = FIT === 'height' ? 'kenburns-zoom' : 'kenburns-zoom-alt';
 
 const mediaCache = new Map(); // id -> { id, ext, url, objectUrl, isVideo, lastUsedAt }
 const pendingPrefetch = new Map(); // id -> { controller, promise, post }
@@ -314,9 +323,10 @@ export function crossfadeFullscreenMedia(container, newMediaUrl, postId, isVideo
 
     const finishLoad = (durationMs) => {
         if (renderToken !== currentRenderToken) return;
-        if (nextLayer.children.length > 1) {
-            console.error('More than one child in nextLayer:', nextLayer.children);
-            nextLayer.removeChild(nextLayer.children[0]);
+        const media = nextLayer.querySelectorAll('.fullscreen-media');
+        if (media.length > 1) {
+            console.error('More than one media element in nextLayer:', media);
+            media[0].remove();
         }
         startCrossfade(currentLayer, nextLayer);
         // The image is on screen now — tell the server immediately so its
@@ -350,7 +360,7 @@ export function crossfadeFullscreenMedia(container, newMediaUrl, postId, isVideo
         video.muted = true;
         video.playsInline = true;
         video.classList.add('fullscreen-media');
-        if (Number(params.noclock)) video.classList.add('alt-fit');
+        if (FIT_CLASS) video.classList.add(FIT_CLASS);
         video.onloadeddata = () => {
             if (renderToken !== currentRenderToken) return;
             const durSec = video.duration;
@@ -367,7 +377,7 @@ export function crossfadeFullscreenMedia(container, newMediaUrl, postId, isVideo
     } else {
         const img = new Image();
         img.classList.add('fullscreen-media');
-        if (Number(params.noclock)) img.classList.add('alt-fit');
+        if (FIT_CLASS) img.classList.add(FIT_CLASS);
         img.addEventListener('load', async () => {
             if (renderToken !== currentRenderToken) return;
             if (!Number(params.static)) {
@@ -375,11 +385,19 @@ export function crossfadeFullscreenMedia(container, newMediaUrl, postId, isVideo
                     const { focusX, focusY } = await findSobelFocus(img);
                     if (renderToken !== currentRenderToken) return;
                     img.style.transformOrigin = `${focusX * 100}% ${focusY * 100}%`;
-                    const kenburnsName = Number(params.noclock) ? 'kenburns-zoom-alt' : 'kenburns-zoom';
-                    img.style.animation = `${kenburnsName} ${state.interval / 1000}s ease-in-out forwards`;
+                    img.style.animation = `${KENBURNS_NAME} ${state.interval / 1000}s ease-in-out forwards`;
                 } catch (e) {
                     console.warn('Sobel focus failed; rendering without Ken Burns:', e);
                 }
+            }
+            // The backdrop lives in the same layer as its photo so the two
+            // crossfade together. Same object URL, so no second fetch.
+            if (BLUR_BACKDROP) {
+                const backdrop = new Image();
+                backdrop.className = 'fullscreen-backdrop';
+                backdrop.alt = '';
+                backdrop.src = newMediaUrl;
+                nextLayer.appendChild(backdrop);
             }
             nextLayer.appendChild(img);
             finishLoad();
@@ -489,12 +507,35 @@ function reportImageReady(postId, durationMs) {
     }
 }
 
+// Toast preview for a post. Its ext comes from whichever local record still
+// knows it. An animated post (cached blob is video, ext isn't) has no still
+// to show, so it gets none; a convert URL would come back as mp4.
+function previewUrlFor(postId) {
+    if (!postId) return null;
+    const entry = mediaCache.get(postId);
+    let ext = entry ? entry.ext : undefined;
+    if (ext === undefined) {
+        const cur = state.currentPlayback?.current;
+        if (cur && cur.id === postId) ext = cur.ext;
+    }
+    if (ext === undefined) {
+        const seen = history.find((h) => h.id === postId);
+        if (seen) ext = seen.ext;
+    }
+    if (entry && entry.isVideo && !isVideoExt(ext)) return null;
+    return buildPreviewUrl(postId, ext);
+}
+
 export function blockPost() {
     if (!state.currentPost) return;
+    // Built before the block goes out: the server advances the channel off
+    // this post, and the preview is fetched by id either way.
+    const blocked = state.currentPost;
+    const preview = previewUrlFor(blocked);
     if (state.socket && state.socket.readyState === WebSocket.OPEN) {
-        state.socket.send(JSON.stringify({ action: 'block', payload: { id: state.currentPost } }));
+        state.socket.send(JSON.stringify({ action: 'block', payload: { id: blocked } }));
     }
-    showToast(`🛑 Blocked post ${state.currentPost}`);
+    showToast(`🛑 Blocked post ${blocked}`, { image: preview });
     // The server's notifyBlockedChange advances the channel for us when
     // the currently-displayed post is blocked; a local requestNext would
     // double-skip.
@@ -508,6 +549,7 @@ export function saveFileRemote(postId) {
     if (postId === lastSavedPost) return;
     lastSavedPost = postId;
 
+    const preview = previewUrlFor(postId);
     showToast(`⬇️ Saving ${postId}`);
     fetch(api(`/save?id=${encodeURIComponent(postId)}`), { method: 'GET' })
         .then((response) => {
@@ -515,7 +557,7 @@ export function saveFileRemote(postId) {
             showToast(`❌ Error: ${response.status} ${response.statusText}`);
             throw new Error(`Error: ${response.status} ${response.statusText}`);
         })
-        .then((text) => { showToast(text); console.log('Save success:', text); })
+        .then((text) => { showToast(text, { image: preview }); console.log('Save success:', text); })
         .catch((error) => {
             showToast(`❌ Error saving image: ${error}`);
             console.error('Fetch error:', error);

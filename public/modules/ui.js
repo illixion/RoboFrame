@@ -2,13 +2,14 @@
 // home-iframe toggle, button positioning. Anything that's neither slideshow
 // nor RPC effect lands here.
 
-import { params, homeEndpoint, api } from './config.js';
+import { params, homeEndpoint, api, resolveOpacity } from './config.js';
 import { state } from './state.js';
 import { tags } from './tags.js';
 import { showToast } from './toast.js';
 import { disable } from './visibility.js';
 import { blockPost, saveFileRemote, requestNext, requestPrev, requestReshuffle } from './slideshow.js';
 import { sendDisplaySync } from './ws-client.js';
+import { openSettings, isSettingsOpen, setOpacity } from './settings.js';
 
 let wakeLock = true;
 let awaitingTagList = false;
@@ -72,27 +73,38 @@ function toggleCustomPage() {
 }
 
 // ----- Button positioning when noclock is set -------------------------
+const CORNER_BUTTONS = ['.toggle-button', '.block-picture-button', '.change-tagset-button', '.settings-button'];
+
 function moveButtonsToTop(spacingTop = '15px', spacingLeft = '15px', spacingBetween = '15px') {
-    const toggleBtn = document.querySelector('.toggle-button');
-    const blockBtn = document.querySelector('.block-picture-button');
-    const tagsetBtn = document.querySelector('.change-tagset-button');
-    if (toggleBtn) {
-        toggleBtn.style.top = spacingTop;
-        toggleBtn.style.left = spacingLeft;
+    let top = parseInt(spacingTop, 10);
+    for (const selector of CORNER_BUTTONS) {
+        const btn = document.querySelector(selector);
+        if (!btn) continue;
+        btn.style.top = `${top}px`;
+        btn.style.left = spacingLeft;
+        top += btn.offsetHeight + parseInt(spacingBetween, 10);
     }
-    if (blockBtn) {
-        const top = parseInt(spacingTop, 10) + (toggleBtn ? toggleBtn.offsetHeight : 0) + parseInt(spacingBetween, 10);
-        blockBtn.style.top = `${top}px`;
-        blockBtn.style.left = spacingLeft;
-    }
-    if (tagsetBtn) {
-        const top = parseInt(spacingTop, 10)
-            + (toggleBtn ? toggleBtn.offsetHeight : 0)
-            + (blockBtn ? blockBtn.offsetHeight : 0)
-            + (2 * parseInt(spacingBetween, 10));
-        tagsetBtn.style.top = `${top}px`;
-        tagsetBtn.style.left = spacingLeft;
-    }
+}
+
+// ----- Long-press → settings ------------------------------------------
+// A touch tablet launched with `nobutton=1` has no ⚙️ and no keyboard, so a
+// one-second press on the photo opens the panel too.
+function installLongPress() {
+    const LONG_PRESS_MS = 1000;
+    let timer = null;
+    let origin = null;
+    const cancel = () => { clearTimeout(timer); timer = null; origin = null; };
+    document.addEventListener('pointerdown', (event) => {
+        if (!event.target.closest || !event.target.closest('.fullscreen-container')) return;
+        cancel();
+        origin = { x: event.clientX, y: event.clientY };
+        timer = setTimeout(() => { cancel(); openSettings(); }, LONG_PRESS_MS);
+    });
+    document.addEventListener('pointermove', (event) => {
+        if (origin && Math.hypot(event.clientX - origin.x, event.clientY - origin.y) > 12) cancel();
+    });
+    document.addEventListener('pointerup', cancel);
+    document.addEventListener('pointercancel', cancel);
 }
 
 // ----- Cursor auto-hide ------------------------------------------------
@@ -123,6 +135,13 @@ function installKeyboard() {
             return;
         }
 
+        // The settings panel owns the keyboard while it's open (it handles
+        // its own Escape), and typing into any field is never a shortcut.
+        if (isSettingsOpen()) return;
+        const target = event.target;
+        if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+        if (event.metaKey || event.ctrlKey || event.altKey) return;
+
         if (awaitingTagList) {
             if (key >= '0' && key <= '9') {
                 tags.set(parseInt(key, 10));
@@ -134,11 +153,11 @@ function installKeyboard() {
         }
 
         if (key >= '1' && key <= '9') {
-            state.mediaContainer.style.opacity = String(Number(key) / 10 || 1);
+            setOpacity(Number(key) * 10);
             return;
         }
         if (key === '0') {
-            state.mediaContainer.style.opacity = '1';
+            setOpacity(100);
             return;
         }
 
@@ -156,28 +175,15 @@ function installKeyboard() {
                 sendDisplaySync(state.isPrimary);
                 showToast(`Display Sync ${state.isPrimary ? 'ON' : 'OFF'}`);
                 break;
-            case 'a': {
-                const addThis = prompt('Enter tag to add');
-                if (addThis) tags.addTag(addThis);
+            case 'o':
+                event.preventDefault();
+                openSettings();
                 break;
-            }
+            case 'a':
             case 'r':
-                if (tags.modTags.length === 0) {
-                    showToast('No mod tags to remove');
-                } else if (tags.modTags.length === 1) {
-                    tags.removeTag(tags.modTags[0]);
-                    showToast('Removed mod tag');
-                } else {
-                    const list = tags.modTags.map((t, i) => `${i}: ${t}`).join('\n');
-                    const rmIdx = prompt(`Enter the number of the tag to remove:\n\n${list}`);
-                    const idx = parseInt(rmIdx, 10);
-                    if (!isNaN(idx) && idx >= 0 && idx < tags.modTags.length) {
-                        tags.removeTag(tags.modTags[idx]);
-                        showToast('Removed mod tag');
-                    } else {
-                        showToast('Invalid tag number');
-                    }
-                }
+                // Mod tags are added and removed as chips in the panel.
+                event.preventDefault();
+                openSettings({ focus: 'modtags' });
                 break;
             case 't':
                 requestReshuffle();
@@ -243,7 +249,7 @@ function applyParamFlags() {
     }
 
     if (Number(params.nobutton)) {
-        document.querySelectorAll('.toggle-button, .block-picture-button, .change-tagset-button')
+        document.querySelectorAll(CORNER_BUTTONS.join(', '))
             .forEach((el) => { el.style.display = 'none'; });
     } else if (homeEndpoint) {
         const iframe = document.getElementById('ha-iframe');
@@ -251,6 +257,7 @@ function applyParamFlags() {
     }
 
     if (Number(params.nobg)) document.body.style.backgroundColor = 'transparent';
+    if (state.mediaContainer) state.mediaContainer.style.opacity = String(resolveOpacity() / 100);
     if (Number(params.list)) tags.set(Number(params.list));
     if (Number(params.delay)) state.interval = Number(params.delay) * 1000;
 
@@ -258,7 +265,8 @@ function applyParamFlags() {
         const style = document.createElement('style');
         style.innerHTML = `
             .fullscreen-media { animation: none !important; transform: translateX(-50%) !important; }
-            .fullscreen-media.alt-fit { animation: none !important; transform: none !important; }
+            .fullscreen-media.fit-contain,
+            .fullscreen-media.fit-cover { animation: none !important; transform: none !important; }
         `;
         document.head.appendChild(style);
     }
@@ -277,6 +285,7 @@ export function bootUi() {
     installVisibilityHandlers();
     installIframeBridge();
     installCursorHide();
+    installLongPress();
 
     updateClock();
     if (!Number(params.noclock)) {
@@ -298,3 +307,4 @@ export function bootUi() {
 // Inline button handlers in the HTML reach these via window.* bindings.
 window.toggleIframe = toggleIframe;
 window.blockPost = blockPost;
+window.openSettings = openSettings;

@@ -436,6 +436,8 @@ On WebSocket connect, every client receives two initial frames: `tagLists`, `cur
 
 ## Frontend (kiosk) URL parameters
 
+Every setting below except the connection ones (`endpoint`, `homeendpoint`, `wsurl`, `ws`, `token`) can also be changed in the kiosk's settings panel: the ⚙️ button, the `o` key, or a one-second press on the photo (`a` / `r` open it on the mod-tag chips). A value saved in the panel is stored in the browser (`localStorage` key `roboframe.settings`, only the fields that were changed) and outranks the URL, so a kiosk launched from a fixed bookmark keeps it across relaunches: panel > URL > default. The panel shows where each value comes from, resets fields one at a time or all at once, and applies brightness, the tag list, mod tags and display sync immediately; everything else applies with *Save & reload*.
+
 | Param | Description |
 |---|---|
 | `endpoint` | Backend base URL. Default: same origin (no prefix). Useful for split deployments. |
@@ -450,6 +452,10 @@ On WebSocket connect, every client receives two initial frames: `tagLists`, `cur
 | `static`, `ratio`, `convert`, `bright`, `nobutton`, `nobg` | Boolean flags (0/1). `bright` ambient-dims the image at the server (used for night-light or any always-dim deployment); a manual `bright=1` is OR-ed with the night-light schedule. |
 | `wallpaper` | Boolean (0/1). Composes every frame onto a `width`×`height` canvas server-side so it always fills the screen (cover-crop when the aspect is close, fit-with-fill otherwise — see `/get`). Forces `ratio` on (the queue is biased to matching-aspect posts so they cover-crop edge to edge), so you don't need to also pass `ratio=1`. |
 | `width`, `height` | Screen dimensions used when fetching `/get` |
+| `fit` | How a photo fills the screen: `height` (fill the height, crop the sides), `contain` (whole photo, letterboxed) or `cover` (fill the screen edge to edge). Without it, `noclock=1` means `contain` and anything else `height`. |
+| `blurbg` | Boolean (0/1). A blurred, dimmed copy of the photo behind its letterbox / pillarbox bars. Default on, off when `lowmem=1`. Not drawn with `fit=cover` or behind videos. |
+| `opacity` | Photo layer opacity in percent, 10–100 (default 100). The digit keys `1`–`9` / `0` set and save it too. |
+| `nightlight` | Boolean (0/1, default 1). `0` switches the night-light schedule off while keeping its times. |
 | `top-offset` | CSS top padding (notch / overscan) |
 | `list` | Initial tag list index |
 
