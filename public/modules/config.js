@@ -115,7 +115,7 @@ export function resolveOpacity(p = params) {
     return Math.min(100, Math.max(10, Math.round(n)));
 }
 
-export const defaultInterval =Number(params.delay) > 0 ? Number(params.delay) * 1000 : 15000;
+export const defaultInterval = Number(params.delay) > 0 ? Number(params.delay) * 1000 : 15000;
 
 export function getScreenSize() {
     if (params.height && params.width) {
