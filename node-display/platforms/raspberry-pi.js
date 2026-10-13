@@ -348,19 +348,39 @@ function create() {
         });
     }
 
+    let _pendingOps = 0;
     function _scheduleState(target, callback) {
         const myId = ++_stateRequestId;
+        _pendingOps++;
         _stateQueue = _stateQueue.then(() => new Promise((resolve) => {
-            if (myId !== _stateRequestId) {
-                callback(null);
-                return resolve();
-            }
-            const op = target ? _doTurnOn : _doTurnOff;
-            op((err) => {
+            const finish = (err) => {
+                _pendingOps--;
                 callback(err || null);
                 resolve();
-            });
+            };
+            if (myId !== _stateRequestId) return finish(null);
+            const op = target ? _doTurnOn : _doTurnOff;
+            op(finish);
         }));
+    }
+
+    // `_doTurnOn`/`_doTurnOff` skip the hardware call when `_powerStage`
+    // already matches the target, so a cache that disagrees with the panel
+    // swallows every re-drive: an X or kiosk restart brings the CRTC back up
+    // while the cache still says "off", and the reconciler's off re-drive
+    // never reaches xrandr. Each ground-truth probe therefore overwrites the
+    // cache. A probe racing an op still queued or running is stale by the time
+    // it lands, so it is ignored; a lit panel in the `dim` stage is correct.
+    function _adoptProbedState(isOn) {
+        if (_pendingOps > 0) return;
+        if (isOn && _powerStage === 'off') {
+            _powerStage = 'on';
+            currentState = true;
+        } else if (!isOn && _powerStage !== 'off') {
+            _clearDimTimer();
+            _powerStage = 'off';
+            currentState = false;
+        }
     }
 
     function turnOff(callback) { _scheduleState(false, callback); }
@@ -386,7 +406,9 @@ function create() {
             exec(`xrandr --display ${XRANDR_DISPLAY} --query`, (e, xout) => {
                 if (e) return callback(null, null);
                 const re = new RegExp(`^${out.name}\\s+connected\\b[^\\n]*?\\s\\d+x\\d+\\+\\d+\\+\\d+`, 'm');
-                callback(null, re.test(xout));
+                const isOn = re.test(xout);
+                _adoptProbedState(isOn);
+                callback(null, isOn);
             });
             return;
         }
