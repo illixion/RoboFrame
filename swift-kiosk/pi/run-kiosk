@@ -12,9 +12,13 @@ set -u
 
 config=${ROBOFRAME_CONFIG:-/opt/RoboFrame/roboframe.config.json}
 dir=$(dirname "$(readlink -f "$0")")
+# What the on-screen menu saves: on the SD card's real filesystem, in a
+# directory the session's user owns (deploy-pi.sh makes it), so it survives
+# overlayroot and a reboot.
+settings=${KIOSK_SETTINGS:-$dir/state/settings.json}
 
 if [ -x "$dir/roboframe-kiosk" ] && [ ! -e "$dir/disabled" ]; then
-    ROBOFRAME_CONFIG=$config "$dir/roboframe-kiosk" 2>&1 | systemd-cat -t roboframe-kiosk
+    ROBOFRAME_CONFIG=$config KIOSK_SETTINGS=$settings "$dir/roboframe-kiosk" 2>&1 | systemd-cat -t roboframe-kiosk
     status=${PIPESTATUS[0]}
     case $status in
         0|143) exit 0 ;;

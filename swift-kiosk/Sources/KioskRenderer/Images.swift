@@ -10,12 +10,114 @@
 
 import CSDL2
 import Foundation
+import KioskCore
+
+/// A photo decoded for the slideshow, with what drawing it needs: the
+/// tiny, blurred and darkened copy that fills the bars beside it, and the
+/// point its Ken Burns zoom heads for.
+struct DecodedPhoto: Sendable {
+    let image: RGBAImage
+    let backdrop: RGBAImage?
+    let focus: (x: Double, y: Double)
+
+    /// The backdrop's longest edge. Stretched across the screen with linear
+    /// filtering, a blurred copy this small reads as a soft blur.
+    static let backdropSize = 40
+
+    static func decode(_ data: Data, maxWidth: Int, maxHeight: Int) -> DecodedPhoto? {
+        guard let image = RGBAImage.decode(data, maxWidth: maxWidth, maxHeight: maxHeight) else { return nil }
+        let focus = image.pixels.withUnsafeBytes { KioskKenBurns.focus(rgba: $0, width: image.width, height: image.height) }
+        return DecodedPhoto(image: image, backdrop: image.backdrop(edge: backdropSize), focus: focus)
+    }
+}
 
 /// Decoded RGBA pixels, top row first, rows tightly packed.
 struct RGBAImage: Sendable {
     let width: Int
     let height: Int
     let pixels: [UInt8]
+
+    init(width: Int, height: Int, pixels: [UInt8]) {
+        self.width = width
+        self.height = height
+        self.pixels = pixels
+    }
+
+    /// Box-sampled down to `edge` on the longest side, blurred twice more
+    /// and darkened to 45 %, so the photo in front stays the brightest thing.
+    func backdrop(edge: Int) -> RGBAImage? {
+        guard width > 0, height > 0 else { return nil }
+        let scale = Double(edge) / Double(max(width, height))
+        let w = max(1, Int((Double(width) * scale).rounded())), h = max(1, Int((Double(height) * scale).rounded()))
+        var small = [Double](repeating: 0, count: w * h * 3)
+        pixels.withUnsafeBufferPointer { source in
+            for y in 0..<h {
+                let y0 = y * height / h, y1 = max(y0 + 1, (y + 1) * height / h)
+                for x in 0..<w {
+                    let x0 = x * width / w, x1 = max(x0 + 1, (x + 1) * width / w)
+                    // Every other source pixel each way is plenty for a blur.
+                    var r = 0.0, g = 0.0, b = 0.0, count = 0.0
+                    for sy in stride(from: y0, to: y1, by: 2) {
+                        for sx in stride(from: x0, to: x1, by: 2) {
+                            let offset = (sy * width + sx) * 4
+                            r += Double(source[offset]); g += Double(source[offset + 1]); b += Double(source[offset + 2])
+                            count += 1
+                        }
+                    }
+                    let index = (y * w + x) * 3
+                    small[index] = r / count; small[index + 1] = g / count; small[index + 2] = b / count
+                }
+            }
+        }
+        for _ in 0..<2 { small = Self.boxBlur(small, width: w, height: h) }
+        var out = [UInt8](repeating: 255, count: w * h * 4)
+        for index in 0..<(w * h) {
+            for channel in 0..<3 { out[index * 4 + channel] = UInt8(min(255, small[index * 3 + channel] * 0.45)) }
+        }
+        return RGBAImage(width: w, height: h, pixels: out)
+    }
+
+    private static func boxBlur(_ pixels: [Double], width: Int, height: Int) -> [Double] {
+        var out = pixels
+        for y in 0..<height {
+            for x in 0..<width {
+                var sum = (0.0, 0.0, 0.0), count = 0.0
+                for dy in -1...1 {
+                    for dx in -1...1 {
+                        let sx = min(width - 1, max(0, x + dx)), sy = min(height - 1, max(0, y + dy))
+                        let offset = (sy * width + sx) * 3
+                        sum.0 += pixels[offset]; sum.1 += pixels[offset + 1]; sum.2 += pixels[offset + 2]
+                        count += 1
+                    }
+                }
+                let offset = (y * width + x) * 3
+                out[offset] = sum.0 / count; out[offset + 1] = sum.1 / count; out[offset + 2] = sum.2 / count
+            }
+        }
+        return out
+    }
+
+    /// The same image with its corners cut round, antialiased, for the
+    /// overlay's boxes (the web kiosk's border-radius).
+    func roundingCorners(_ radius: Int) -> RGBAImage {
+        let radius = min(radius, width / 2, height / 2)
+        guard radius > 1 else { return self }
+        var pixels = pixels
+        let r = Double(radius)
+        for y in 0..<radius {
+            for x in 0..<radius {
+                // Distance from the corner circle's centre, sampled at the pixel's centre.
+                let dx = r - (Double(x) + 0.5), dy = r - (Double(y) + 0.5)
+                let coverage = min(1, max(0, r - (dx * dx + dy * dy).squareRoot() + 0.5))
+                guard coverage < 1 else { continue }
+                for (cx, cy) in [(x, y), (width - 1 - x, y), (x, height - 1 - y), (width - 1 - x, height - 1 - y)] {
+                    let offset = (cy * width + cx) * 4 + 3
+                    pixels[offset] = UInt8(Double(pixels[offset]) * coverage)
+                }
+            }
+        }
+        return RGBAImage(width: width, height: height, pixels: pixels)
+    }
 
     /// Decodes a JPEG/PNG, scaling it down to fit `maxWidth` x `maxHeight`
     /// if it's larger (the server sends screen-sized frames, so that's rare).
@@ -173,7 +275,7 @@ final class TextSetter {
     func box(_ lines: [String], size: Int, rightAligned: Bool, padding: (x: Int, y: Int) = (14, 10),
              background: (UInt8, UInt8, UInt8, UInt8) = (0, 0, 0, 178),
              color: SDL_Color = SDL_Color(r: 222, g: 222, b: 222, a: 255),
-             leading image: RGBAImage? = nil, imageGap: Int = 8) -> RGBAImage? {
+             leading image: RGBAImage? = nil, imageGap: Int = 8, radius: Int = 0) -> RGBAImage? {
         let surfaces = lines.compactMap { line($0, size: size, color: color) }
         defer { surfaces.forEach { SDL_FreeSurface($0) } }
         guard !surfaces.isEmpty else { return nil }
@@ -186,7 +288,7 @@ final class TextSetter {
         defer { SDL_FreeSurface(box) }
         SDL_FillRect(box, nil, SDL_MapRGBA(box.pointee.format, background.0, background.1, background.2, background.3))
         if let image {
-            var pixels = image.pixels
+            var pixels = image.roundingCorners(max(0, radius / 2)).pixels
             pixels.withUnsafeMutableBytes { bytes in
                 guard let surface = SDL_CreateRGBSurfaceWithFormatFrom(bytes.baseAddress, Int32(image.width), Int32(image.height), 32,
                                                                         Int32(image.width * 4), SDL_PIXELFORMAT_RGBA32.rawValue) else { return }
@@ -204,7 +306,57 @@ final class TextSetter {
             SDL_UpperBlit(surface, nil, box, &target)
             y += Int(surface.pointee.h) + gap
         }
-        return RGBAImage(surface: box)
+        return RGBAImage(surface: box).roundingCorners(radius)
+    }
+
+    /// The settings menu as one panel: a title, then each row's label on the
+    /// left and value on the right under its section's heading, the selected
+    /// row highlighted, and the keys to use along the bottom.
+    func menu(title: String, subtitle: String, rows: [KioskMenuRow], footer: String, scale: Double) -> RGBAImage? {
+        func px(_ value: Double) -> Int { max(1, Int((value * scale).rounded())) }
+        let textSize = px(30), headingSize = px(20), titleSize = px(40)
+        let white = SDL_Color(r: 240, g: 240, b: 240, a: 255)
+        let dim = SDL_Color(r: 160, g: 160, b: 160, a: 255)
+        let accent = SDL_Color(r: 138, g: 180, b: 248, a: 255)
+        let width = px(980), padding = px(36), rowHeight = px(46), headingHeight = px(44)
+        let height = padding * 2 + px(64) + rows.reduce(0) { $0 + rowHeight + ($1.section != nil ? headingHeight : 0) } + px(56)
+        guard let panel = SDL_CreateRGBSurfaceWithFormat(0, Int32(width), Int32(height), 32, SDL_PIXELFORMAT_RGBA32.rawValue) else { return nil }
+        defer { SDL_FreeSurface(panel) }
+        SDL_FillRect(panel, nil, SDL_MapRGBA(panel.pointee.format, 18, 18, 20, 238))
+
+        func blit(_ text: String, size: Int, color: SDL_Color, x: Int, y: Int, rightAligned: Bool = false, height: Int? = nil) {
+            guard !text.isEmpty, let surface = line(text, size: size, color: color) else { return }
+            defer { SDL_FreeSurface(surface) }
+            SDL_SetSurfaceBlendMode(surface, SDL_BLENDMODE_BLEND)
+            let w = Int(surface.pointee.w), h = Int(surface.pointee.h)
+            var target = SDL_Rect(x: Int32(rightAligned ? x - w : x), y: Int32(y + ((height ?? h) - h) / 2), w: Int32(w), h: Int32(h))
+            SDL_UpperBlit(surface, nil, panel, &target)
+        }
+        func fill(_ x: Int, _ y: Int, _ w: Int, _ h: Int, _ r: UInt8, _ g: UInt8, _ b: UInt8, _ a: UInt8) {
+            var rect = SDL_Rect(x: Int32(x), y: Int32(y), w: Int32(w), h: Int32(h))
+            SDL_FillRect(panel, &rect, SDL_MapRGBA(panel.pointee.format, r, g, b, a))
+        }
+
+        var y = padding
+        blit(title, size: titleSize, color: white, x: padding, y: y)
+        blit(subtitle, size: headingSize, color: dim, x: width - padding, y: y + px(12), rightAligned: true)
+        y += px(64)
+        for row in rows {
+            if let section = row.section {
+                blit(section.uppercased(), size: headingSize, color: accent, x: padding, y: y + px(14))
+                y += headingHeight
+            }
+            if row.isSelected {
+                fill(padding - px(14), y, width - 2 * padding + px(28), rowHeight, 70, 90, 130, 255)
+                fill(padding - px(14), y, px(5), rowHeight, 138, 180, 248, 255)
+            }
+            blit(row.label, size: textSize, color: row.isSelected ? white : SDL_Color(r: 210, g: 210, b: 210, a: 255), x: padding + px(6), y: y, height: rowHeight)
+            let value = row.isSelected && !row.value.isEmpty ? "‹  \(row.value)  ›" : row.value
+            blit(value, size: textSize, color: row.isSelected ? white : accent, x: width - padding - px(6), y: y, rightAligned: true, height: rowHeight)
+            y += rowHeight
+        }
+        blit(footer, size: headingSize, color: dim, x: padding, y: y + px(20))
+        return RGBAImage(surface: panel).roundingCorners(px(18))
     }
 
     /// The largest size at which `text` fits in `width` x `height`.

@@ -10,8 +10,25 @@ frontend joins, reports and follows the server the same way.
 its fallback. It joins its channel, follows `playback`, crossfades photos
 and videos fullscreen (SDL2 + OpenGL ES 2 on the VideoCore IV, video through
 libmpv), draws the clock, date, sensors and toasts, shows `showText` alerts
-and `playVideo`/`playScene`/`playAudio` effects, follows `displayState`, and
-takes the keypad's keys. A save's toast shows a preview of what was saved.
+and `playVideo`/`playScene`/`playAudio` effects, follows `displayState` and
+`setBrightness`, and takes the keypad's keys.
+
+What it does beyond native-kiosk, and mostly beyond the web kiosk:
+
+- **Ken Burns:** each photo zooms slowly towards its busiest part over its
+  dwell, as the web kiosk does (1x to 1.3x, eased, about the centre of the
+  3x3 cell with the most Sobel edges).
+- **Blurred bars:** a letterboxed photo sits on a blurred, darkened copy of
+  itself instead of black. Or fill the screen instead (`fit: cover`).
+- **Previews:** saving and blocking confirm with a thumbnail of the post.
+  Both act on the post that was on screen when the key was pressed, for 1.5 s
+  after an automatic advance: the keypad sends a key on release, and saving
+  is a hold.
+- **A settings menu** at the frame (below), saved across restarts.
+- **On-screen status:** offline for more than 10 s, a refused token, a tag
+  query that matches nothing.
+- Overlay boxes with rounded corners, toasts that fade and slide in, a
+  brightness control for the photo alone, and a night light.
 
 ## Keys
 
@@ -19,7 +36,23 @@ The same as native-kiosk and the web kiosk; gpio-agent's keypad types them.
 `→` next, `←` previous (held for one interval; this display only, the
 server isn't told), space save, `b` block, `s` then a digit for a tag list,
 `d` display sync, `p` hide the photo (the clock stays), `t` reshuffle,
-ctrl+r reload, Esc quit.
+ctrl+r reload, Esc quit. A digit on its own sets the photo's brightness
+(`1` 10 % … `9` 90 %, `0` full), like the web kiosk's dimmer.
+
+`m` or Enter opens the **settings menu** (on the keypad, hold C; see
+gpio-agent's `config.example.json`). The keypad has no up or down, so the
+digits around 5 work as a d-pad:
+
+| Key | In the menu |
+|---|---|
+| ↑ ↓, or 2 8 | move |
+| ← →, or 4 6 (and the keypad's ← →) | change the value |
+| Enter, space or 5 | toggle, or run an action |
+| Esc, `m`, `p` or 0 | close (it also closes itself after 30 s) |
+
+It covers the dwell, crossfade, Ken Burns, fit, the bars' fill, brightness,
+the `bright` variant, the night light, each overlay item, the tag list and
+display sync, plus reshuffle, restart, and a reset back to the config.
 
 ## Layout
 
@@ -27,15 +60,27 @@ ctrl+r reload, Esc quit.
   - `KioskConfig` reads native-kiosk's config: the top-level `accessToken`
     and `deviceId`, and the `kiosk` block (`wsUrl`, `interval`, `bright`,
     `lowmem`, `modTags`, `vcodec`, `videoMaxHeight`, `ratioFilter`,
-    `wallpaper`, `maxMediaBytes`, plus `transitionMs`). Environment variables
+    `wallpaper`, `maxMediaBytes`, plus `transitionMs`, and the look:
+    `kenBurns`, `fit` (`contain` or `cover`), `blurBackground`,
+    `brightness` (10-100), `clock`, `clockSeconds`, `date`, `sensors`,
+    `nightLightStart`/`nightLightEnd` (`HH:MM`)). Environment variables
     override it under native-kiosk's names (`WS_URL`, `ACCESS_TOKEN`,
-    `DEVICE_ID`, `INTERVAL`, …); `SCREEN_SIZE=1920x1080` sets the frame size
-    until a renderer reports the real one.
+    `DEVICE_ID`, `INTERVAL`, …; the new keys as `KEN_BURNS`, `FIT`, …);
+    `SCREEN_SIZE=1920x1080` sets the frame size until a renderer reports
+    the real one.
+  - The settings menu saves what it changes to a settings file of its own
+    (`KIOSK_SETTINGS`, default `~/.config/roboframe-kiosk/settings.json`;
+    on the Pi `run-kiosk` points it at `/opt/swift-kiosk/state/`), under the
+    same key names. It wins over the environment and the config file,
+    because those are the launcher's and fixed, and only holds keys the menu
+    touched. Its reset deletes the file.
   - `KioskSession` is one display: session `main` on a `RoboFrameConnection`,
     driving the engine in server-driven mode with a 1-deep prefetch.
   - `KioskMediaProvider` builds the `/get` URLs and loads stills.
   - `KioskOverlay` / `KioskKeys` are the overlay's text and the keypad's
-    shortcuts, the same as native-kiosk's.
+    shortcuts, the same as native-kiosk's; `KioskMenu` the settings menu,
+    `KioskSettings` its file and the night light, `KioskKenBurns` the zoom
+    and its focus.
 - `Sources/KioskRenderer/` — Linux only: the SDL2 window and GLES2
   compositor, SDL_image/SDL_ttf for photos and text, the libmpv player.
 - `Sources/roboframe-kiosk/` — the executable. `HEADLESS=1` runs without a

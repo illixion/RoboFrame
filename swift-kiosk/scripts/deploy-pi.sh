@@ -42,6 +42,8 @@ ssh "${ssh_opts[@]}" "$host" 'set -e
     fi
     mv roboframe-kiosk.new roboframe-kiosk
     mv run-kiosk.new run-kiosk
+    # The settings menu saves here, as the session user (kiosk).
+    if id kiosk >/dev/null 2>&1; then install -d -o kiosk -g kiosk -m 755 state; else mkdir -p state; fi
     echo "deploy-pi: installed $(du -h roboframe-kiosk | cut -f1) in /opt/swift-kiosk"
     grep -q /opt/swift-kiosk/run-kiosk /usr/local/bin/start-kiosk \
         || echo "deploy-pi: start-kiosk does not launch run-kiosk yet, so native-kiosk stays the frontend (see the README)"

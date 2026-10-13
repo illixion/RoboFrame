@@ -69,14 +69,15 @@ The shipped example matches the kiosk's shortcuts:
 ```json
 "A": "B",        // keypad A → b (block post)
 "B": "S",        // keypad B → s (tag list select)
-"C": "D",        // keypad C → d (displaySync toggle)
+"C": { "tap": "D", "hold": "M" },           // d toggles displaySync; hold for the Swift kiosk's settings menu
 "D": "P",        // keypad D → p (hide image; clock/sensors stay visible)
 "*": { "tap": "SPACE", "hold": "T" },       // SPACE saves, hold for reshuffle
 "#": { "tap": "RIGHT", "hold": ["LEFTCTRL", "R"] }  // next image, hold to refresh
 ```
 
-If you change the mapping, also update [`public/modules/ui.js`](../public/modules/ui.js)
-or [`native-kiosk/kiosk.py`](../native-kiosk/kiosk.py) accordingly — the
+If you change the mapping, also update [`public/modules/ui.js`](../public/modules/ui.js),
+[`native-kiosk/kiosk.py`](../native-kiosk/kiosk.py) or the Swift kiosk's
+[`KioskKeys.swift`](../swift-kiosk/Sources/KioskCore/KioskKeys.swift) accordingly — the
 agent only emits keystrokes; the kiosk decides what each one does.
 
 Set `keypad.diagnose = true` to log every press and release with the

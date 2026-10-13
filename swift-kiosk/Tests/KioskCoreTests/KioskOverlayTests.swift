@@ -48,8 +48,8 @@ struct KioskKeyTests {
         let session = try session()
         #expect(session.handleKey(.character("s")) == "Tag list (0-0)?")
         #expect(session.handleKey(.character("3")) == "Tag list 3 out of range (0-0)")
-        // The prompt is consumed either way.
-        #expect(session.handleKey(.character("3")) == nil)
+        // The prompt is consumed either way: a digit after it is the dimmer again.
+        #expect(session.handleKey(.character("3")) == "Brightness 30 %")
     }
 
     @Test("p hides the photo and reports the session hidden; the panel stays on")

@@ -40,7 +40,7 @@ public enum KioskMediaError: Error, CustomStringConvertible {
 @MainActor
 public final class KioskMediaProvider: RAVESlideshowContentProvider {
     public private(set) var endpoint: RoboFrameEndpoint
-    private let config: KioskConfig
+    private var config: KioskConfig
     private let session: URLSession
     private var screen: (width: Int, height: Int)
 
@@ -54,6 +54,11 @@ public final class KioskMediaProvider: RAVESlideshowContentProvider {
     /// The size stills are requested at. Must match what `slideshowConfig` advertised.
     public func setScreenSize(width: Int, height: Int) {
         screen = (width, height)
+    }
+
+    /// The night light (or the menu) switched the `bright` variant.
+    public func setBright(_ bright: Bool) {
+        config.bright = bright
     }
 
     public func fetchMoreContent(_ request: RAVESlideshowFetchRequest) async throws -> [RAVESlideshowItem] {

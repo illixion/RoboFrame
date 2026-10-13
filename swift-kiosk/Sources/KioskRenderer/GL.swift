@@ -78,6 +78,33 @@ final class GLPhotoSlot {
         texture = GLTexture(width: width, height: height, rgba: nil)
     }
 
+    /// The photo's blurred copy, for the bars beside it (DecodedPhoto).
+    private let backdropTexture = GLTexture(width: DecodedPhoto.backdropSize, height: DecodedPhoto.backdropSize, rgba: nil)
+    private(set) var backdropSize: (width: Int, height: Int)?
+    private(set) var focus = (x: 0.5, y: 0.5)
+
+    func upload(_ photo: DecodedPhoto) {
+        upload(photo.image)
+        focus = photo.focus
+        backdropSize = nil
+        if let backdrop = photo.backdrop, backdrop.width <= backdropTexture.width, backdrop.height <= backdropTexture.height {
+            glBindTexture(GLenum(GL_TEXTURE_2D), backdropTexture.id)
+            backdrop.pixels.withUnsafeBytes {
+                glTexSubImage2D(GLenum(GL_TEXTURE_2D), 0, 0, 0, GLsizei(backdrop.width), GLsizei(backdrop.height),
+                                GLenum(GL_RGBA), GLenum(GL_UNSIGNED_BYTE), $0.baseAddress)
+            }
+            backdropSize = (backdrop.width, backdrop.height)
+        }
+    }
+
+    /// The backdrop texture and the part of it the copy fills, when there is one.
+    var backdrop: (texture: GLTexture, region: GLCompositor.Region, width: Int, height: Int)? {
+        guard let size = backdropSize else { return nil }
+        let w = Float(backdropTexture.width), h = Float(backdropTexture.height)
+        return (backdropTexture, GLCompositor.Region(u: 0.5 / w, v: 0.5 / h, width: (Float(size.width) - 1) / w, height: (Float(size.height) - 1) / h),
+                size.width, size.height)
+    }
+
     func upload(_ image: RGBAImage) {
         width = min(image.width, texture.width)
         height = min(image.height, texture.height)

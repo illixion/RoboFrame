@@ -12,9 +12,17 @@
     targets. Those surfaces are allocated once and reused (GL.swift says
     why). A new frame crossfades over the old for the configured transition
     length, photo or video either side.
+    A photo is placed whole or filling the screen (`fit`), zooms slowly
+    towards its busiest part over its dwell (Ken Burns, KioskKenBurns), and
+    has its blurred copy in the bars beside it. That copy is drawn only in
+    the bars, never under the photo, so each layer still paints every pixel
+    once and the additive crossfade stays exact.
+    The slideshow's brightness setting dims this layer alone.
  2. Effects: a `playVideo` clip or a `playScene` stream over the slideshow,
     or a `showText` alert, which covers everything.
- 3. The overlay: clock, date, sensors and toasts.
+ 3. The overlay: clock, date, sensors, toasts (fading in and out), the
+    status line (offline, a refused token, an empty query) and the
+    settings menu over everything.
 
  The panel off (displayState) draws black and stops video; the photo hidden
  from the keypad keeps the overlay. Nothing here talks to the server: the
@@ -56,6 +64,8 @@ public final class KioskRenderer {
     private struct Layer {
         let id: String
         let content: Content
+        /// When it started fading in: the Ken Burns zoom's clock.
+        let start: TimeInterval
     }
 
     private enum PlayerOwner: Equatable {
@@ -79,7 +89,7 @@ public final class KioskRenderer {
 
     // Slideshow
     /// Decoded and waiting for their turn, in RAM rather than GPU memory.
-    private var photos: [String: RGBAImage] = [:]
+    private var photos: [String: DecodedPhoto] = [:]
     private var photoSlots: [GLPhotoSlot] = []
     private var videoTargets: [GLRenderTarget] = []
     private var decoding: Set<String> = []
@@ -101,6 +111,11 @@ public final class KioskRenderer {
     private var sensorLines: [String] = []
     private var sensorsTexture: GLTexture?
     private var toastTextures: [(id: Int, texture: GLTexture)] = []
+    private var statusText: String?
+    private var statusTexture: GLTexture?
+    private var menuRows: [KioskMenuRow] = []
+    private var menuTexture: GLTexture?
+    private var overlayLayout: (clock: Bool, seconds: Bool, date: Bool, sensors: Bool)?
 
     private var dirty = true
     private var timer: DispatchSourceTimer?
@@ -205,6 +220,14 @@ public final class KioskRenderer {
             if let target = activeVideoTarget, player.renderIfNeeded(into: target) { dirty = true }
         }
         if let start = effect?.start, now - start < 0.5 { animating = true; dirty = true }
+        if session.isShowing, alert == nil, let layer = fade?.layer ?? front, kenBurnsProgress(layer) < 1 {
+            animating = true
+            dirty = true
+        }
+        if session.toasts.all.contains(where: { $0.isAnimating(now: now) }) {
+            animating = true
+            dirty = true
+        }
 
         if dirty {
             dirty = false
@@ -248,6 +271,8 @@ public final class KioskRenderer {
             } else if let front {
                 drawLayer(front, alpha: 1)
             }
+            let brightness = Float(session.config.brightness) / 100
+            if brightness < 1 { compositor.fill(screen, red: 0, green: 0, blue: 0, alpha: 1 - brightness) }
         }
 
         if let effect, let start = effect.start {
@@ -260,18 +285,49 @@ public final class KioskRenderer {
     private func drawLayer(_ layer: Layer, alpha: Float) {
         switch layer.content {
         case .photo(let slot):
-            compositor.draw(slot.texture, in: fitted(slot.width, slot.height), alpha: alpha, blend: .add, region: slot.region)
+            let config = session.config
+            var rect = KioskKenBurns.placed(width: slot.width, height: slot.height, screenWidth: width, screenHeight: height, fit: config.fit)
+            if config.kenBurns { rect = KioskKenBurns.zoomed(rect, focus: slot.focus, progress: kenBurnsProgress(layer)) }
+            let photo = PixelRect(x: Float(rect.x), y: Float(rect.y), width: Float(rect.width), height: Float(rect.height))
+            if config.blurBackground, let backdrop = slot.backdrop { drawBackdrop(backdrop, around: photo, alpha: alpha) }
+            compositor.draw(slot.texture, in: photo, alpha: alpha, blend: .add, region: slot.region)
         case .video(let target, _):
             // mpv letterboxes into the full-screen target itself.
             compositor.draw(target.texture, in: PixelRect(x: 0, y: 0, width: Float(width), height: Float(height)), alpha: alpha, blend: .add)
         }
     }
 
-    /// Aspect-fit and centred.
-    private func fitted(_ imageWidth: Int, _ imageHeight: Int) -> PixelRect {
-        let fit = min(Float(width) / Float(imageWidth), Float(height) / Float(imageHeight))
-        let w = Float(imageWidth) * fit, h = Float(imageHeight) * fit
-        return PixelRect(x: (Float(width) - w) / 2, y: (Float(height) - h) / 2, width: w, height: h)
+    /// How far a photo's zoom has got: 0 as it starts fading in, 1 by the
+    /// time its dwell (and the fade) is over, then it holds.
+    private func kenBurnsProgress(_ layer: Layer) -> Double {
+        guard session.config.kenBurns, case .photo = layer.content else { return 1 }
+        let span = session.engine.displaySettings.delay + session.config.transitionDuration
+        return min(1, max(0, (now - layer.start) / max(1, span)))
+    }
+
+    /// The photo's blurred copy, scaled to cover the screen, drawn in the
+    /// strips around `photo`: above, below, then either side.
+    private func drawBackdrop(_ backdrop: (texture: GLTexture, region: GLCompositor.Region, width: Int, height: Int), around photo: PixelRect, alpha: Float) {
+        let cover = KioskKenBurns.placed(width: backdrop.width, height: backdrop.height, screenWidth: width, screenHeight: height, fit: .cover)
+        let screenWidth = Float(width), screenHeight = Float(height)
+        let top = max(0, min(screenHeight, photo.y)), bottom = max(top, min(screenHeight, photo.y + photo.height))
+        let left = max(0, min(screenWidth, photo.x)), right = max(left, min(screenWidth, photo.x + photo.width))
+        let strips = [
+            PixelRect(x: 0, y: 0, width: screenWidth, height: top),
+            PixelRect(x: 0, y: bottom, width: screenWidth, height: screenHeight - bottom),
+            PixelRect(x: 0, y: top, width: left, height: bottom - top),
+            PixelRect(x: right, y: top, width: screenWidth - right, height: bottom - top),
+        ]
+        for strip in strips where strip.width >= 1 && strip.height >= 1 {
+            // The strip's part of the cover-scaled copy, in texture coordinates.
+            let u = (Double(strip.x) - cover.x) / cover.width, v = (Double(strip.y) - cover.y) / cover.height
+            let region = GLCompositor.Region(
+                u: backdrop.region.u + Float(u) * backdrop.region.width,
+                v: backdrop.region.v + Float(v) * backdrop.region.height,
+                width: Float(Double(strip.width) / cover.width) * backdrop.region.width,
+                height: Float(Double(strip.height) / cover.height) * backdrop.region.height)
+            compositor.draw(backdrop.texture, in: strip, alpha: alpha, blend: .add, region: region)
+        }
     }
 
     // MARK: - Slideshow
@@ -306,7 +362,7 @@ public final class KioskRenderer {
             slot.upload(image)
             photos[id] = nil
             pendingVideo = nil
-            begin(Layer(id: id, content: .photo(slot)))
+            begin(Layer(id: id, content: .photo(slot), start: now))
         case .video(let url, _):
             guard pendingVideo?.id != id, effect == nil, let player else {
                 if self.player == nil { unplayable.insert(id) }
@@ -315,9 +371,22 @@ public final class KioskRenderer {
             guard let target = freeVideoTarget() else { return }
             pendingVideo = (id, url, target)
             owner = .slideshow(id)
-            player.load(url, options: VideoPlayer.Options(loop: true, audio: false))
+            player.load(url, options: VideoPlayer.Options(loop: loops(target: engineItem(id)), audio: false))
             logger.log(.info, "loading video for post \(id)")
         }
+    }
+
+    private func engineItem(_ id: String) -> RAVESlideshowItem? {
+        [session.engine.incoming, session.engine.current].compactMap { $0 }.first { $0.item.id == id }?.item
+    }
+
+    /// A clip that fits in the dwell loops; a longer one plays once and holds
+    /// its last frame until the server moves on (it dwells for the clip's
+    /// length), as the other kiosks do: looping it would flash its opening
+    /// just before the advance.
+    private func loops(target item: RAVESlideshowItem?) -> Bool {
+        guard let duration = item?.duration, duration > 0 else { return true }
+        return duration <= session.engine.displaySettings.delay
     }
 
     /// A video target no layer is showing, blacked out. Up to three exist:
@@ -371,13 +440,13 @@ public final class KioskRenderer {
             decoding.insert(id)
             let maxWidth = min(width, maxTextureSize), maxHeight = min(height, maxTextureSize)
             Task.detached(priority: .userInitiated) {
-                let image = RGBAImage.decode(data, maxWidth: maxWidth, maxHeight: maxHeight)
+                let image = DecodedPhoto.decode(data, maxWidth: maxWidth, maxHeight: maxHeight)
                 await MainActor.run { [weak self] in self?.decoded(id, image) }
             }
         }
     }
 
-    private func decoded(_ id: String, _ image: RGBAImage?) {
+    private func decoded(_ id: String, _ image: DecodedPhoto?) {
         decoding.remove(id)
         guard let image else {
             logger.log(.warning, "couldn't decode post \(id)")
@@ -423,12 +492,17 @@ public final class KioskRenderer {
                     guard let pending = pendingVideo, pending.id == id else { break }
                     pendingVideo = nil
                     logger.log(.info, "video for post \(id) playing: \(player.property("video-codec") ?? "?", privacy: .public) \(player.property("width") ?? "?", privacy: .public)x\(player.property("height") ?? "?", privacy: .public), hwdec=\(player.property("hwdec-current") ?? "no", privacy: .public)")
-                    begin(Layer(id: id, content: .video(pending.target, pending.url)))
+                    begin(Layer(id: id, content: .video(pending.target, pending.url), start: now))
                 case (.slideshow(let id), .failed(let reason)):
                     logger.log(.warning, "video for post \(id) failed: \(reason)")
                     if pendingVideo?.id == id { pendingVideo = nil }
                     unplayable.insert(id)
                     owner = .none
+                    if session.videoFailed(id) {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                            MainActor.assumeIsolated { _ = self?.unplayable.remove(id) }
+                        }
+                    }
                 case (.effect, .started):
                     effect?.start = now
                     dirty = true
@@ -494,7 +568,7 @@ public final class KioskRenderer {
     private func resumeSlideshowVideo() {
         guard let player, let layer = fade?.layer ?? front, case .video(_, let url) = layer.content else { return }
         owner = .slideshow(layer.id)
-        player.load(url, options: VideoPlayer.Options(loop: true, audio: false))
+        player.load(url, options: VideoPlayer.Options(loop: loops(target: engineItem(layer.id)), audio: false))
     }
 
     private func buildAlert(_ value: RoboFrameAlert) {
@@ -564,22 +638,54 @@ public final class KioskRenderer {
 
     private func syncOverlay() {
         let fontScale = scale
-        let clock = KioskOverlay.clock()
+        let config = session.config
+        let radius = Int(10 * fontScale)
+        let layout = (clock: config.showClock, seconds: config.showSeconds, date: config.showDate, sensors: config.showSensors)
+        if overlayLayout.map({ $0 != layout }) ?? true {
+            overlayLayout = layout
+            clockText = ("", "")
+            sensorLines = []
+            dirty = true
+        }
+        let clock = KioskOverlay.clock(seconds: config.showSeconds)
         if clock != clockText {
             if clock.time != clockText.time {
-                clockTexture = text.box([clock.time], size: Int(48 * fontScale), rightAligned: false)?.texture()
+                clockTexture = config.showClock ? text.box([clock.time], size: Int(48 * fontScale), rightAligned: false, radius: radius)?.texture() : nil
             }
             if clock.date != clockText.date {
-                dateTexture = text.box([clock.date], size: Int(48 * fontScale), rightAligned: false)?.texture()
+                dateTexture = config.showDate ? text.box([clock.date], size: Int(48 * fontScale), rightAligned: false, radius: radius)?.texture() : nil
             }
             clockText = clock
             dirty = true
         }
 
-        let lines = KioskOverlay.sensorLines(session.sensors)
+        let lines = config.showSensors ? KioskOverlay.sensorLines(session.sensors) : []
         if lines != sensorLines {
             sensorLines = lines
-            sensorsTexture = lines.isEmpty ? nil : text.box(lines, size: Int(26 * fontScale), rightAligned: true)?.texture()
+            sensorsTexture = lines.isEmpty ? nil : text.box(lines, size: Int(26 * fontScale), rightAligned: true, radius: radius)?.texture()
+            dirty = true
+        }
+
+        let status = KioskOverlay.status(session)
+        if status != statusText {
+            statusText = status
+            statusTexture = status.flatMap {
+                text.box([$0], size: Int(24 * fontScale), rightAligned: false, padding: (16, 10), background: (122, 31, 31, 230),
+                         color: SDL_Color(r: 255, g: 255, b: 255, a: 255), radius: radius)?.texture()
+            }
+            dirty = true
+        }
+
+        let rows = session.isMenuOpen ? session.menuRows : []
+        if rows != menuRows {
+            menuRows = rows
+            menuTexture = rows.isEmpty ? nil : text.menu(
+                title: "Settings",
+                subtitle: "\(session.config.deviceId) · \(width)×\(height)",
+                rows: rows,
+                footer: "↑↓ or 2 8 move   ←→ or 4 6 change   5 or Enter select   M or 0 close",
+                scale: Double(min(fontScale, Float(height) / Float(max(1, menuNaturalHeight(rows: rows))) * 0.94))
+            )?.texture()
             dirty = true
         }
 
@@ -589,13 +695,18 @@ public final class KioskRenderer {
                 if let existing = toastTextures.first(where: { $0.id == toast.id }) { return existing }
                 let edge = session.thumbnailSize
                 let thumbnail = toast.thumbnail.flatMap { RGBAImage.decode($0, maxWidth: edge, maxHeight: edge) }
-                guard let image = text.box([toast.text], size: Int(22 * fontScale), rightAligned: false, padding: (10, 6),
-                                           background: (51, 51, 51, 230), color: SDL_Color(r: 255, g: 255, b: 255, a: 255),
-                                           leading: thumbnail, imageGap: Int(8 * fontScale)) else { return nil }
+                guard let image = text.box([toast.text], size: Int(22 * fontScale), rightAligned: false, padding: (Int(14 * fontScale), Int(8 * fontScale)),
+                                           background: (40, 40, 42, 235), color: SDL_Color(r: 255, g: 255, b: 255, a: 255),
+                                           leading: thumbnail, imageGap: Int(10 * fontScale), radius: Int(8 * fontScale)) else { return nil }
                 return (toast.id, image.texture())
             }
             dirty = true
         }
+    }
+
+    /// The menu's height at 1080p scale 1, to shrink it on a short screen.
+    private func menuNaturalHeight(rows: [KioskMenuRow]) -> Int {
+        36 * 2 + 64 + rows.reduce(0) { $0 + 46 + ($1.section != nil ? 44 : 0) } + 56
     }
 
     private func drawOverlay() {
@@ -609,16 +720,26 @@ public final class KioskRenderer {
         if let sensorsTexture {
             draw(sensorsTexture, x: Float(width) - Float(sensorsTexture.width) - margin, y: margin)
         }
-        // Toasts stack down from the top right, over the sensors.
+        if let statusTexture {
+            draw(statusTexture, x: margin, y: margin)
+        }
+        // Toasts stack down from the top right, over the sensors, sliding
+        // into place as they fade in.
         var y = 20 * scale
-        for (_, texture) in toastTextures {
-            draw(texture, x: Float(width) - Float(texture.width) - 20 * scale, y: y)
-            y += Float(texture.height) + 6 * scale
+        let toasts = session.toasts.all
+        for (id, texture) in toastTextures {
+            let look = toasts.first { $0.id == id }?.appearance(now: now) ?? (alpha: 1, drop: 0)
+            draw(texture, x: Float(width) - Float(texture.width) - 20 * scale, y: y - Float(look.drop) * 20 * scale, alpha: Float(look.alpha))
+            y += (Float(texture.height) + 8 * scale) * Float(min(1, look.alpha * 2))
+        }
+        if let menuTexture {
+            compositor.fill(PixelRect(x: 0, y: 0, width: Float(width), height: Float(height)), red: 0, green: 0, blue: 0, alpha: 0.45)
+            draw(menuTexture, x: (Float(width) - Float(menuTexture.width)) / 2, y: (Float(height) - Float(menuTexture.height)) / 2)
         }
     }
 
-    private func draw(_ texture: GLTexture, x: Float, y: Float) {
-        compositor.draw(texture, in: PixelRect(x: x.rounded(), y: y.rounded(), width: Float(texture.width), height: Float(texture.height)), alpha: 1, blend: .over)
+    private func draw(_ texture: GLTexture, x: Float, y: Float, alpha: Float = 1) {
+        compositor.draw(texture, in: PixelRect(x: x.rounded(), y: y.rounded(), width: Float(texture.width), height: Float(texture.height)), alpha: alpha, blend: .over)
     }
 
     // MARK: - Input
@@ -644,15 +765,22 @@ public final class KioskRenderer {
         let control = Int(key.mod) & Int(KMOD_CTRL.rawValue) != 0
         switch Int(key.sym) {
         case Int(SDLK_ESCAPE.rawValue):
-            // Like native-kiosk: the launcher's xinit ends with us, and
-            // getty starts the session again.
-            exit(0)
+            // Closes the menu; otherwise, like native-kiosk, quits: the
+            // launcher's xinit ends with us, and getty starts the session again.
+            guard session.isMenuOpen else { exit(0) }
+            session.handleKey(.escape)
         case Int(SDLK_RIGHT.rawValue):
             session.handleKey(.right)
         case Int(SDLK_LEFT.rawValue):
             session.handleKey(.left)
+        case Int(SDLK_UP.rawValue):
+            session.handleKey(.up)
+        case Int(SDLK_DOWN.rawValue):
+            session.handleKey(.down)
         case Int(SDLK_RETURN.rawValue), Int(SDLK_KP_ENTER.rawValue):
-            break
+            session.handleKey(.enter)
+        case Int(SDLK_BACKSPACE.rawValue):
+            session.handleKey(.backspace)
         case Int(SDLK_KP_0.rawValue):
             session.handleKey(.character("0"))
         case Int(SDLK_KP_1.rawValue)...Int(SDLK_KP_9.rawValue):
@@ -675,6 +803,8 @@ public final class KioskRenderer {
         clockText = ("", "")
         sensorLines = []
         toastTextures = []
+        statusText = nil
+        menuRows = []
         front = nil
         fade = nil
         photos = [:]

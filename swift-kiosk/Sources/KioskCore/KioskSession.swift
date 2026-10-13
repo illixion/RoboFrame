@@ -19,6 +19,16 @@
    The server is never told: sessions sharing this channel share one queue,
    so going back is this display's alone. Playback frames that arrive during
    the hold wait for it to end, then the latest one applies.
+ - What space saves and `b` blocks (`target`) trails an automatic advance by
+   `targetGrace`. The keypad sends a key when the button comes back up, and
+   saving is a hold, so a press that started on one post often lands just
+   after the next one faded in; it still means the post it started on. A
+   post reached with `→` or `←` is the target at once: it was asked for.
+ - `setBrightness` below `minimumBrightness` for this deviceId hides the
+   slideshow like `p` does, as the web kiosk treats it.
+ - `bright` is the config's, or on during the night-light window. A change
+   re-sends `slideshowConfig` (the server prefetches the variant this
+   display asks for) and drops what was prefetched under the old one.
 
  What it never does, per the protocol: run its own dwell timer, advance on a
  wake, or filter posts locally.
@@ -36,7 +46,8 @@ import RAVESlideshowCore
 public final class KioskSession {
     public static let sessionId = "main"
 
-    public let config: KioskConfig
+    public private(set) var config: KioskConfig
+    public let settings: KioskSettingsStore
     public let engine: RAVESlideshowEngine
     public let connection: RoboFrameConnection
     public let provider: KioskMediaProvider
@@ -45,10 +56,22 @@ public final class KioskSession {
     public private(set) var isPanelOn = true
     /// The photo hidden from the keypad; the overlay stays.
     public private(set) var isImageHidden = false
+    /// `setBrightness` turned the slideshow down below `minimumBrightness`.
+    public private(set) var isDimmedOut = false
+    public static let minimumBrightness = 16
     /// Whether the slideshow is on screen: the panel on and the photo not hidden.
-    public var isShowing: Bool { isPanelOn && !isImageHidden }
+    public var isShowing: Bool { isPanelOn && !isImageHidden && !isDimmedOut }
+    /// `bright` as the server should render it: configured, or the night light.
+    public private(set) var effectiveBright = false
+    /// The socket has been down long enough to say so on screen.
+    public private(set) var isOffline = false
+    public static let offlineAfter: TimeInterval = 10
+    /// Something the person at the frame should know, until it's resolved.
+    public private(set) var banner: Banner?
+    /// The settings menu, while it's open.
+    public internal(set) var menu: KioskMenuState?
     public private(set) var tagLists: [[String]] = []
-    public private(set) var currentList = 0
+    public internal(set) var currentList = 0
     public private(set) var alert: RoboFrameAlert?
     /// The latest effect video or live scene, for the renderer to play over the slideshow.
     public private(set) var effect: Effect?
@@ -60,14 +83,33 @@ public final class KioskSession {
     public static let historyLimit = 100
     /// `←` is holding an earlier post on screen.
     public var isHolding: Bool { holdTask != nil }
-    /// The post on screen, which is what `b` blocks and space saves (during
-    /// a `←` hold, the earlier post).
-    public var currentPostID: Int? { engine.current.flatMap { RoboFramePost(slideshowItem: $0.item) }?.id }
+    /// What `b` blocks and space saves: the post on screen, or for
+    /// `targetGrace` after an automatic advance, the one before it.
+    public private(set) var target: RAVESlideshowDisplayedMedia?
+    public var currentPostID: Int? { target.flatMap { RoboFramePost(slideshowItem: $0.item) }?.id }
+    public static let targetGrace: TimeInterval = 1.5
+    /// How long a `→`/`←` press keeps the next frame's target immediate,
+    /// bounding the wait for the server's reply.
+    public static let navIntentWindow: TimeInterval = 10
     public var sensors: [RoboFrameSensorReading] { Array(connection.sensors.values) }
 
     public enum Effect: Equatable, Sendable {
         case video(URL)
         case scene(URL)
+    }
+
+    public enum Banner: Equatable, Sendable {
+        /// The server refused this kiosk (a bad token): it won't reconnect.
+        case halted(String)
+        /// The channel's query matches nothing, so nothing will play.
+        case searchEmpty
+
+        public var text: String {
+            switch self {
+            case .halted: "The server refused this frame's access token. Check accessToken in the config."
+            case .searchEmpty: "No posts match this frame's tags. Pick another tag list in the menu."
+            }
+        }
     }
 
     /// The server asked for a reload (`refresh`).
@@ -84,8 +126,14 @@ public final class KioskSession {
     private var backSteps = 0
     private var holdTask: Task<Void, Never>?
     private var historySeeded = false
+    private var targetTask: Task<Void, Never>?
+    private var navIntentUntil: TimeInterval = 0
+    private var ticker: Task<Void, Never>?
+    private var lastConnected: TimeInterval
+    private var failedVideos: [Int: Int] = [:]
     var awaitingTagList = false
-    var isDisplaySyncOn = false
+    public internal(set) var isDisplaySyncOn = false
+    var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
 
     public init(config: KioskConfig, logger: any RAVENetLogger = RAVENetOSLogger(subsystem: "roboframe.kiosk", category: "session")) throws {
         guard let endpoint = RoboFrameEndpoint(webSocketURL: config.webSocketURL, accessToken: config.accessToken, deviceId: config.deviceId),
@@ -95,13 +143,19 @@ public final class KioskSession {
         self.config = config
         self.logger = logger
         self.screen = (config.screenWidth, config.screenHeight)
-        provider = KioskMediaProvider(endpoint: endpoint, config: config)
+        settings = KioskSettingsStore(path: config.settingsPath)
+        lastConnected = ProcessInfo.processInfo.systemUptime
+        effectiveBright = config.bright || (config.nightLight?.isActive() ?? false)
+        var media = config
+        media.bright = effectiveBright
+        provider = KioskMediaProvider(endpoint: endpoint, config: media)
         connection = RoboFrameConnection(url: socketURL, logger: logger)
         engine = RAVESlideshowEngine(
             provider: provider,
             displaySettings: RAVESlideshowDisplaySettings(
                 delay: TimeInterval(config.intervalMs) / 1_000,
                 transitionDuration: config.transitionDuration,
+                // The renderer draws its own Ken Burns; the engine only times frames.
                 enableKenBurns: false
             ),
             configuration: RAVESlideshowConfiguration(
@@ -112,7 +166,7 @@ public final class KioskSession {
             )
         )
         engine.onTransition = { [weak self] displayed in
-            self?.didDisplay(displayed)
+            self?.transitioned(to: displayed)
         }
     }
 
@@ -123,9 +177,16 @@ public final class KioskSession {
         handlers.onConnected = { [weak self] in self?.didConnect() }
         self.handlers = handlers
         reportScene()
+        ticker = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                self?.tick()
+            }
+        }
     }
 
     public func stop() {
+        ticker?.cancel()
         connection.detachSession(Self.sessionId)
         connection.disconnect()
         engine.stop()
@@ -140,15 +201,76 @@ public final class KioskSession {
         if connection.isConnected { sendSlideshowConfig() }
     }
 
+    /// Once a second: the offline badge, the night light, the menu's timeout.
+    func tick() {
+        let now = self.now
+        if connection.isConnected { lastConnected = now }
+        let offline = banner == nil && now - lastConnected >= Self.offlineAfter
+        if offline != isOffline {
+            isOffline = offline
+            logger.log(offline ? .warning : .info, offline ? "offline" : "back online")
+            onChange?()
+        }
+        updateBright()
+        if let menu, now - menu.lastInput >= KioskMenuState.timeout {
+            self.menu = nil
+            onChange?()
+        }
+    }
+
+    /// Applies a changed setting: saved, then acted on.
+    func update(_ key: String, _ value: JSONValue, _ change: (inout KioskConfig) -> Void) {
+        update([key: value], change)
+    }
+
+    func update(_ values: [String: JSONValue], _ change: (inout KioskConfig) -> Void) {
+        let before = config
+        change(&config)
+        guard config != before else { return }
+        for (key, value) in values.sorted(by: { $0.key < $1.key }) where !settings.set(key, value) {
+            logger.log(.warning, "couldn't save the setting \(key, privacy: .public)")
+        }
+        if config.intervalMs != before.intervalMs {
+            var display = engine.displaySettings
+            display.delay = TimeInterval(config.intervalMs) / 1_000
+            engine.displaySettings = display
+            if connection.isConnected { sendSlideshowConfig() }
+        }
+        if config.transitionDuration != before.transitionDuration {
+            var display = engine.displaySettings
+            display.transitionDuration = config.transitionDuration
+            engine.displaySettings = display
+        }
+        if config.bright != before.bright || config.nightLight != before.nightLight { updateBright() }
+        onChange?()
+    }
+
+    private func updateBright() {
+        let bright = config.bright || (config.nightLight?.isActive() ?? false)
+        guard bright != effectiveBright else { return }
+        effectiveBright = bright
+        logger.log(.info, "bright \(bright ? "on" : "off", privacy: .public)")
+        provider.setBright(bright)
+        // What was prefetched is the other variant; the next playback
+        // frame fetches the upcoming post again.
+        engine.prunePrefetched(keeping: [])
+        if connection.isConnected { sendSlideshowConfig() }
+    }
+
     // MARK: - Local controls (keypad)
 
-    public func requestNext() { connection.sendRequestNext(sessionId: Self.sessionId) }
+    public func requestNext() {
+        markNavIntent()
+        connection.sendRequestNext(sessionId: Self.sessionId)
+    }
+
+    private func markNavIntent() { navIntentUntil = now + Self.navIntentWindow }
     public func reshuffle() { connection.sendReshuffle(sessionId: Self.sessionId) }
     public func setTagList(_ index: Int) { connection.sendSetTagList(sessionId: Self.sessionId, listNumber: index) }
     public func setDisplaySync(_ enabled: Bool) { connection.sendDisplaySync(sessionId: Self.sessionId, enabled: enabled) }
     public func blockCurrent() {
-        guard let post = engine.current.flatMap({ RoboFramePost(slideshowItem: $0.item) }) else { return }
-        connection.sendBlock(postId: post.id)
+        guard let id = currentPostID else { return }
+        connection.sendBlock(postId: id)
     }
 
     public func setImageHidden(_ hidden: Bool) {
@@ -159,7 +281,7 @@ public final class KioskSession {
 
     public func toast(_ text: String, thumbnail: Data? = nil) {
         logger.log(.info, "toast: \(text)")
-        toasts.add(text, thumbnail: thumbnail, now: ProcessInfo.processInfo.systemUptime)
+        toasts.add(text, thumbnail: thumbnail, now: now)
         onChange?()
     }
 
@@ -174,6 +296,7 @@ public final class KioskSession {
             return "No earlier image"
         }
         backSteps += 1
+        markNavIntent()
         let seconds = max(2, engine.displaySettings.delay)
         holdTask?.cancel()
         holdTask = Task { [weak self] in
@@ -221,7 +344,7 @@ public final class KioskSession {
     }
 
     public func expireToasts() {
-        if toasts.expire(now: ProcessInfo.processInfo.systemUptime) { onChange?() }
+        if toasts.expire(now: now) { onChange?() }
     }
 
     /// The renderer finished (or couldn't play) the effect.
@@ -237,8 +360,24 @@ public final class KioskSession {
 
     // MARK: - Protocol
 
+    /// The renderer couldn't play a video post. One more try, as a network
+    /// blip deserves; a second failure skips it, since the server would
+    /// otherwise hold the channel on it until its readiness timeout.
+    /// Returns whether to retry.
+    public func videoFailed(_ id: String) -> Bool {
+        guard let postID = Int(id) else { return false }
+        let failures = failedVideos[postID, default: 0] + 1
+        failedVideos = failedVideos.filter { $0.key == postID }
+        failedVideos[postID] = failures
+        guard failures >= 2 else { return true }
+        if !isHolding, engine.current?.item.id == id || engine.incoming?.item.id == id { requestNext() }
+        return false
+    }
+
     private func didConnect() {
         logger.log(.info, "connected")
+        lastConnected = now
+        if case .halted = banner { banner = nil }
         sendSlideshowConfig()
         connection.sendGetDisplayState(target: config.deviceId)
         seedHistory()
@@ -255,7 +394,7 @@ public final class KioskSession {
             ratio: ratio,
             width: screen.width,
             height: screen.height,
-            bright: config.bright,
+            bright: effectiveBright,
             convert: true,
             lowmem: config.lowmem
         ))
@@ -275,6 +414,12 @@ public final class KioskSession {
             currentList = index
         case .displayState(let target, let on) where target == config.deviceId:
             setPanel(on: on)
+        case .brightness(let target, let value) where target == config.deviceId:
+            let dimmedOut = value < Self.minimumBrightness
+            if dimmedOut != isDimmedOut {
+                isDimmedOut = dimmedOut
+                showingChanged()
+            }
         case .alert(let alert):
             self.alert = alert
             onChange?()
@@ -305,8 +450,12 @@ public final class KioskSession {
             onRefresh?()
         case .searchEmpty(let query):
             logger.log(.warning, "no posts match the channel's query: \(query)")
+            if banner == nil { banner = .searchEmpty; onChange?() }
         case .halted(let reason):
             logger.log(.error, "connection halted: \(reason)")
+            banner = .halted(reason)
+            isOffline = false
+            onChange?()
         default:
             break
         }
@@ -322,6 +471,7 @@ public final class KioskSession {
             engine.displaySettings = settings
         }
         if let list = playback.currentList { currentList = list }
+        if playback.current != nil, banner == .searchEmpty { banner = nil; onChange?() }
         let lookahead = playback.next ?? playback.upcoming.first
         engine.setAuthoritativeNextItemID(lookahead.map { String($0.id) })
         engine.prunePrefetched(keeping: Set(playback.upcoming.map { String($0.id) }))
@@ -350,6 +500,28 @@ public final class KioskSession {
         // next report. The parked one is never re-confirmed.
         reportScene()
         onChange?()
+    }
+
+    private func transitioned(to displayed: RAVESlideshowDisplayedMedia) {
+        retarget(displayed)
+        didDisplay(displayed)
+    }
+
+    private func retarget(_ displayed: RAVESlideshowDisplayedMedia) {
+        targetTask?.cancel()
+        targetTask = nil
+        let asked = now < navIntentUntil
+        if asked { navIntentUntil = 0 }
+        guard target != nil, !asked else {
+            target = displayed
+            return
+        }
+        targetTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.targetGrace))
+            guard !Task.isCancelled, let self else { return }
+            self.target = self.engine.current ?? displayed
+            self.targetTask = nil
+        }
     }
 
     private func didDisplay(_ displayed: RAVESlideshowDisplayedMedia) {
