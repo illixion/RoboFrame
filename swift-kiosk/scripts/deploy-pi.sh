@@ -33,7 +33,14 @@ scp -q "${ssh_opts[@]}" "$kiosk/pi/run-kiosk" "$host:/opt/swift-kiosk/run-kiosk.
 ssh "${ssh_opts[@]}" "$host" 'set -e
     cd /opt/swift-kiosk
     chmod 755 roboframe-kiosk.new run-kiosk.new
-    missing=$(ldd roboframe-kiosk.new | grep "not found" || true)
+    # ldd fails outright on a binary this machine cannot run (the wrong
+    # architecture), which would otherwise pass as "nothing missing".
+    if ! libraries=$(ldd roboframe-kiosk.new 2>&1); then
+        rm -f roboframe-kiosk.new run-kiosk.new
+        echo "deploy-pi: the Pi cannot run this binary: $libraries" >&2
+        exit 1
+    fi
+    missing=$(echo "$libraries" | grep "not found" || true)
     if [ -n "$missing" ]; then
         rm -f roboframe-kiosk.new run-kiosk.new
         echo "deploy-pi: the Pi is missing libraries the kiosk links:" >&2
@@ -51,7 +58,7 @@ ssh "${ssh_opts[@]}" "$host" 'set -e
 
 if [ "$restart" = --restart ]; then
     # SIGTERM to the frontend ends the X session; getty starts a new one.
-    ssh "${ssh_opts[@]}" "$host" 'pid=$(pgrep -o -f "^/opt/swift-kiosk/roboframe-kiosk|native-kiosk/kiosk.py") \
+    ssh "${ssh_opts[@]}" "$host" 'pid=$(pgrep -o -f "^/opt/swift-kiosk/roboframe-kiosk|^/usr/bin/python3 /opt/RoboFrame/native-kiosk/kiosk.py") \
         && kill "$pid" && echo "deploy-pi: restarting the kiosk session" \
         || echo "deploy-pi: no kiosk running to restart"'
 fi

@@ -50,15 +50,16 @@ Hypnos is a separate app that implements the same protocol in Swift, it is locat
   embeds via `--wid` purely for correct rendering/stacking, not input.
 - `swift-kiosk/` — Swift successor to `native-kiosk/` for the Pi, built
   on RAVESDK's shared `RAVERoboFrame` client and `RAVESlideshowCore`
-  engine (the same code Hypnos's remote viewer and NativeClient run), so
-  every Swift frontend follows the server identically. Reads native-kiosk's
+  engine (the same code NativeClient runs), so the Swift frontends
+  follow the server identically. Reads native-kiosk's
   `roboframe.config.json` `kiosk` block and env names. Renders with SDL2 +
   OpenGL ES 2 (VC4) and plays video through libmpv inside its own window
   (crossfades either way, no evdev grab needed). Big GL surfaces are
   allocated once and reused: VC4's CMA pool is shared with the hardware
   decoder, and running it out wedged the Pi's firmware decoder until a
-  reboot. kiosk-pi3's frontend: `swift-kiosk/pi/run-kiosk` runs it and
-  falls back to native-kiosk if it dies. `swift-kiosk/scripts/build-linux.sh`
+  reboot. kiosk-pi3's frontend: `swift-kiosk/pi/run-kiosk` runs it,
+  restarts it after a crash, and falls back to native-kiosk if it keeps
+  dying. `swift-kiosk/scripts/build-linux.sh`
   builds it in Docker (arm64, `--static-swift-stdlib`; the Pi needs
   `libmpv2`), `scripts/deploy-pi.sh` installs it in `/opt/swift-kiosk`;
   see its README.
@@ -123,13 +124,16 @@ The shipped clients are the second source of truth. If they need
 updates to track a server change, ship those too:
 - Web kiosk: [`public/modules/ws-client.js`](public/modules/ws-client.js)
   + the action-specific module.
-- The Swift clients (Hypnos, NativeClient, swift-kiosk) share one
-  protocol client: `~/Projects/RAVESDK/Sources/RAVERoboFrame` (frames,
-  connection, present/visibility, URLs). A wire change lands there once,
-  with its tests, then in each client's message handling:
-  - Hypnos: `Services/RemoteWSSession.swift` + `Views/Remote/RemoteViewerModel.swift`.
+- NativeClient and swift-kiosk share one protocol client:
+  `~/Projects/RAVESDK/Sources/RAVERoboFrame` (frames, connection,
+  present/visibility, URLs). A wire change lands there once, with its
+  tests, then in each client's message handling:
   - NativeClient: `SlideshowModel.swift`.
   - swift-kiosk: `Sources/KioskCore/KioskSession.swift`.
+- Hypnos: `~/Projects/Hypnos/Hypnos/Hypnos/Services/RemoteWebSocketClient.swift`
+  + `Views/Remote/RemoteViewerModel.swift`. Its move onto RAVERoboFrame is
+  the unmerged Hypnos branch `roboframe-shared-client`; until that lands,
+  it carries its own copy of the protocol.
 - node-display: [`node-display/server.js`](node-display/server.js).
 
 ## Orchestrator model (one-screen summary)

@@ -146,9 +146,10 @@ binary the Pi lacks a library for, and with `--restart` restarts the X
 session onto it. A running kiosk keeps its old binary until then.
 
 `run-kiosk` is the session's frontend: the Swift kiosk, logging to the
-journal as `roboframe-kiosk`, and native-kiosk for the rest of the session if
-it dies (a crash, a missing library), so a bad build can't leave getty
-restarting X every few seconds. Stopping it on purpose (SIGTERM, Esc) ends
+journal as `roboframe-kiosk`. A crash restarts it; three crashes within
+minutes of starting (a bad build, a missing library) hand the rest of the
+session to native-kiosk, so a broken binary can't leave getty restarting X
+every few seconds. Stopping it on purpose (SIGTERM, Esc) ends
 the session and getty starts a fresh one. `touch /opt/swift-kiosk/disabled`
 goes back to native-kiosk.
 

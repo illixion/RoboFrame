@@ -1,6 +1,7 @@
 #!/bin/bash
 # The kiosk session's frontend, exec'd by start-kiosk once X is up: the Swift
-# kiosk, with native-kiosk taking over for the rest of the session if it dies.
+# kiosk, with native-kiosk taking over for the rest of the session if it
+# keeps dying.
 # The fallback matters: a session that exits straight away (a crash, a missing
 # library) makes getty respawn X every few seconds.
 #
@@ -17,13 +18,24 @@ dir=$(dirname "$(readlink -f "$0")")
 # overlayroot and a reboot.
 settings=${KIOSK_SETTINGS:-$dir/state/settings.json}
 
-if [ -x "$dir/roboframe-kiosk" ] && [ ! -e "$dir/disabled" ]; then
+# A one-off crash after a long run restarts the Swift kiosk; only one that
+# keeps dying within minutes of starting hands over to native-kiosk.
+failures=0
+while [ -x "$dir/roboframe-kiosk" ] && [ ! -e "$dir/disabled" ]; do
+    started=$SECONDS
     ROBOFRAME_CONFIG=$config KIOSK_SETTINGS=$settings "$dir/roboframe-kiosk" 2>&1 | systemd-cat -t roboframe-kiosk
     status=${PIPESTATUS[0]}
     case $status in
         0|143) exit 0 ;;
     esac
-    echo "roboframe-kiosk exited with $status; native-kiosk takes over until the session restarts" \
-        | systemd-cat -t roboframe-kiosk -p warning
-fi
+    [ $((SECONDS - started)) -ge 300 ] && failures=0
+    failures=$((failures + 1))
+    if [ "$failures" -ge 3 ]; then
+        echo "roboframe-kiosk exited with $status; native-kiosk takes over until the session restarts" \
+            | systemd-cat -t roboframe-kiosk -p warning
+        break
+    fi
+    echo "roboframe-kiosk exited with $status; restarting it" | systemd-cat -t roboframe-kiosk -p warning
+    sleep 2
+done
 exec env ROBOFRAME_CONFIG="$config" /usr/bin/python3 /opt/RoboFrame/native-kiosk/kiosk.py

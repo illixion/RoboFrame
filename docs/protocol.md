@@ -518,8 +518,8 @@ WebSocket query token and as a `token` field on the message itself.
 
 ### `playback`
 The channel's playback state. Pushed on every advance, displaySync claim,
-mod-tag change, tag-list change, or visibility-driven resume. The only
-server-pushed frame that's session-scoped — `sessionIds` carries every
+mod-tag change, tag-list change, or visibility-driven resume. Session-
+scoped, like `searchEmpty` — `sessionIds` carries every
 session on the receiving ws that this frame is destined for. One frame
 can therefore satisfy N sessions when multiple windows on one device
 share a connection (e.g. all 10 windows in a room → one playback frame
@@ -698,10 +698,12 @@ Forwarded HA sensor reading (filtered by `HA_FILTER_ENTITIES`).
 Channel-scoped notification fired when a refill returns zero rows for a
 non-empty tag query — typically a typo'd `setModTags` or an unsatisfiable
 combination. Clients can surface this to logs / UI; the slideshow remains
-paused on its current image.
+paused on its current image. Like `playback`, it names the sessions on the
+receiving ws whose channel came up empty in `sessionIds`; show it in those
+windows only.
 
 ```json
-{ "action": "searchEmpty", "payload": { "query": "cats rare:tag" } }
+{ "action": "searchEmpty", "sessionIds": ["win1"], "payload": { "query": "cats rare:tag" } }
 ```
 
 ### Effect frames
