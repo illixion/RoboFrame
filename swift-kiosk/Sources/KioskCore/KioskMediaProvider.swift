@@ -19,7 +19,7 @@ import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
-import RAVERoboFrame
+import RoboFrameKit
 import RAVESlideshowCore
 
 public enum KioskMediaError: Error, CustomStringConvertible {

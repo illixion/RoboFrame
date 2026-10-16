@@ -1,5 +1,5 @@
 import Foundation
-import RAVERoboFrame
+import RoboFrameKit
 
 enum ProfileMode: String, Codable, CaseIterable, Identifiable {
     case slideshow

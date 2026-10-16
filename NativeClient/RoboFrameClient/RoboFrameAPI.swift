@@ -1,5 +1,5 @@
 import Foundation
-import RAVERoboFrame
+import RoboFrameKit
 import RAVESlideshow
 
 actor RoboFrameAPI {

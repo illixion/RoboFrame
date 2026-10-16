@@ -2,8 +2,9 @@
 # Builds the kiosk for the Pi (Linux, arm64) in Docker and leaves the stripped
 # binary at swift-kiosk/dist/roboframe-kiosk.
 #
-# The package reaches RAVESDK by path (../../RAVESDK), and RAVESDK reaches
-# DebugTrace and vergence beside it, so those checkouts are copied into a
+# The package reaches RoboFrameKit (../RoboFrameKit) and RAVESDK
+# (../../RAVESDK) by path, and RAVESDK reaches DebugTrace and vergence beside
+# it, so RoboFrameKit and those checkouts are copied into a
 # directory under $HOME first: Colima and Docker Desktop share the home
 # directory, not /tmp, where worktrees live. Builds stay in that directory
 # between runs, so a rebuild is incremental.
@@ -35,6 +36,7 @@ for package in RAVESDK DebugTrace vergence; do
     sync "$projects/$package" "$cache/src/$package"
 done
 sync "$kiosk" "$cache/src/RoboFrame/swift-kiosk"
+sync "$kiosk/../RoboFrameKit" "$cache/src/RoboFrame/RoboFrameKit"
 
 # --static-swift-stdlib links the Swift runtime and Foundation in; SDL2,
 # libmpv, GLES and libcurl stay dynamic and come from the Pi's Debian.

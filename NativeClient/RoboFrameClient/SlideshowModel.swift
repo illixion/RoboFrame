@@ -10,7 +10,7 @@
 import AVFoundation
 import Foundation
 import Observation
-import RAVERoboFrame
+import RoboFrameKit
 import RAVESlideshow
 
 @MainActor @Observable

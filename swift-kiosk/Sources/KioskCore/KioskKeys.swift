@@ -20,7 +20,7 @@ import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
-import RAVERoboFrame
+import RoboFrameKit
 
 public enum KioskKey: Equatable, Sendable {
     case character(Character, control: Bool = false)

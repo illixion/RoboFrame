@@ -5,7 +5,7 @@
  WebSocket `showText` alerts.
  */
 
-import RAVERoboFrame
+import RoboFrameKit
 import SwiftUI
 
 struct AlertOverlayView: View {

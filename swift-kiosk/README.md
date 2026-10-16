@@ -2,9 +2,9 @@
 
 The Swift frontend for Pi-class RoboFrame displays, and the successor to
 [`native-kiosk`](../native-kiosk) (Python + pygame). It runs the same protocol
-client and slideshow engine as Hypnos's remote viewer and the NativeClient
-app (RAVESDK's `RAVERoboFrame` and `RAVESlideshowCore`), so every Swift
-frontend joins, reports and follows the server the same way.
+client and slideshow engine as the NativeClient app (this repo's
+[`RoboFrameKit`](../RoboFrameKit) and RAVESDK's `RAVESlideshowCore`), so both
+Swift frontends join, report and follow the server the same way.
 
 **Status:** the Pi 3 kiosk's frontend (kiosk-pi3), with native-kiosk as
 its fallback. It joins its channel, follows `playback`, crossfades photos
@@ -102,7 +102,7 @@ scripts/build-linux.sh        # → dist/roboframe-kiosk
 
 It builds `docker/build.Dockerfile` (the Swift toolchain plus the renderer's
 headers) the first time, copies this package and its sibling checkouts
-(RAVESDK, DebugTrace, vergence) under `~/Library/Caches` (Colima only shares
+(RoboFrameKit, RAVESDK, DebugTrace, vergence) under `~/Library/Caches` (Colima only shares
 the home directory), and keeps the build there, so later builds are
 incremental.
 

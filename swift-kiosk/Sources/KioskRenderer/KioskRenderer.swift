@@ -41,7 +41,7 @@ import FoundationNetworking
 #endif
 import KioskCore
 import RAVENet
-import RAVERoboFrame
+import RoboFrameKit
 import RAVESlideshowCore
 
 public enum KioskRendererError: Error, CustomStringConvertible {

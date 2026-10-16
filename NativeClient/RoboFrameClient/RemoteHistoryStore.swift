@@ -8,7 +8,7 @@
 
 import Foundation
 import Observation
-import RAVERoboFrame
+import RoboFrameKit
 
 @MainActor @Observable
 final class RemoteHistoryStore {

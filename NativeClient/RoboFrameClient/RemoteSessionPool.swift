@@ -1,7 +1,7 @@
 import DebugTrace
 import Foundation
 import RAVENet
-import RAVERoboFrame
+import RoboFrameKit
 
 /// One `RoboFrameConnection` per server URL, shared by every window that
 /// points at it; each window is a session on it. The last window to leave

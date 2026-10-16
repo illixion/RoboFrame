@@ -43,7 +43,7 @@ import Foundation
 import FoundationNetworking
 #endif
 import RAVENet
-import RAVERoboFrame
+import RoboFrameKit
 import RAVESlideshowCore
 
 @MainActor

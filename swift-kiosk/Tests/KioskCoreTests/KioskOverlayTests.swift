@@ -1,6 +1,6 @@
 import Foundation
 import RAVENet
-import RAVERoboFrame
+import RoboFrameKit
 import Testing
 @testable import KioskCore
 
