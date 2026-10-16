@@ -7,8 +7,12 @@
  - Every `playback.current` becomes the engine's authoritative item; the
    upcoming list bounds its prefetch (1 deep: a Pi 3 has 1 GB).
  - The engine's finished transition is the frame on screen, and that is when
-   `imageReady` goes out, once per post, with a video's indexed length so
-   the server dwells for the whole clip.
+   `imageReady` goes out, once per post. A video post goes out once the
+   player is actually playing it, not when the engine hands over its URL,
+   with its indexed length (or the player's, when the library has none) so
+   the server dwells for the whole clip. Every `slideshowConfig` re-arms the
+   report: the server answers one by re-announcing the frame on screen and
+   waiting for it to be confirmed again.
  - `displayState` for this deviceId is the panel: off reports the session
    absent and invisible and stops reporting `imageReady` (a hidden session is
    outside the readiness barrier), on reports it back. node-display, running
@@ -122,6 +126,12 @@ public final class KioskSession {
     private var reportedReadyID: Int?
     private var screen: (width: Int, height: Int)
     var screenHeight: Int { screen.height }
+    /// The renderer's latest screen size, applied once the panel has been on
+    /// for `screenSettle`.
+    private var reportedScreen: (width: Int, height: Int)?
+    /// When the panel last came on; the distant past until it first goes off.
+    private var panelOnSince: TimeInterval = -.infinity
+    var screenSettle: TimeInterval = 2
     private var lastPlayback: RoboFramePlayback?
     private var backSteps = 0
     private var holdTask: Task<Void, Never>?
@@ -131,6 +141,10 @@ public final class KioskSession {
     private var ticker: Task<Void, Never>?
     private var lastConnected: TimeInterval
     private var failedVideos: [Int: Int] = [:]
+    /// A video post on screen whose player hasn't started yet.
+    private var awaitingVideo: RAVESlideshowDisplayedMedia?
+    /// The video the player last started, and its length in ms when known.
+    private var startedVideo: (id: String, durationMs: Int?)?
     var awaitingTagList = false
     public internal(set) var isDisplaySyncOn = false
     var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
@@ -194,10 +208,26 @@ public final class KioskSession {
 
     /// The real display mode, once the renderer knows it. Re-joins the
     /// channel so the server's prefetch is keyed to the new size.
+    ///
+    /// Not while the panel is off, nor in the moment after it comes on:
+    /// node-display turns the panel off by disabling X's output, which drops
+    /// the screen to 320x200 until it's back. That isn't a size to fetch
+    /// posts at, and each re-join makes the server restart the channel (it
+    /// re-commits the frame, and with nobody present runs its dwell blind).
+    /// The size the renderer last reported is applied once the panel has
+    /// been on for `screenSettle`, from `tick`.
     public func setScreenSize(width: Int, height: Int) {
-        guard width > 0, height > 0, (width, height) != screen else { return }
-        screen = (width, height)
-        provider.setScreenSize(width: width, height: height)
+        guard width > 0, height > 0 else { return }
+        reportedScreen = (width, height)
+        applyScreenSize()
+    }
+
+    private func applyScreenSize() {
+        guard let reported = reportedScreen, isPanelOn, now - panelOnSince >= screenSettle else { return }
+        reportedScreen = nil
+        guard reported != screen else { return }
+        screen = reported
+        provider.setScreenSize(width: reported.width, height: reported.height)
         if connection.isConnected { sendSlideshowConfig() }
     }
 
@@ -212,6 +242,7 @@ public final class KioskSession {
             onChange?()
         }
         updateBright()
+        applyScreenSize()
         if let menu, now - menu.lastInput >= KioskMenuState.timeout {
             self.menu = nil
             onChange?()
@@ -264,12 +295,21 @@ public final class KioskSession {
         connection.sendRequestNext(sessionId: Self.sessionId)
     }
 
+    /// The next frame was asked for (it replaces a post the person moved
+    /// past, blocked or reshuffled away), so it is the target at once.
     private func markNavIntent() { navIntentUntil = now + Self.navIntentWindow }
-    public func reshuffle() { connection.sendReshuffle(sessionId: Self.sessionId) }
-    public func setTagList(_ index: Int) { connection.sendSetTagList(sessionId: Self.sessionId, listNumber: index) }
+    public func reshuffle() {
+        markNavIntent()
+        connection.sendReshuffle(sessionId: Self.sessionId)
+    }
+    public func setTagList(_ index: Int) {
+        markNavIntent()
+        connection.sendSetTagList(sessionId: Self.sessionId, listNumber: index)
+    }
     public func setDisplaySync(_ enabled: Bool) { connection.sendDisplaySync(sessionId: Self.sessionId, enabled: enabled) }
     public func blockCurrent() {
         guard let id = currentPostID else { return }
+        markNavIntent()
         connection.sendBlock(postId: id)
     }
 
@@ -360,6 +400,16 @@ public final class KioskSession {
 
     // MARK: - Protocol
 
+    /// The renderer's player started the video post `id` (or found it can't
+    /// play video at all: `durationMs` nil and no player). That is when it is
+    /// on screen, so its `imageReady` goes out now if it was waiting.
+    public func videoStarted(_ id: String, durationMs: Int?) {
+        startedVideo = (id, durationMs)
+        guard let waiting = awaitingVideo, waiting.item.id == id else { return }
+        awaitingVideo = nil
+        didDisplay(waiting)
+    }
+
     /// The renderer couldn't play a video post. One more try, as a network
     /// blip deserves; a second failure skips it, since the server would
     /// otherwise hold the channel on it until its readiness timeout.
@@ -384,6 +434,9 @@ public final class KioskSession {
     }
 
     private func sendSlideshowConfig() {
+        // The server re-announces the frame on screen when a lone session
+        // re-joins, and waits for it to be confirmed again.
+        reportedReadyID = nil
         let ratio = config.ratioFilter && screen.height > 0
             ? (Double(screen.width) / Double(screen.height) * 10_000).rounded() / 10_000
             : nil
@@ -490,6 +543,7 @@ public final class KioskSession {
         guard on != isPanelOn else { return }
         logger.log(.info, "panel \(on ? "on" : "off", privacy: .public)")
         isPanelOn = on
+        if on { panelOnSince = now }
         showingChanged()
     }
 
@@ -527,8 +581,17 @@ public final class KioskSession {
     private func didDisplay(_ displayed: RAVESlideshowDisplayedMedia) {
         // A post `←` brought back isn't the channel's, so it isn't reported.
         guard isShowing, !isHolding, let post = RoboFramePost(slideshowItem: displayed.item), reportedReadyID != post.id else { return }
+        var durationMs = post.durationMs
+        if case .video = displayed.media {
+            guard let started = startedVideo, started.id == displayed.item.id else {
+                awaitingVideo = displayed
+                return
+            }
+            durationMs = durationMs ?? started.durationMs
+        }
+        awaitingVideo = nil
         reportedReadyID = post.id
         logger.log(.info, "showing post \(post.id) (\(post.ext, privacy: .public))")
-        connection.sendImageReady(sessionId: Self.sessionId, postId: post.id, durationMs: post.durationMs)
+        connection.sendImageReady(sessionId: Self.sessionId, postId: post.id, durationMs: durationMs)
     }
 }

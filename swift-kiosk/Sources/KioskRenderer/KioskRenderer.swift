@@ -92,6 +92,7 @@ public final class KioskRenderer {
     private var photos: [String: DecodedPhoto] = [:]
     private var photoSlots: [GLPhotoSlot] = []
     private var videoTargets: [GLRenderTarget] = []
+    private var videoTargetRetryAt: TimeInterval = 0
     private var decoding: Set<String> = []
     private var unplayable: Set<String> = []
     private var front: Layer?
@@ -365,13 +366,17 @@ public final class KioskRenderer {
             begin(Layer(id: id, content: .photo(slot), start: now))
         case .video(let url, _):
             guard pendingVideo?.id != id, effect == nil, let player else {
-                if self.player == nil { unplayable.insert(id) }
+                if self.player == nil {
+                    // No mpv: nothing will start it, so confirm the frame as it is.
+                    unplayable.insert(id)
+                    session.videoStarted(id, durationMs: nil)
+                }
                 return
             }
             guard let target = freeVideoTarget() else { return }
             pendingVideo = (id, url, target)
             owner = .slideshow(id)
-            player.load(url, options: VideoPlayer.Options(loop: loops(target: engineItem(id)), audio: false))
+            player.load(url, options: VideoPlayer.Options(loop: loops(target: engineItem(id)), audio: false, holdLastFrame: true))
             logger.log(.info, "loading video for post \(id)")
         }
     }
@@ -391,6 +396,9 @@ public final class KioskRenderer {
 
     /// A video target no layer is showing, blacked out. Up to three exist:
     /// the video on screen, one fading in over it, and an effect over both.
+    /// Nil while all three are busy, and for a while after one couldn't be
+    /// made: retrying every frame would keep pressing on the CMA pool that
+    /// just ran out, the condition that wedges the Pi's decoder.
     private func freeVideoTarget() -> GLRenderTarget? {
         var used: [GLRenderTarget] = []
         for layer in [front, fade?.layer].compactMap({ $0 }) {
@@ -398,27 +406,37 @@ public final class KioskRenderer {
         }
         if let pendingVideo { used.append(pendingVideo.target) }
         if let effect { used.append(effect.target) }
+        // Videos are capped at 720p, so a target any bigger only costs memory.
+        let targetHeight = min(height, 720)
+        let targetWidth = Int((Double(width) * Double(targetHeight) / Double(height)).rounded())
+        // A free target made for another screen size (one made while the
+        // panel was off and X ran at 320x200) is replaced, not reused.
+        videoTargets.removeAll { target in
+            !used.contains { $0 === target } && (target.texture.width != targetWidth || target.texture.height != targetHeight)
+        }
         if let free = videoTargets.first(where: { target in !used.contains { $0 === target } }) {
             free.clear()
             return free
         }
-        guard videoTargets.count < 3 else { return nil }
-        // Videos are capped at 720p, so a target any bigger only costs memory.
-        let targetHeight = min(height, 720)
-        let targetWidth = Int((Double(width) * Double(targetHeight) / Double(height)).rounded())
+        guard videoTargets.count < 3, now >= videoTargetRetryAt else { return nil }
         do {
             let target = try GLRenderTarget(width: targetWidth, height: targetHeight)
             videoTargets.append(target)
             return target
         } catch {
             logger.log(.error, "video target: \(String(describing: error), privacy: .public)")
+            videoTargetRetryAt = now + 5
             return nil
         }
     }
 
-    /// The two photo textures, sized to the screen.
+    /// The two photo textures, sized to the screen. Kept when the screen
+    /// shrinks (every panel off drops X to 320x200 and back), since a photo
+    /// fits a larger slot; reallocating them is the CMA churn GL.swift avoids.
     private func makePhotoSlots() {
-        photoSlots = (0..<2).map { _ in GLPhotoSlot(width: min(width, maxTextureSize), height: min(height, maxTextureSize)) }
+        let slotWidth = min(width, maxTextureSize), slotHeight = min(height, maxTextureSize)
+        if let slot = photoSlots.first, slot.texture.width >= slotWidth, slot.texture.height >= slotHeight { return }
+        photoSlots = (0..<2).map { _ in GLPhotoSlot(width: slotWidth, height: slotHeight) }
     }
 
     /// Photos are decoded as soon as the engine has their bytes, so a
@@ -441,13 +459,16 @@ public final class KioskRenderer {
             let maxWidth = min(width, maxTextureSize), maxHeight = min(height, maxTextureSize)
             Task.detached(priority: .userInitiated) {
                 let image = DecodedPhoto.decode(data, maxWidth: maxWidth, maxHeight: maxHeight)
-                await MainActor.run { [weak self] in self?.decoded(id, image) }
+                await MainActor.run { [weak self] in self?.decoded(id, image, maxWidth: maxWidth, maxHeight: maxHeight) }
             }
         }
     }
 
-    private func decoded(_ id: String, _ image: DecodedPhoto?) {
+    private func decoded(_ id: String, _ image: DecodedPhoto?, maxWidth: Int, maxHeight: Int) {
         decoding.remove(id)
+        // Fitted to a screen size that has since changed: decoded again at
+        // the new one on the next tick.
+        guard maxWidth == min(width, maxTextureSize), maxHeight == min(height, maxTextureSize) else { return }
         guard let image else {
             logger.log(.warning, "couldn't decode post \(id)")
             unplayable.insert(id)
@@ -493,6 +514,8 @@ public final class KioskRenderer {
                     pendingVideo = nil
                     logger.log(.info, "video for post \(id) playing: \(player.property("video-codec") ?? "?", privacy: .public) \(player.property("width") ?? "?", privacy: .public)x\(player.property("height") ?? "?", privacy: .public), hwdec=\(player.property("hwdec-current") ?? "no", privacy: .public)")
                     begin(Layer(id: id, content: .video(pending.target, pending.url), start: now))
+                    let seconds = player.property("duration").flatMap(Double.init).flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+                    session.videoStarted(id, durationMs: seconds.map { Int(($0 * 1_000).rounded()) })
                 case (.slideshow(let id), .failed(let reason)):
                     logger.log(.warning, "video for post \(id) failed: \(reason)")
                     if pendingVideo?.id == id { pendingVideo = nil }
@@ -530,7 +553,11 @@ public final class KioskRenderer {
                 stopPlayer()
                 resumeSlideshowVideo()
             }
-            if let value = session.effect, let player, let target = freeVideoTarget() {
+            if session.effect != nil, player == nil {
+                // Nothing can play it; let the session drop it rather than
+                // asking again every frame.
+                session.effectEnded()
+            } else if let value = session.effect, let player, let target = freeVideoTarget() {
                 effect = (value, target, nil)
                 owner = .effect
                 pendingVideo = nil
@@ -568,7 +595,7 @@ public final class KioskRenderer {
     private func resumeSlideshowVideo() {
         guard let player, let layer = fade?.layer ?? front, case .video(_, let url) = layer.content else { return }
         owner = .slideshow(layer.id)
-        player.load(url, options: VideoPlayer.Options(loop: loops(target: engineItem(layer.id)), audio: false))
+        player.load(url, options: VideoPlayer.Options(loop: loops(target: engineItem(layer.id)), audio: false, holdLastFrame: true))
     }
 
     private func buildAlert(_ value: RoboFrameAlert) {
@@ -577,8 +604,9 @@ public final class KioskRenderer {
         layoutAlert(imageHeight: 0)
         guard let imageURL = value.imageURL.flatMap(resolve) else { return }
         let maxWidth = width / 4, maxHeight = height / 2
+        let maxBytes = session.config.maxMediaBytes
         Task { [weak self] in
-            guard let (data, _) = try? await URLSession.shared.data(from: imageURL) else { return }
+            guard let (data, _) = try? await URLSession.shared.data(from: imageURL), data.count <= maxBytes else { return }
             let image = await Task.detached { RGBAImage.decode(data, maxWidth: maxWidth, maxHeight: maxHeight) }.value
             guard let self, let image, self.alert?.value == value else { return }
             self.alert?.image = image.texture()
@@ -622,7 +650,14 @@ public final class KioskRenderer {
         guard let absolute = URL(string: url.relativeString, relativeTo: endpoint.baseURL)?.absoluteURL,
               var components = URLComponents(url: absolute, resolvingAgainstBaseURL: false) else { return nil }
         if ["/get", "/save"].contains(components.path) {
-            components.queryItems = (components.queryItems ?? []) + [URLQueryItem(name: "token", value: endpoint.accessToken)]
+            var items = components.queryItems ?? []
+            // A /get alert image is a post: ask for it at the size it's drawn
+            // and as JPEG, not the original (a 24 MP decode on a 1 GB Pi).
+            if components.path == "/get", !items.contains(where: { ["width", "height"].contains($0.name) }) {
+                items += [URLQueryItem(name: "width", value: String(width / 4)), URLQueryItem(name: "height", value: String(height / 2)),
+                          URLQueryItem(name: "convert", value: "1")]
+            }
+            components.queryItems = items + [URLQueryItem(name: "token", value: endpoint.accessToken)]
         }
         return components.url
     }
@@ -749,8 +784,15 @@ public final class KioskRenderer {
         while SDL_PollEvent(&event) != 0 {
             switch event.type {
             case SDL_QUIT.rawValue:
-                exit(0)
+                quit()
             case SDL_KEYDOWN.rawValue:
+                // X auto-repeats a held key (the keypad's passthrough keys
+                // too): one press is one action, as in native-kiosk. Only the
+                // menu's arrows repeat, to scroll.
+                if event.key.repeat != 0 {
+                    let arrows = [SDLK_UP, SDLK_DOWN, SDLK_LEFT, SDLK_RIGHT].map { Int($0.rawValue) }
+                    guard session.isMenuOpen, arrows.contains(Int(event.key.keysym.sym)) else { break }
+                }
                 handleKey(event.key.keysym)
             case SDL_WINDOWEVENT.rawValue:
                 if event.window.event == UInt8(SDL_WINDOWEVENT_SIZE_CHANGED.rawValue) { resized() }
@@ -767,7 +809,7 @@ public final class KioskRenderer {
         case Int(SDLK_ESCAPE.rawValue):
             // Closes the menu; otherwise, like native-kiosk, quits: the
             // launcher's xinit ends with us, and getty starts the session again.
-            guard session.isMenuOpen else { exit(0) }
+            guard session.isMenuOpen else { quit() }
             session.handleKey(.escape)
         case Int(SDLK_RIGHT.rawValue):
             session.handleKey(.right)
@@ -791,6 +833,17 @@ public final class KioskRenderer {
         default:
             break
         }
+    }
+
+    /// Ends the process now, status 0. exit() would run atexit handlers and
+    /// library teardown while mpv's and Mesa's threads are still running; a
+    /// crash in there reads as a failure to run-kiosk, which then gives up
+    /// on this frontend for native-kiosk.
+    private func quit() -> Never {
+        player?.stop()
+        audioPlayer?.stop()
+        fflush(nil)
+        _exit(0)
     }
 
     private func resized() {

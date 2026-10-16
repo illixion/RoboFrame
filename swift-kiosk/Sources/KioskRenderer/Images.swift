@@ -157,8 +157,21 @@ struct RGBAImage: Sendable {
         self.pixels = pixels
     }
 
+    /// Cropped to the GPU's texture limit (2048 on the Pi), which only an
+    /// overlay line far wider than the screen reaches: an oversized upload
+    /// fails and samples as a black bar instead.
     func texture() -> GLTexture {
-        pixels.withUnsafeBytes { GLTexture(width: width, height: height, rgba: $0.baseAddress) }
+        let limit = GLCompositor.maxTextureSize
+        guard limit > 0, width > limit || height > limit else {
+            return pixels.withUnsafeBytes { GLTexture(width: width, height: height, rgba: $0.baseAddress) }
+        }
+        let croppedWidth = min(width, limit), croppedHeight = min(height, limit)
+        var cropped = [UInt8](repeating: 0, count: croppedWidth * croppedHeight * 4)
+        for row in 0..<croppedHeight {
+            let source = row * width * 4
+            cropped.replaceSubrange(row * croppedWidth * 4 ..< (row + 1) * croppedWidth * 4, with: pixels[source ..< source + croppedWidth * 4])
+        }
+        return cropped.withUnsafeBytes { GLTexture(width: croppedWidth, height: croppedHeight, rgba: $0.baseAddress) }
     }
 }
 
@@ -359,13 +372,18 @@ final class TextSetter {
         return RGBAImage(surface: panel).roundingCorners(px(18))
     }
 
-    /// The largest size at which `text` fits in `width` x `height`.
+    /// The largest size at which `text` fits in `width` x `height`, from a
+    /// fixed ladder of sizes about 10 % apart. Every size measured is an open
+    /// font kept in `fonts`, so searching every integer would leave a new
+    /// handful behind for each alert text, for as long as the kiosk runs.
     func fittingSize(_ text: String, width: Int, height: Int) -> Int {
-        var low = 8, high = max(8, height), best = 8
+        let ladder = Self.fittingSizes
+        var low = 0, high = ladder.count - 1, best = ladder[0]
         while low <= high {
             let mid = (low + high) / 2
-            if self.width(of: text, size: mid) <= width && lineHeight(size: mid) <= height {
-                best = mid
+            let size = ladder[mid]
+            if size <= max(8, height), self.width(of: text, size: size) <= width && lineHeight(size: size) <= height {
+                best = size
                 low = mid + 1
             } else {
                 high = mid - 1
@@ -373,6 +391,13 @@ final class TextSetter {
         }
         return best
     }
+
+    /// 8 px up to 1080p's full height.
+    static let fittingSizes: [Int] = {
+        var sizes = [8]
+        while sizes.last! < 1080 { sizes.append(max(sizes.last! + 1, Int((Double(sizes.last!) * 1.1).rounded()))) }
+        return sizes
+    }()
 
     /// Splits text into runs of emoji and non-emoji characters. Coarse, but
     /// it covers the sensor symbols: Misc Symbols and Dingbats, the SMP emoji

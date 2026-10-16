@@ -11,7 +11,8 @@
  VideoCore can decode. An animated post comes back from the stills path as an
  mp4 (the response's Content-Type is the only signal), so it is handed to the
  player the same way, from its still URL; the server keeps that variant
- cached, so the second fetch is a cache hit.
+ cached, so the second fetch is a cache hit, and it asks without `record`,
+ since the first fetch already counted the view.
  */
 
 import Foundation
@@ -75,10 +76,11 @@ public final class KioskMediaProvider: RAVESlideshowContentProvider {
         let (data, response) = try await session.data(from: url)
         let http = response as? HTTPURLResponse
         if let status = http?.statusCode, status != 200 { throw KioskMediaError.status(status) }
-        if http?.value(forHTTPHeaderField: "Content-Type")?.lowercased().hasPrefix("video/") == true {
-            return .video(url: url, hlsURL: nil)
-        }
         guard data.count <= config.maxMediaBytes else { throw KioskMediaError.tooLarge(data.count) }
+        if http?.value(forHTTPHeaderField: "Content-Type")?.lowercased().hasPrefix("video/") == true {
+            guard let playerURL = stillURL(for: post, record: false) else { throw KioskMediaError.badURL }
+            return .video(url: playerURL, hlsURL: nil)
+        }
         return .still(data: data, displayURL: url)
     }
 
@@ -86,10 +88,10 @@ public final class KioskMediaProvider: RAVESlideshowContentProvider {
         nil
     }
 
-    /// `/get` for a still, sized to the screen. Recorded as a view.
-    public func stillURL(for post: RoboFramePost) -> URL? {
+    /// `/get` for a still, sized to the screen. Recorded as a view by default.
+    public func stillURL(for post: RoboFramePost, record: Bool = true) -> URL? {
         endpoint.mediaURL(postID: post.id, options: RoboFrameMediaOptions(
-            record: true,
+            record: record,
             width: screen.width,
             height: screen.height,
             convert: true,

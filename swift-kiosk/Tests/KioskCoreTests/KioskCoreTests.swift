@@ -49,6 +49,15 @@ struct KioskConfigTests {
         #expect(config.webSocketURL.absoluteString == "ws://localhost:3123/rpc/ws")
     }
 
+    @Test("A number past Int's range is ignored, not a crash on start")
+    func hugeNumber() throws {
+        let path = try write(#"{"accessToken":1e19,"kiosk":{"interval":1e19,"maxMediaBytes":-1e300}}"#)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let config = try KioskConfig.load(path: path, environment: [:])
+        #expect(config.intervalMs == 15_000)
+        #expect(config.accessToken == "1e+19")
+    }
+
     @Test("No token is an error, not an unauthenticated kiosk")
     func missingToken() {
         #expect(throws: KioskConfig.LoadError.self) {

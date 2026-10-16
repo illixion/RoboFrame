@@ -12,6 +12,12 @@
  one; the old one's texture keeps its last frame, which is what fades out.
  An audio-only `playAudio` clip gets its own instance with no video output.
 
+ Events are matched to the file they belong to by mpv's playlist entry id.
+ mpv's queue still holds whatever the previous file reported before the
+ `loadfile` (a looping clip wrapping around, an end of file), and taken for
+ the new file's, a stale restart faded in a black target and a stale end
+ skipped a clip that hadn't started.
+
  mpv needs LC_NUMERIC=C, set once before the first instance.
  */
 
@@ -34,12 +40,22 @@ final class VideoPlayer {
         var audio = false
         /// Live streams: no buffering, RTSP over TCP.
         var lowLatency = false
+        /// Pause on the last frame at the end instead of finishing: a
+        /// slideshow clip stays up until the server moves on. Effects and
+        /// audio finish, so the session hears that they ended.
+        var holdLastFrame = false
     }
 
     private let handle: OpaquePointer
     private var renderContext: OpaquePointer?
     private var loading = false
     private var paused = false
+    /// The playlist entry of the last `load`, and whether mpv has started it.
+    private var entryID: Int64?
+    private var entryStarted = false
+    /// mpv didn't say which entry the load made (it always has so far):
+    /// take every event as the current file's, as before ids were matched.
+    private var entryUnknown = false
     private let log: (String) -> Void
 
     /// `video: false` makes an audio-only player with no render context.
@@ -126,10 +142,25 @@ final class VideoPlayer {
         setProperty("aid", options.audio ? "auto" : "no")
         setProperty("cache", options.lowLatency ? "no" : "auto")
         setProperty("rtsp-transport", "tcp")
+        setProperty("keep-open", options.holdLastFrame ? "yes" : "no")
         setProperty("pause", "no")
         paused = false
         loading = true
         command(["loadfile", url.absoluteString, "replace"])
+        // `replace` leaves the new file as the playlist's only entry, and the
+        // command has run by the time mpv_command returns.
+        entryID = int64Property("playlist/0/id")
+        entryUnknown = entryID == nil
+        entryStarted = entryUnknown
+    }
+
+    private func isCurrent(_ playlistEntryID: Int64) -> Bool {
+        entryUnknown || playlistEntryID == entryID
+    }
+
+    private func int64Property(_ name: String) -> Int64? {
+        var value: Int64 = 0
+        return mpv_get_property(handle, name, MPV_FORMAT_INT64, &value) >= 0 ? value : nil
     }
 
     /// A property as text (`hwdec-current`, `video-codec`), or nil if unset.
@@ -141,6 +172,8 @@ final class VideoPlayer {
 
     func stop() {
         loading = false
+        entryID = nil
+        entryUnknown = false
         command(["stop"])
     }
 
@@ -155,14 +188,21 @@ final class VideoPlayer {
         var events: [Event] = []
         while let event = mpv_wait_event(handle, 0), event.pointee.event_id != MPV_EVENT_NONE {
             switch event.pointee.event_id {
+            case MPV_EVENT_START_FILE:
+                guard let data = event.pointee.data else { break }
+                let start = data.assumingMemoryBound(to: mpv_event_start_file.self).pointee
+                if isCurrent(start.playlist_entry_id) { entryStarted = true }
             case MPV_EVENT_PLAYBACK_RESTART:
-                if loading {
+                // Only once this load's file has started: anything before
+                // that is the previous file's.
+                if loading, entryStarted {
                     loading = false
                     events.append(.started)
                 }
             case MPV_EVENT_END_FILE:
                 guard let data = event.pointee.data else { break }
                 let end = data.assumingMemoryBound(to: mpv_event_end_file.self).pointee
+                guard isCurrent(end.playlist_entry_id) else { break }
                 if end.reason == MPV_END_FILE_REASON_ERROR {
                     loading = false
                     events.append(.failed(String(cString: mpv_error_string(end.error))))

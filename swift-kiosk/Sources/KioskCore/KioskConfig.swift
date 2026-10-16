@@ -281,7 +281,7 @@ enum JSONValue: Codable, Equatable, Sendable {
     var string: String? {
         switch self {
         case .string(let value): value
-        case .number(let value): value.rounded() == value ? String(Int(value)) : String(value)
+        case .number(let value): Int(exactly: value).map(String.init) ?? String(value)
         case .bool(let value): String(value)
         default: nil
         }
@@ -289,7 +289,8 @@ enum JSONValue: Codable, Equatable, Sendable {
 
     var int: Int? {
         switch self {
-        case .number(let value): value.isFinite ? Int(value) : nil
+        // Int(_:) traps past Int's range; a hand-edited 1e19 is just invalid.
+        case .number(let value): Int(exactly: value.rounded(.towardZero))
         case .string(let value): Int(value.trimmingCharacters(in: .whitespaces))
         default: nil
         }

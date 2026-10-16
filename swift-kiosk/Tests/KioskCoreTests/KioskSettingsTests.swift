@@ -133,6 +133,33 @@ struct KioskMenuTests {
         #expect(session.isShowing)
     }
 
+    @Test("The 320x200 screen X falls back to while the panel is off never reaches the server")
+    func screenSizeWhilePanelOff() throws {
+        let session = try session()
+        let post = RoboFramePost(id: 5, ext: "jpg")
+        func requestedSize() -> String? {
+            let items = URLComponents(url: session.provider.stillURL(for: post)!, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            return items.first { $0.name == "width" }?.value
+        }
+        session.setScreenSize(width: 1920, height: 1080)
+        #expect(requestedSize() == "1920")
+
+        session.handle(.displayState(target: "d", on: false))
+        session.setScreenSize(width: 320, height: 200)
+        #expect(requestedSize() == "1920")
+
+        // Just back on, X hasn't restored its mode yet: still settling.
+        session.handle(.displayState(target: "d", on: true))
+        session.setScreenSize(width: 320, height: 200)
+        session.tick()
+        #expect(requestedSize() == "1920")
+
+        // A real change, once settled, applies.
+        session.screenSettle = 0
+        session.setScreenSize(width: 1280, height: 720)
+        #expect(requestedSize() == "1280")
+    }
+
     @Test("A refused token and an empty query say so on screen until resolved")
     func banners() throws {
         let session = try session()
