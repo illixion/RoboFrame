@@ -8,9 +8,16 @@ const path = require('path');
  *
  * Resolution order (highest precedence wins):
  *   1. Process env vars (preserves existing systemd units)
- *   2. roboframe.config.json (located by ROBOFRAME_CONFIG env var, or by
+ *   2. roboframe.secrets.json (ROBOFRAME_SECRETS, or beside the config file)
+ *   3. roboframe.config.json (located by ROBOFRAME_CONFIG env var, or by
  *      walking up from process.cwd() looking for the file)
- *   3. Hard-coded defaults
+ *   4. Hard-coded defaults
+ *
+ * The secrets file has the config's own shape and is merged over it, so
+ * tokens and passwords (`accessToken`, `server.rpcToken`, `server.ha.token`,
+ * `server.mqtt.password`, `display.webcam.tokens`) live apart from the
+ * settings people open, grep and paste while tuning a deployment. Either
+ * file may hold any key; the split is a convention, not a schema.
  *
  * Each service calls `loadConfig()` to get the full tree, then pulls its
  * own section. Per-service env overrides are applied via `pickEnv()` at
@@ -32,18 +39,45 @@ function findConfigFile() {
     return null;
 }
 
+function findSecretsFile(configPath) {
+    if (process.env.ROBOFRAME_SECRETS) {
+        return path.resolve(process.env.ROBOFRAME_SECRETS);
+    }
+    if (!configPath) return null;
+    const candidate = path.join(path.dirname(configPath), 'roboframe.secrets.json');
+    return fs.existsSync(candidate) ? candidate : null;
+}
+
+function readJson(file) {
+    if (!file) return {};
+    try {
+        return JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (err) {
+        // The message names the file and position, never its contents.
+        console.warn(`Failed to read ${file}: ${err.message}`);
+        return {};
+    }
+}
+
+function isPlainObject(v) {
+    return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+// Objects merge key by key; anything else in `over` replaces `base`.
+function deepMerge(base, over) {
+    const out = { ...base };
+    for (const [key, value] of Object.entries(over)) {
+        out[key] = isPlainObject(value) && isPlainObject(out[key]) ? deepMerge(out[key], value) : value;
+    }
+    return out;
+}
+
 let _cached = null;
 function loadConfig({ reload = false } = {}) {
     if (_cached && !reload) return _cached;
     const configPath = findConfigFile();
-    let raw = {};
-    if (configPath) {
-        try {
-            raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-        } catch (err) {
-            console.warn(`Failed to parse ${configPath}: ${err.message}`);
-        }
-    }
+    const secretsPath = findSecretsFile(configPath);
+    const raw = deepMerge(readJson(configPath), readJson(secretsPath));
     const accessToken = raw.accessToken || '';
     const deviceId = raw.deviceId || '';
     const server = raw.server || {};
@@ -59,6 +93,7 @@ function loadConfig({ reload = false } = {}) {
         server: { ...server, ha: { ...(server.ha || {}) }, slideshow: { ...(server.slideshow || {}) } },
         display: { ...display, pirHttp: { ...(display.pirHttp || {}) }, nightLight: { ...(display.nightLight || {}) }, webcam: { ...(display.webcam || {}) } },
         configPath,
+        secretsPath,
     };
     return _cached;
 }
@@ -91,4 +126,4 @@ function cast(s, type, fallback) {
     return String(s);
 }
 
-module.exports = { loadConfig, findConfigFile, pickEnv };
+module.exports = { loadConfig, findConfigFile, findSecretsFile, deepMerge, pickEnv };

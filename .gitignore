@@ -5,8 +5,9 @@ node_modules/
 .env
 *.env.local
 
-# Unified config (contains rpcToken, HA token, etc.)
+# Unified config, and the tokens and passwords merged over it
 roboframe.config.json
+roboframe.secrets.json
 
 # Database files
 *.duckdb

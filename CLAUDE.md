@@ -263,6 +263,11 @@ the deadline) is the canary for the wake-advance class of bug.
 - **Two token tiers.** `accessToken` (kiosk tier) ≠ `rpcToken`
   (privileged tier). They must differ. `rpcsend` over WebSocket and
   HTTP `/rpc/send` both require the rpc tier.
+- **Credentials live in `roboframe.secrets.json`, not the config.** All
+  three loaders (`packages/shared`, native-kiosk, swift-kiosk) deep-merge it
+  over `roboframe.config.json`, so the config is safe to read and grep.
+  Never print the secrets file or a token value; to see what it holds, list
+  key names only. `scripts/split-secrets.js` migrates an old config.
 - **MQTT bridge auto-disables.** Empty `mqtt.url` makes every method
   on `createMqttBridge` a no-op — the rest of the broker doesn't
   feature-detect.

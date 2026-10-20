@@ -1,10 +1,11 @@
 /*
  Kiosk configuration
 
- Read from `roboframe.config.json` (path in ROBOFRAME_CONFIG): the top-level
- `accessToken` and `deviceId`, and the `kiosk` block native-kiosk already
- uses, so one config drives either frontend. Environment variables override
- the file, under native-kiosk's names.
+ Read from `roboframe.config.json` (path in ROBOFRAME_CONFIG), with
+ `roboframe.secrets.json` beside it (or ROBOFRAME_SECRETS) merged over it:
+ the top-level `accessToken` and `deviceId`, and the `kiosk` block
+ native-kiosk already uses, so one config drives either frontend.
+ Environment variables override both files, under native-kiosk's names.
 
  What the on-screen settings menu changes is saved apart from both, in the
  settings file (`KIOSK_SETTINGS`, or `kiosk.settingsPath`), and wins over
@@ -130,6 +131,25 @@ public struct KioskConfig: Equatable, Sendable {
 
     static func clampBrightness(_ value: Int) -> Int { min(100, max(10, value)) }
 
+    /// `roboframe.secrets.json`, the config's shape holding its tokens:
+    /// ROBOFRAME_SECRETS, else beside the config file, as packages/shared finds it.
+    static func secretsPath(configPath: String?, environment: [String: String]) -> String? {
+        if let path = environment["ROBOFRAME_SECRETS"], !path.isEmpty { return path }
+        guard let configPath else { return nil }
+        return URL(fileURLWithPath: configPath).deletingLastPathComponent()
+            .appendingPathComponent("roboframe.secrets.json").path
+    }
+
+    private static func readObject(_ path: String?) throws -> [String: JSONValue] {
+        guard let path, FileManager.default.fileExists(atPath: path) else { return [:] }
+        do {
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            return try JSONDecoder().decode([String: JSONValue].self, from: data)
+        } catch {
+            throw LoadError.unreadable("\(path): \(error)")
+        }
+    }
+
     public enum LoadError: Error, CustomStringConvertible {
         case unreadable(String)
         case missingToken
@@ -137,24 +157,17 @@ public struct KioskConfig: Equatable, Sendable {
 
         public var description: String {
             switch self {
-            case .unreadable(let detail): "can't read the config file: \(detail)"
+            case .unreadable(let detail): "can't read \(detail)"
             case .missingToken: "an access token is required (top-level accessToken, or ACCESS_TOKEN)"
             case .badWebSocketURL: "the WebSocket URL isn't a ws:// or wss:// URL"
             }
         }
     }
 
-    /// Load from the file at `path` (if any), then apply `environment`.
+    /// Load from the file at `path` (if any) with the secrets file merged
+    /// over it, then apply `environment`.
     public static func load(path: String?, environment: [String: String]) throws -> KioskConfig {
-        var root: [String: JSONValue] = [:]
-        if let path, FileManager.default.fileExists(atPath: path) {
-            do {
-                let data = try Data(contentsOf: URL(fileURLWithPath: path))
-                root = try JSONDecoder().decode([String: JSONValue].self, from: data)
-            } catch {
-                throw LoadError.unreadable(String(describing: error))
-            }
-        }
+        let root = JSONValue.merge(try readObject(path), try readObject(secretsPath(configPath: path, environment: environment)))
         let kiosk = root["kiosk"]?.object ?? [:]
         let display = root["display"]?.object ?? [:]
         let settingsPath = environment["KIOSK_SETTINGS"].flatMap { $0.isEmpty ? nil : $0 }
@@ -275,6 +288,14 @@ enum JSONValue: Codable, Equatable, Sendable {
         case .array(let value): try container.encode(value)
         case .object(let value): try container.encode(value)
         case .null: try container.encodeNil()
+        }
+    }
+
+    /// Objects merge key by key; anything else in `over` replaces `base`.
+    static func merge(_ base: [String: JSONValue], _ over: [String: JSONValue]) -> [String: JSONValue] {
+        base.merging(over) { old, new in
+            if case .object(let a) = old, case .object(let b) = new { return .object(merge(a, b)) }
+            return new
         }
     }
 

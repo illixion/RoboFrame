@@ -212,15 +212,25 @@ root. Copy the example to start:
 
 ```bash
 cp roboframe.config.example.json roboframe.config.json
-$EDITOR roboframe.config.json
+cp roboframe.secrets.example.json roboframe.secrets.json && chmod 600 roboframe.secrets.json
+$EDITOR roboframe.config.json roboframe.secrets.json
 ```
 
-The file is gitignored. Environment variables override anything in it (so
-existing systemd units with `Environment=PORT=...` keep working as-is).
-Resolution order: **env var → config file → built-in default**.
+Tokens and passwords (`accessToken`, `server.rpcToken`, `server.ha.token`,
+`server.mqtt.password`, `display.webcam.tokens`) go in
+`roboframe.secrets.json` beside the config. It has the config's own shape and
+is merged over it key by key, so the settings file you open, grep and paste
+while tuning a deployment holds no credentials. Both files are gitignored.
+`node scripts/split-secrets.js [path/to/roboframe.config.json]` moves those
+keys out of an existing config, printing only their names.
 
-The loader walks up from the working directory looking for the file, or you
-can point it explicitly via `ROBOFRAME_CONFIG=/path/to/file`.
+Environment variables override anything in either file (so existing systemd
+units with `Environment=PORT=...` keep working as-is). Resolution order:
+**env var → secrets file → config file → built-in default**.
+
+The loader walks up from the working directory looking for the config, or you
+can point it explicitly via `ROBOFRAME_CONFIG=/path/to/file`. The secrets file
+is read from beside it, or from `ROBOFRAME_SECRETS=/path/to/file`.
 
 The keys below show the env-var name and the corresponding nested path in
 the config file (e.g. `IMAGE_DB_PATH` ↔ `imagemirror.imageDbPath`).

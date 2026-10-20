@@ -31,6 +31,23 @@ struct KioskSettingsTests {
         #expect(config.settingsPath == settingsPath)
     }
 
+    @Test("The secrets file beside the config is merged over it")
+    func secretsFile() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("kiosk-secrets-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let configPath = dir.appendingPathComponent("roboframe.config.json").path
+        try Data(#"{"accessToken":"old","deviceId":"den","kiosk":{"interval":20000}}"#.utf8)
+            .write(to: URL(fileURLWithPath: configPath))
+        try Data(#"{"accessToken":"s","kiosk":{"modTags":["x"]}}"#.utf8)
+            .write(to: dir.appendingPathComponent("roboframe.secrets.json"))
+        let config = try KioskConfig.load(path: configPath, environment: ["KIOSK_SETTINGS": dir.appendingPathComponent("none.json").path])
+        #expect(config.accessToken == "s")
+        // A nested block merges instead of replacing the config's.
+        #expect(config.intervalMs == 20_000 && config.modTags == ["x"] && config.deviceId == "den")
+        #expect(try KioskConfig.load(path: configPath, environment: ["ACCESS_TOKEN": "e"]).accessToken == "e")
+    }
+
     @Test("Defaults: Ken Burns, a whole photo on its blurred copy, every overlay on")
     func defaults() throws {
         let config = try KioskConfig.load(path: nil, environment: ["ACCESS_TOKEN": "t", "HOME": "/home/kiosk"])

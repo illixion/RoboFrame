@@ -136,15 +136,43 @@ def _walk_for_config():
     return None
 
 
+def _secrets_path(config_path):
+    """roboframe.secrets.json: ROBOFRAME_SECRETS, else beside the config."""
+    if env := os.environ.get("ROBOFRAME_SECRETS"):
+        return Path(env).resolve()
+    if config_path is None:
+        return None
+    cand = config_path.parent / "roboframe.secrets.json"
+    return cand if cand.exists() else None
+
+
+def _read_json(path):
+    if path is None:
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception as e:
+        # Names the file and the parse position, never its contents.
+        log.warning("Failed to read %s: %s", path, e)
+        return {}
+
+
+def _deep_merge(base, over):
+    """Objects merge key by key; anything else in `over` replaces `base`."""
+    out = dict(base)
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
 def load_config():
-    """Mirror packages/shared resolution: env > roboframe.config.json > default."""
-    raw = {}
+    """Mirror packages/shared resolution:
+    env > roboframe.secrets.json > roboframe.config.json > default."""
     path = _walk_for_config()
-    if path:
-        try:
-            raw = json.loads(path.read_text())
-        except Exception as e:
-            log.warning("Failed to read %s: %s", path, e)
+    raw = _deep_merge(_read_json(path), _read_json(_secrets_path(path)))
     kiosk = raw.get("kiosk", {}) or {}
     display = raw.get("display", {}) or {}
 

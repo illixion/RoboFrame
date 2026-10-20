@@ -1,8 +1,5 @@
 {
-  "_comment": "Copy this to roboframe.config.json and fill in your values. The file is gitignored. Per-service .env files keep working — env vars override anything in this file.",
-
-  "accessToken": "REPLACE_ME_DIFFERENT_FROM_RPC_TOKEN",
-  "_accessTokenComment": "Read-mostly token shared by every WebSocket consumer (kiosks, node-display, hypnos). Required to connect to /rpc/ws but cannot call privileged `rpcsend`. Top-level so the same value can be copied to client and server configs.",
+  "_comment": "Copy this to roboframe.config.json and fill in your values. The file is gitignored. Tokens and passwords go in roboframe.secrets.json beside it (see roboframe.secrets.example.json). Per-service .env files keep working — env vars override anything in either file.",
 
   "deviceId": "screen1",
   "_deviceIdComment": "Identifier this kiosk joins channels and HA entities under. Shared by node-display and native-kiosk on the same host (and by any browser kiosk URL that names this id via ?ws=). Override with the DEVICE_ID env var.",
@@ -11,7 +8,6 @@
     "_comment": "The merged Node server: image API + WebSocket broker + optional Home Assistant bridge, all in one process on one port.",
     "port": 3123,
     "host": "localhost",
-    "rpcToken": "REPLACE_ME_GENERATE_VIA_OPENSSL_RAND_HEX_16",
     "dataPath": null,
     "imageDbPath": "/path/to/your/images",
     "imageMirrorPath": "/path/to/optional/mirror",
@@ -37,14 +33,12 @@
     "ha": {
       "_comment": "Read-only sensor forwarder. With url+token set, the broker subscribes to the listed HA entities and pushes their state to kiosks via the `update` action so the frontend can render outdoor temperature, humidity, etc. Set enabled:false to force-disable.",
       "url": "",
-      "token": "",
       "filterEntities": []
     },
     "mqtt": {
       "_comment": "MQTT auto-discovery. With url set, the broker connects to the broker (typically the HA Mosquitto add-on), publishes retained discovery for each kiosk's light/binary_sensor/sensor entities, and bridges command-topic writes from HA into setBrightness/displayState messages back to the kiosk. Disabled when url is empty.",
       "url": "",
       "username": "",
-      "password": "",
       "discoveryPrefix": "homeassistant",
       "topicPrefix": "roboframe"
     }
@@ -76,8 +70,6 @@
       "port": 8082,
       "_comment_controls": "Optional. V4L2 controls applied via `v4l2-ctl --set-ctrl` each time capture (re)starts. Applied in listed order, so put dependent controls last (e.g. auto_exposure before exposure_time_absolute). Common UVC fixes: exposure_dynamic_framerate=0 stops the camera dropping fps to lengthen exposure in dim light; power_line_frequency=1 is 50 Hz (EU) / 2 is 60 Hz (US) anti-flicker. Run `v4l2-ctl -d <device> --list-ctrls` to see what your camera supports.",
       "controls": {},
-      "_comment_tokens": "Optional. When non-empty, every media endpoint (/stream.mjpg, /snapshot.jpg, /audio.pcm) requires one of these tokens via `?token=<t>` or `Authorization: Bearer <t>`. /health stays open. Use a long random value, e.g. `openssl rand -hex 24`. Gates both the LAN port and any tailscale-serve path.",
-      "tokens": [],
       "_comment_audio": "Optional. When enabled, captures raw PCM from an ALSA device via `arecord` and serves it at /audio.pcm (little-endian, no container). Pair it with the video URL in a consumer that muxes separate A/V inputs (e.g. Scrypted FFmpeg camera: `-f s16le -ar <rate> -ac <channels> -i http://<host>:<port>/audio.pcm`). The mic process only runs while a client is attached. IMPORTANT: do NOT use a numeric `hw:N,0` device — ALSA card indices are not stable across reboots (USB vs HDMI probe order shifts them). Use the by-id form `hw:CARD=<id>,DEV=0` from `arecord -L` (e.g. a Logitech C270 is `hw:CARD=U0x46d0x825,DEV=0`).",
       "audio": {
         "enabled": false,
