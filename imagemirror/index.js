@@ -993,9 +993,10 @@ async function processRequestV2(req, res) {
         else res.status(503).send('mjpeg transcode unavailable');
         return;
       }
-      // vcodec=hls: HLS fMP4 for Safari/WebKit `<video>` (Hypnos's
-      // streaming fallback). Safari won't play an unbounded chunked mp4, but
-      // plays HLS starting on segment 0 while the rest still encodes. The
+      // vcodec=hls: HLS fMP4 for AVPlayer (NativeClient's path for
+      // containers it can't open) and Safari/WebKit `<video>`. Neither plays
+      // an unbounded chunked mp4, but both play HLS starting on segment 0
+      // while the rest still encodes. The
       // playlist's segment URIs are rewritten to authenticated
       // `/get?vcodec=hlsseg` URLs so segment fetches carry the token.
       if (req.query.vcodec === 'hls' && await videoTranscoder.available()) {

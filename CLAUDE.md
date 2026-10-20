@@ -332,7 +332,10 @@ the deadline) is the canary for the wake-advance class of bug.
   finish makes it replay as VOD. `/get?vcodec=hls` returns the playlist with
   segment URIs rewritten to authenticated `/get?vcodec=hlsseg&seg=…` URLs;
   `vcodec=hlsseg` serves one Range-capable segment (name validated against
-  path traversal).
+  path traversal). A source with no audio gets a silent AAC track: AVPlayer
+  never starts an HLS stream without one (it waits to minimize stalls with
+  every segment on hand), and silent webm posts, which always take this
+  path, are common.
 - **One video-extension list.** `packages/shared/src/mediaTypes.js` is what
   the CLI indexes and the server streams/transcodes (mp4, m4v, mov, mkv,
   webm, avi, wmv, flv, 3gp). The clients can't import it and carry copies —

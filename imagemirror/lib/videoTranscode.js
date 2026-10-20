@@ -251,15 +251,16 @@ function createVideoTranscoder({
     return fs.existsSync(p) ? p : null;
   }
 
-  // ffprobe the source's video stream. `null` means the probe failed —
-  // callers treat that as "transcode, and cap conservatively".
+  // ffprobe the source's first video stream, and whether it has audio.
+  // `null` means the probe failed — callers treat that as "transcode, and
+  // cap conservatively".
   function probeSource(id, filePath) {
     if (sourceInfoCache.has(id)) return Promise.resolve(sourceInfoCache.get(id));
     return new Promise((resolve) => {
       const fp = spawn(probeBin, [
-        '-v', 'error', '-select_streams', 'v:0',
+        '-v', 'error',
         '-show_entries',
-        'stream=codec_name,width,height,avg_frame_rate,pix_fmt,sample_aspect_ratio:stream_tags=rotate:stream_side_data=rotation:format=format_name',
+        'stream=codec_type,codec_name,width,height,avg_frame_rate,pix_fmt,sample_aspect_ratio:stream_tags=rotate:stream_side_data=rotation:format=format_name',
         '-of', 'json', filePath,
       ], { stdio: ['ignore', 'pipe', 'ignore'] });
       let out = '';
@@ -270,7 +271,8 @@ function createVideoTranscoder({
         if (code === 0) {
           try {
             const probe = JSON.parse(out);
-            const s = (probe.streams || [])[0];
+            const streams = probe.streams || [];
+            const s = streams.find((st) => st.codec_type === 'video');
             if (s) {
               const [num, den] = String(s.avg_frame_rate || '').split('/').map(Number);
               const sideRot = (s.side_data_list || []).find((d) => d.rotation !== undefined);
@@ -287,6 +289,7 @@ function createVideoTranscoder({
                 // ffprobe names the whole ISO BMFF family (mp4, mov, m4v,
                 // 3gp) "mov,mp4,m4a,3gp,3g2,mj2".
                 isoBmff: /(^|,)mp4(,|$)/.test(String((probe.format || {}).format_name || '')),
+                hasAudio: streams.some((st) => st.codec_type === 'audio'),
               };
             }
           } catch { /* fall through */ }
@@ -352,7 +355,9 @@ function createVideoTranscoder({
   // frames in VT surfaces through scale_vt, so it takes no -pix_fmt (the
   // encoder emits 8-bit 4:2:0 from any VT surface, 10-bit included); the
   // software plan forces yuv420p for the encoder.
-  function videoPipelineArgs(plan, encoder, filePath, info, maxHeight, fpsTarget, inputFormat = null) {
+  // `extraInputs` are further `-i` inputs; they have to sit between the
+  // source's input and the output options.
+  function videoPipelineArgs(plan, encoder, filePath, info, maxHeight, fpsTarget, inputFormat = null, extraInputs = []) {
     const outH = outputHeight(info, maxHeight);
     if (plan === 'gpu') {
       const { width, height } = fitSize(info.width, info.height, maxHeight);
@@ -360,12 +365,12 @@ function createVideoTranscoder({
       if (fpsTarget) vf += `,fps=${fpsTarget}`;
       return [
         '-hwaccel', 'videotoolbox', '-hwaccel_output_format', 'videotoolbox_vld',
-        '-i', filePath, '-vf', vf, ...videoCodecArgs(encoder, outH),
+        '-i', filePath, ...extraInputs, '-vf', vf, ...videoCodecArgs(encoder, outH),
       ];
     }
     return [
       ...(inputFormat ? ['-f', inputFormat] : []),
-      '-i', filePath, '-vf', swScaleFilter(maxHeight, fpsTarget),
+      '-i', filePath, ...extraInputs, '-vf', swScaleFilter(maxHeight, fpsTarget),
       ...videoCodecArgs(encoder, outH), '-pix_fmt', 'yuv420p',
     ];
   }
@@ -758,11 +763,18 @@ function createVideoTranscoder({
 
       const attempt = async (plan) => {
         await fs.promises.mkdir(dir, { recursive: true });
+        // AVPlayer never starts an HLS stream that has no audio track: it
+        // sits in waitingToMinimizeStalls with every segment on hand, and a
+        // copy of the same video with any audio track plays at once. Silent
+        // sources get a silent track, cut to the video's length.
+        const silent = info && !info.hasAudio;
         const ff = spawn(ffmpegPath, [
           '-hide_banner', '-loglevel', 'error',
-          ...videoPipelineArgs(plan, encoder, filePath, info, maxHeight, fpsTarget),
+          ...videoPipelineArgs(plan, encoder, filePath, info, maxHeight, fpsTarget, null,
+            silent ? ['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo'] : []),
+          ...(silent ? ['-map', '0:v:0', '-map', '1:a:0', '-shortest'] : []),
           '-g', '60',
-          '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
+          '-c:a', 'aac', '-b:a', silent ? '32k' : '128k', '-ac', '2',
           // ~2s segments (g=60 → keyframe every 2s at 30fps) so segment 0 is
           // ready fast; independent_segments lets the player start anywhere.
           '-f', 'hls', '-hls_time', '2', '-hls_playlist_type', 'event',

@@ -397,6 +397,41 @@ test('end-to-end: hls() produces a playable fMP4 playlist + segments, ENDLIST on
     assert.equal(await t.hls(7, src, 0, 0), hlsPath);
 });
 
+// AVPlayer never starts an HLS stream without an audio track, so a silent
+// source gets a silent one; a source's own audio is kept as it is.
+test('hls() gives a silent source a silent AAC track the length of its video', { skip: !hasFfmpeg() }, async () => {
+    const dir = tmpDir();
+    const silent = makeSource(dir, 'silent.webm', ['-f', 'lavfi', '-i', 'testsrc=duration=3:size=320x240:rate=8', '-c:v', 'libvpx-vp9', '-deadline', 'realtime']);
+    const voiced = makeSource(dir, 'voiced.webm', [
+        '-f', 'lavfi', '-i', 'testsrc=duration=2:size=320x240:rate=30',
+        '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2', '-c:v', 'libvpx-vp9', '-deadline', 'realtime', '-c:a', 'libopus',
+    ]);
+    const t = createVideoTranscoder({ cachePath: dir, log: quietLog });
+    if (!silent || !voiced || !await t.available()) return;
+
+    const streamsOf = async (id, src) => {
+        const hlsPath = await t.hls(id, src, 0, 0);
+        assert.ok(hlsPath, `hls returned a dir for ${id}`);
+        for (let i = 0; i < 100; i++) {
+            if (fs.readFileSync(path.join(hlsPath, 'index.m3u8'), 'utf8').includes('#EXT-X-ENDLIST')) break;
+            await new Promise((r) => setTimeout(r, 100));
+        }
+        const out = execFileSync('ffprobe', [
+            '-v', 'error', '-show_entries', 'stream=codec_type,codec_name:format=duration', '-of', 'json',
+            path.join(hlsPath, 'index.m3u8'),
+        ]);
+        return JSON.parse(out);
+    };
+
+    const s = await streamsOf(51, silent);
+    assert.deepEqual(s.streams.map((x) => `${x.codec_type}:${x.codec_name}`).sort(), ['audio:aac', 'video:h264']);
+    // -shortest ends the endless silence with the video.
+    assert.ok(Math.abs(Number(s.format.duration) - 3) < 0.5, `duration ~3s, got ${s.format.duration}`);
+
+    const v = await streamsOf(52, voiced);
+    assert.deepEqual(v.streams.map((x) => `${x.codec_type}:${x.codec_name}`).sort(), ['audio:aac', 'video:h264']);
+});
+
 test('hls() returns null when no encoder is available', async () => {
     const t = createVideoTranscoder({
         cachePath: tmpDir(),
