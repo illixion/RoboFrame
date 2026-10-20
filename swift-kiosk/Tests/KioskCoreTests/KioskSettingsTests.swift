@@ -182,6 +182,12 @@ struct KioskMenuTests {
         session.screenSettle = 0
         session.setScreenSize(width: 1280, height: 720)
         #expect(requestedSize() == "1280")
+
+        // The no-output screen is never a size, even with the panel
+        // reported on (a panel cut that nobody announced).
+        session.setScreenSize(width: 320, height: 200)
+        session.tick()
+        #expect(requestedSize() == "1280")
     }
 
     @Test("A refused token and an empty query say so on screen until resolved")

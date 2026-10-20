@@ -132,6 +132,8 @@ public final class KioskSession {
     /// When the panel last came on; the distant past until it first goes off.
     private var panelOnSince: TimeInterval = -.infinity
     var screenSettle: TimeInterval = 2
+    /// Smaller than any panel this kiosk drives; see `setScreenSize`.
+    static let minimumScreen = (width: 640, height: 360)
     private var lastPlayback: RoboFramePlayback?
     private var backSteps = 0
     private var holdTask: Task<Void, Never>?
@@ -216,8 +218,12 @@ public final class KioskSession {
     /// re-commits the frame, and with nobody present runs its dwell blind).
     /// The size the renderer last reported is applied once the panel has
     /// been on for `screenSettle`, from `tick`.
+    ///
+    /// Never one below `minimumScreen`, whatever the panel state: that is X
+    /// with no output enabled (320x200 on VC4), which a panel cut without a
+    /// `displayState` would otherwise pass off as the real mode.
     public func setScreenSize(width: Int, height: Int) {
-        guard width > 0, height > 0 else { return }
+        guard width >= Self.minimumScreen.width, height >= Self.minimumScreen.height else { return }
         reportedScreen = (width, height)
         applyScreenSize()
     }
