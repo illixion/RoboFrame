@@ -20,6 +20,7 @@ const { createImageCache } = require('./lib/imageCache');
 const { createPrefetcher } = require('./lib/prefetcher');
 const { createComputeLimiter } = require('./lib/computeLimiter');
 const { createVideoTranscoder } = require('./lib/videoTranscode');
+const { rewriteHlsPlaylist } = require('./lib/hlsPlaylist');
 const { createSceneProducer } = require('./lib/sceneProducer');
 
 const config = loadConfig();
@@ -997,8 +998,9 @@ async function processRequestV2(req, res) {
       // containers it can't open) and Safari/WebKit `<video>`. Neither plays
       // an unbounded chunked mp4, but both play HLS starting on segment 0
       // while the rest still encodes. The
-      // playlist's segment URIs are rewritten to authenticated
-      // `/get?vcodec=hlsseg` URLs so segment fetches carry the token.
+      // playlist's segment URIs are rewritten to authenticated, relative
+      // `get?vcodec=hlsseg` URLs so segment fetches carry the token and any
+      // reverse-proxy path prefix (lib/hlsPlaylist.js).
       if (req.query.vcodec === 'hls' && await videoTranscoder.available()) {
         const vmaxh = req.query.vmaxh === '0'
           ? 0 : Math.min(4320, Math.max(240, Number(req.query.vmaxh) || 1080));
@@ -1010,15 +1012,7 @@ async function processRequestV2(req, res) {
           try {
             const raw = await fs.promises.readFile(path.join(dir, 'index.m3u8'), 'utf8');
             const token = req.query.token || req.headers['x-roboframe-token'] || '';
-            const base = `/get?id=${parts.id}&vcodec=hlsseg&vmaxh=${vmaxh}&vmaxfps=${vmaxfps}`
-              + `&token=${encodeURIComponent(token)}&seg=`;
-            const rewritten = raw.split('\n').map((line) => {
-              if (line.startsWith('#EXT-X-MAP:URI=')) {
-                return line.replace(/URI="([^"]+)"/, (_, f) => `URI="${base}${encodeURIComponent(f)}"`);
-              }
-              if (line && !line.startsWith('#')) return `${base}${encodeURIComponent(line.trim())}`;
-              return line;
-            }).join('\n');
+            const rewritten = rewriteHlsPlaylist(raw, { id: parts.id, vmaxh, vmaxfps, token });
             res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
             // A completed (ENDLIST) playlist is a stable VOD; a growing one must
             // be re-fetched so the player picks up new segments.

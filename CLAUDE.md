@@ -330,7 +330,9 @@ the deadline) is the canary for the wake-advance class of bug.
   playlist + fMP4 segments to a per-`(id,vmaxh,vmaxfps)` cache dir
   (`${id}.hls.${h}p.${fps}fps/`, pruned as one unit); `ENDLIST` on a clean
   finish makes it replay as VOD. `/get?vcodec=hls` returns the playlist with
-  segment URIs rewritten to authenticated `/get?vcodec=hlsseg&seg=…` URLs;
+  segment URIs rewritten to authenticated, relative `get?vcodec=hlsseg&seg=…`
+  URLs (`lib/hlsPlaylist.js`) — relative so they keep a reverse proxy's path
+  prefix (servo's nginx serves the app under `/wallpaper_slideshow/`);
   `vcodec=hlsseg` serves one Range-capable segment (name validated against
   path traversal). A source with no audio gets a silent AAC track: AVPlayer
   never starts an HLS stream without one (it waits to minimize stalls with
