@@ -7,34 +7,67 @@ struct RoboFrameSlideshowSurface: View {
     let model: SlideshowModel
 
     var body: some View {
+        let mode = model.profile.slideshow3DMode
         RAVESlideshowSurface(engine: model.engine) { context in
-            StillSlideshowMedia(context: context)
+            StillSlideshowMedia(
+                context: context,
+                aiDepth: mode == .aiDepth,
+                // The surface fades the outgoing layer with SwiftUI opacity,
+                // which an AI 3D mesh doesn't follow; it fades on its own.
+                isOutgoing: context.role == .current && model.engine.incoming != nil
+            )
         } animated: { context in
             StillSlideshowMedia(context: context)
         } video: { context in
-            SlideshowVideoMedia(context: context, pseudo3D: model.profile.slideshow3DMode == .pseudo3D)
+            SlideshowVideoMedia(context: context, pseudo3D: mode.convertsVideo)
         } placeholder: {
             ProgressView("Waiting for RoboFrame…")
                 .tint(.white)
                 .foregroundStyle(.white)
         }
+        #if os(visionOS)
+        // Depth for the next picture while this one is on screen, so it
+        // arrives with its mesh.
+        .task(id: mode == .aiDepth ? model.engine.peekedNext?.item.id : nil) {
+            guard mode == .aiDepth, let peek = model.engine.peekedNext,
+                  case .still(let data, _) = peek.media,
+                  let image = UIImage(data: data)?.cgImage else { return }
+            _ = await SlideshowDepthCache.shared.depth(for: peek.item.id, image: image)
+        }
+        #endif
     }
 }
 
 private struct StillSlideshowMedia: View {
     let context: RAVESlideshowRenderContext
+    var aiDepth = false
+    var isOutgoing = false
 
     var body: some View {
         switch context.media.media {
         case .still(let data, _):
             if let image = UIImage(data: data) {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .brightness(context.visualSettings.brightness)
-                    .contrast(context.visualSettings.contrast)
-                    .saturation(context.visualSettings.saturation)
-                    .modifier(SpatialImageTreatment(enabled: context.displaySettings.mode3D == .spatial3D))
+                ZStack {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .brightness(context.visualSettings.brightness)
+                        .contrast(context.visualSettings.contrast)
+                        .saturation(context.visualSettings.saturation)
+                        .modifier(SpatialImageTreatment(enabled: context.displaySettings.mode3D == .spatial3D))
+                    #if os(visionOS)
+                    if aiDepth, let cgImage = image.cgImage {
+                        AIDepthStill(
+                            itemID: context.media.item.id,
+                            image: cgImage,
+                            aspectRatio: image.size,
+                            visualSettings: context.visualSettings,
+                            isOutgoing: isOutgoing,
+                            fadeDuration: context.displaySettings.reduceMotion ? 0 : context.displaySettings.transitionDuration * 0.6
+                        )
+                    }
+                    #endif
+                }
             } else {
                 ContentUnavailableView("Media unavailable", systemImage: "exclamationmark.triangle")
             }
@@ -254,6 +287,73 @@ private struct PlayerLayerView: UIViewRepresentable {
 #if os(visionOS)
 import RAVEMedia
 import RealityKit
+
+/// AI 3D over one slideshow picture: the depth mesh, laid over the flat
+/// picture once the depth is ready, and an input layer in front of it so
+/// the window's tap still toggles the chrome (the mesh's RealityView would
+/// swallow it).
+private struct AIDepthStill: View {
+    let itemID: String
+    let image: CGImage
+    let aspectRatio: CGSize
+    let visualSettings: RAVESlideshowVisualSettings
+    let isOutgoing: Bool
+    let fadeDuration: TimeInterval
+    @State private var depth: StillDepthMap?
+
+    var body: some View {
+        ZStack {
+            if let depth {
+                RAVEAIDepthPhotoView(
+                    image: image,
+                    depth: depth,
+                    contentID: itemID,
+                    adjustments: .init(
+                        brightness: visualSettings.brightness,
+                        contrast: visualSettings.contrast,
+                        saturation: visualSettings.saturation
+                    ),
+                    opacity: isOutgoing ? 0 : 1,
+                    fadeDuration: fadeDuration
+                )
+                Color.white.opacity(0.001)
+                    .offset(z: RAVEAIDepthPhotoView.inputTargetZ)
+            }
+        }
+        .aspectRatio(aspectRatio, contentMode: .fit)
+        .task(id: itemID) {
+            depth = await SlideshowDepthCache.shared.depth(for: itemID, image: image)
+        }
+    }
+}
+
+/// Depth maps for the pictures on screen and the next one, by item id. RAM
+/// only and small: a slideshow passes through far too much to keep more.
+@MainActor
+final class SlideshowDepthCache {
+    static let shared = SlideshowDepthCache()
+    private static let capacity = 6
+
+    private var maps: [String: StillDepthMap] = [:]
+    private var order: [String] = []
+    private var inFlight: [String: Task<StillDepthMap?, Never>] = [:]
+
+    func depth(for id: String, image: CGImage) async -> StillDepthMap? {
+        if let map = maps[id] { return map }
+        if let running = inFlight[id] { return await running.value }
+        let task = Task { await RAVEStillDepthEstimator.shared.depth(for: image) }
+        inFlight[id] = task
+        let map = await task.value
+        inFlight.removeValue(forKey: id)
+        if let map {
+            maps[id] = map
+            order.removeAll { $0 == id }
+            order.append(id)
+            while order.count > Self.capacity { maps.removeValue(forKey: order.removeFirst()) }
+        }
+        return map
+    }
+}
 
 private struct Pseudo3DSlideshowVideo: View {
     let url: URL

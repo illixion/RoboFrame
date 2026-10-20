@@ -10,6 +10,7 @@
 import AVFoundation
 import Foundation
 import Observation
+import RAVEMedia
 import RoboFrameKit
 import RAVESlideshow
 
@@ -54,7 +55,8 @@ final class SlideshowModel {
                 showClock: profile.showClock,
                 showSensors: profile.showSensors,
                 useAspectRatio: profile.useAspectRatio,
-                enableKenBurns: profile.enableKenBurns,
+                // Ken Burns doesn't move an AI 3D picture's mesh.
+                enableKenBurns: profile.enableKenBurns && profile.slideshow3DMode != .aiDepth,
                 enableDynamicBrightness: profile.enableDynamicBrightness,
                 transparentBackground: profile.transparentBackground,
                 textScale: profile.textSize,
@@ -103,8 +105,12 @@ final class SlideshowModel {
         set { updateDisplaySettings { $0.useAspectRatio = newValue }; profile.useAspectRatio = newValue; persistConfig() }
     }
     var displayEnableKenBurns: Bool {
-        get { engine.displaySettings.enableKenBurns }
-        set { updateDisplaySettings { $0.enableKenBurns = newValue }; profile.enableKenBurns = newValue; persistConfig() }
+        get { profile.enableKenBurns }
+        set {
+            updateDisplaySettings { $0.enableKenBurns = newValue && profile.slideshow3DMode != .aiDepth }
+            profile.enableKenBurns = newValue
+            persistConfig()
+        }
     }
     var displayEnableDynamicBrightness: Bool {
         get { engine.displaySettings.enableDynamicBrightness }
@@ -125,10 +131,37 @@ final class SlideshowModel {
     var slideshow3DMode: Slideshow3DPreference {
         get { profile.slideshow3DMode }
         set {
-            profile.slideshow3DMode = newValue
-            updateDisplaySettings { $0.mode3D = newValue == .spatial ? .spatial3D : .off }
-            persistConfig()
+            // No depth model yet: offer one, and switch once it's installed.
+            if newValue.needsDepthModel, !RAVEStillDepthEstimator.shared.isModelAvailable {
+                pendingDepthModelMode = newValue
+                showDepthModelSetup = true
+                return
+            }
+            apply3DMode(newValue)
         }
+    }
+
+    private func apply3DMode(_ mode: Slideshow3DPreference) {
+        profile.slideshow3DMode = mode
+        updateDisplaySettings {
+            $0.mode3D = mode == .spatial ? .spatial3D : .off
+            $0.enableKenBurns = profile.enableKenBurns && mode != .aiDepth
+        }
+        persistConfig()
+    }
+
+    /// Drives the depth-model setup sheet, shown when a 3D mode that runs
+    /// the depth model is chosen with none installed.
+    var showDepthModelSetup = false
+    private var pendingDepthModelMode: Slideshow3DPreference?
+
+    /// The setup sheet installed a model: apply the mode that asked for it.
+    /// Directly, not through the setter: the estimator caches "no model" for
+    /// a few seconds and would offer the sheet again.
+    func depthModelInstalled() {
+        guard let mode = pendingDepthModelMode else { return }
+        pendingDepthModelMode = nil
+        apply3DMode(mode)
     }
 
     var maxImageResolution2D: Int {

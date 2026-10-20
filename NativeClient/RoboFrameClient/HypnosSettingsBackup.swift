@@ -91,6 +91,7 @@ extension HypnosRemoteViewerConfig {
         switch slideshow3DMode {
         case "spatial3D": profile.slideshow3DMode = .spatial
         case "immersive3D": profile.slideshow3DMode = .pseudo3D
+        case "aiDepth": profile.slideshow3DMode = .aiDepth
         default: profile.slideshow3DMode = .off
         }
         profile.maxImageResolution2D = maxImageResolution2D

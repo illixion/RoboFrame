@@ -137,6 +137,10 @@ enum Slideshow3DPreference: String, Codable, CaseIterable, Identifiable {
     case off
     case spatial
     case pseudo3D
+    /// Pictures as a mesh displaced by the real-time depth model
+    /// (`RAVEAIDepthPhotoView`), videos converted in real time, as in
+    /// Hypnos's AI 3D. Always last in the menu.
+    case aiDepth
 
     var id: String { rawValue }
     var label: String {
@@ -144,8 +148,15 @@ enum Slideshow3DPreference: String, Codable, CaseIterable, Identifiable {
         case .off: "2D"
         case .spatial: "Spatial Images"
         case .pseudo3D: "Real-Time 3D Video"
+        case .aiDepth: "AI 3D"
         }
     }
+
+    /// Runs the real-time depth model, so needs one installed.
+    var needsDepthModel: Bool { self == .pseudo3D || self == .aiDepth }
+
+    /// Videos convert to stereo in real time.
+    var convertsVideo: Bool { self == .pseudo3D || self == .aiDepth }
 
     /// Matches the icon set `RemoteViewerOrnamentView`'s 3D menu uses in
     /// Hypnos so the ornament reads the same at a glance.
@@ -154,6 +165,7 @@ enum Slideshow3DPreference: String, Codable, CaseIterable, Identifiable {
         case .off: "view.3d"
         case .spatial: "spatial.capture.fill"
         case .pseudo3D: "move.3d"
+        case .aiDepth: "wand.and.sparkles"
         }
     }
 }

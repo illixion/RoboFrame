@@ -17,6 +17,7 @@
  */
 
 import Combine
+import RAVEMedia
 import RAVEUI
 import SwiftUI
 
@@ -53,21 +54,27 @@ struct SlideshowWindowView: View {
                 .opacity(model.adjustments.opacity)
                 .ignoresSafeArea()
 
+            // Everything drawn over the picture sits in front of an AI 3D
+            // mesh, which would otherwise cover it (see `liftedOverAIDepth`).
             if model.displayShowClock {
                 clockOverlay
+                    .liftedOverAIDepth(isAIDepth)
             }
 
             if model.displayShowSensors, !model.sortedSensors.isEmpty {
                 sensorOverlay
+                    .liftedOverAIDepth(isAIDepth)
             }
 
             if let toast = model.toastMessage {
                 toastOverlay(toast)
+                    .liftedOverAIDepth(isAIDepth)
             }
 
             if let alert = model.alert {
                 AlertOverlayView(alert: alert)
                     .transition(.opacity)
+                    .liftedOverAIDepth(isAIDepth)
             }
 
             if showHistory, let store = historyStore {
@@ -79,6 +86,7 @@ struct SlideshowWindowView: View {
                     showHistory = false
                 }
                 .transition(.opacity)
+                .liftedOverAIDepth(isAIDepth)
             }
 
             VStack {
@@ -89,6 +97,7 @@ struct SlideshowWindowView: View {
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
+            .liftedOverAIDepth(isAIDepth)
         }
         .contentShape(.rect)
         .onTapGesture {
@@ -125,7 +134,18 @@ struct SlideshowWindowView: View {
             Task { await historyStore.refresh() }
         }
         .onReceive(clockTimer) { currentTime = $0 }
+        .sheet(isPresented: $model.showDepthModelSetup) {
+            RAVEDepthModelSetupView(
+                prompt: "3D needs a depth model: it estimates the 3D shape of each picture and video frame. Bigger models look better; smaller ones are quicker and lighter. You only need to do this once."
+            ) { variant in
+                // The key `CoreMLDepthProvider` reads for the real-time role.
+                UserDefaults.standard.set(variant.name, forKey: DepthModelRole.realtime.defaultsKey)
+                model.depthModelInstalled()
+            }
+        }
     }
+
+    private var isAIDepth: Bool { model.slideshow3DMode == .aiDepth }
 
     private var clockOverlay: some View {
         let scale = model.profile.textSize
@@ -200,5 +220,18 @@ struct SlideshowWindowView: View {
             guard !Task.isCancelled else { return }
             withAnimation { controlsVisible = false }
         }
+    }
+}
+
+private extension View {
+    /// In front of an AI 3D picture's mesh and its input layer. visionOS
+    /// only: elsewhere there is no mesh and no depth.
+    @ViewBuilder
+    func liftedOverAIDepth(_ isAIDepth: Bool) -> some View {
+        #if os(visionOS)
+        offset(z: isAIDepth ? RAVEAIDepthPhotoView.inputTargetZ + 4 : 0)
+        #else
+        self
+        #endif
     }
 }
