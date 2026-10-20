@@ -31,6 +31,11 @@ final class SlideshowModel {
     private(set) var audioPlayer: AVPlayer?
     private(set) var error: String?
     private(set) var isDisplayOn = true
+    /// The deviceId holding the displaySync claim, as the server last
+    /// reported it; nil while no merge is active.
+    private(set) var mergeDriver: String?
+    /// This window's device drives the merge, so the toggle shows on and releases it.
+    var isDisplaySyncDriver: Bool { mergeDriver != nil && mergeDriver == profile.deviceId }
     private var reportedReadyID: Int?
 
     /// Fires whenever an ornament/adjustments edit changes a persisted field
@@ -288,6 +293,7 @@ final class SlideshowModel {
             engine.setAuthoritativeCurrent(playback.current?.slideshowItem)
             if let list = playback.currentList { currentList = list }
             if let tags = playback.modTags { modTags = tags }
+            mergeDriver = playback.mergeDriver
             reportedReadyID = nil
         case .tagLists(let lists): tagLists = lists
         case .sensor(let reading): sensors[reading.id] = reading

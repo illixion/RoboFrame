@@ -69,12 +69,15 @@ struct SlideshowOrnamentView: View {
             modTagMenu
 
             Button {
-                model.setDisplaySync(true)
+                model.setDisplaySync(!model.isDisplaySyncDriver)
             } label: {
-                Image(systemName: "link.circle").font(.title3)
+                Image(systemName: model.mergeDriver == nil ? "link.circle" : "link.circle.fill")
+                    .font(.title3)
+                    .padding(6)
+                    .background(model.isDisplaySyncDriver ? .white.opacity(0.3) : .clear, in: .rect(cornerRadius: 8))
             }
             .raveChromeButtonStyle()
-            .help("Display Sync")
+            .help(displaySyncHelp)
 
             #if os(visionOS)
             slideshow3DMenu
@@ -97,6 +100,16 @@ struct SlideshowOrnamentView: View {
         .padding(.horizontal, RAVEChromeMetrics.horizontalPadding)
         .padding(.vertical, RAVEChromeMetrics.verticalPadding)
         .chromeBackground()
+    }
+
+    /// The server holds the claim across disconnects, so the toggle reads
+    /// its state from `playback.mergeDriver` rather than remembering a tap.
+    private var displaySyncHelp: String {
+        switch model.mergeDriver {
+        case nil: "Display Sync Off"
+        case model.profile.deviceId: "Display Sync On"
+        case let driver?: "Following \(driver)"
+        }
     }
 
     private var identityLabel: some View {
