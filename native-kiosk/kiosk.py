@@ -1084,15 +1084,26 @@ class Kiosk:
 
     # -- sensors (Home Assistant `update` frames) ---------------------------
 
-    # Word → emoji substitution applied to friendly_name. Mirrors
-    # public/modules/sensors.js so the same HA sensor renders identically
-    # on both clients. The mixed-font compositor paints these glyphs via
-    # NotoColorEmoji.
-    SENSOR_EMOJI = {
-        "Temperature": "🌡️",
-        "Humidity": "💧",
-        "Atmospheric pressure": "🌬️",
+    # Emoji for the kind of reading: HA's device_class, else a unit only one
+    # kind of sensor uses. A bare % says nothing (humidity, battery, ...), so
+    # it never picks one. Mirrors public/modules/sensors.js. The mixed-font
+    # compositor paints these glyphs via NotoColorEmoji.
+    CLASS_EMOJI = {
+        "temperature": "🌡️",
+        "humidity": "💧",
+        "pressure": "🌬️",
+        "atmospheric_pressure": "🌬️",
     }
+    UNIT_EMOJI = {
+        "°C": "🌡️", "°F": "🌡️", "K": "🌡️",
+        "hPa": "🌬️", "mbar": "🌬️", "kPa": "🌬️", "inHg": "🌬️", "mmHg": "🌬️",
+    }
+
+    @classmethod
+    def sensor_emoji(cls, device_class, unit):
+        if device_class:
+            return cls.CLASS_EMOJI.get(device_class, "")
+        return cls.UNIT_EMOJI.get(unit, "")
 
     def _on_sensor_update(self, payload):
         entity = payload.get("entity")
@@ -1103,9 +1114,8 @@ class Kiosk:
         unit = attrs.get("unit_of_measurement") or ""
         state = payload.get("state")
         stale = state == "unavailable" or unit == "unavailable"
-        display_name = name
-        for k, v in self.SENSOR_EMOJI.items():
-            display_name = display_name.replace(k, v)
+        emoji = self.sensor_emoji(attrs.get("device_class"), unit)
+        display_name = f"{name} {emoji}" if emoji else name
         with self.sensors_lock:
             prev = self.sensors.get(entity, {})
             if stale:
