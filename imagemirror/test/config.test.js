@@ -56,3 +56,15 @@ test('ROBOFRAME_SECRETS names the secrets file; a config alone still loads', () 
         assert.equal(loadConfig({ reload: true }).accessToken, 'env');
     });
 });
+
+test('a symlinked config finds the secrets beside the file it links to', () => {
+    withConfigDir({ 'roboframe.config.json': { accessToken: 'stale' }, 'roboframe.secrets.json': { accessToken: 'real' } }, (dir) => {
+        const service = path.join(dir, 'service');
+        fs.mkdirSync(service);
+        fs.symlinkSync(path.join(dir, 'roboframe.config.json'), path.join(service, 'roboframe.config.json'));
+        process.env.ROBOFRAME_CONFIG = path.join(service, 'roboframe.config.json');
+        const config = loadConfig({ reload: true });
+        assert.equal(config.accessToken, 'real');
+        assert.equal(config.secretsPath, path.join(fs.realpathSync(dir), 'roboframe.secrets.json'));
+    });
+});

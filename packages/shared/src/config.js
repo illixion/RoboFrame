@@ -44,8 +44,15 @@ function findSecretsFile(configPath) {
         return path.resolve(process.env.ROBOFRAME_SECRETS);
     }
     if (!configPath) return null;
-    const candidate = path.join(path.dirname(configPath), 'roboframe.secrets.json');
-    return fs.existsSync(candidate) ? candidate : null;
+    // Beside the config, or beside the file it links to: a config symlinked
+    // into a service's directory keeps its secrets with the real one.
+    let real = configPath;
+    try { real = fs.realpathSync(configPath); } catch { /* dangling: beside the link only */ }
+    for (const dir of new Set([path.dirname(configPath), path.dirname(real)])) {
+        const candidate = path.join(dir, 'roboframe.secrets.json');
+        if (fs.existsSync(candidate)) return candidate;
+    }
+    return null;
 }
 
 function readJson(file) {

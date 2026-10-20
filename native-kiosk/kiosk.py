@@ -137,13 +137,17 @@ def _walk_for_config():
 
 
 def _secrets_path(config_path):
-    """roboframe.secrets.json: ROBOFRAME_SECRETS, else beside the config."""
+    """roboframe.secrets.json: ROBOFRAME_SECRETS, else beside the config or
+    beside the file the config links to."""
     if env := os.environ.get("ROBOFRAME_SECRETS"):
         return Path(env).resolve()
     if config_path is None:
         return None
-    cand = config_path.parent / "roboframe.secrets.json"
-    return cand if cand.exists() else None
+    for folder in dict.fromkeys((config_path.parent, config_path.resolve().parent)):
+        cand = folder / "roboframe.secrets.json"
+        if cand.exists():
+            return cand
+    return None
 
 
 def _read_json(path):

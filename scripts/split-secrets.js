@@ -67,7 +67,9 @@ if (!configPath || !fs.existsSync(configPath)) {
     console.error('No roboframe.config.json found; pass its path.');
     process.exit(1);
 }
-const secretsPath = path.join(path.dirname(configPath), 'roboframe.secrets.json');
+// Beside the real file, when the config is a symlink: that's where every
+// loader looks after the link's own directory.
+const secretsPath = path.join(path.dirname(fs.realpathSync(configPath)), 'roboframe.secrets.json');
 
 const configText = fs.readFileSync(configPath, 'utf8');
 const config = readJson(configPath, 'config');

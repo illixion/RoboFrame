@@ -46,6 +46,13 @@ struct KioskSettingsTests {
         // A nested block merges instead of replacing the config's.
         #expect(config.intervalMs == 20_000 && config.modTags == ["x"] && config.deviceId == "den")
         #expect(try KioskConfig.load(path: configPath, environment: ["ACCESS_TOKEN": "e"]).accessToken == "e")
+
+        // A config symlinked elsewhere keeps finding the secrets beside its target.
+        let service = dir.appendingPathComponent("service")
+        try FileManager.default.createDirectory(at: service, withIntermediateDirectories: true)
+        let link = service.appendingPathComponent("roboframe.config.json").path
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: configPath)
+        #expect(try KioskConfig.load(path: link, environment: ["KIOSK_SETTINGS": dir.appendingPathComponent("none.json").path]).accessToken == "s")
     }
 
     @Test("Defaults: Ken Burns, a whole photo on its blurred copy, every overlay on")

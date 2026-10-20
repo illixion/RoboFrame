@@ -132,12 +132,16 @@ public struct KioskConfig: Equatable, Sendable {
     static func clampBrightness(_ value: Int) -> Int { min(100, max(10, value)) }
 
     /// `roboframe.secrets.json`, the config's shape holding its tokens:
-    /// ROBOFRAME_SECRETS, else beside the config file, as packages/shared finds it.
+    /// ROBOFRAME_SECRETS, else beside the config file or beside the file it
+    /// links to, as packages/shared finds it.
     static func secretsPath(configPath: String?, environment: [String: String]) -> String? {
         if let path = environment["ROBOFRAME_SECRETS"], !path.isEmpty { return path }
         guard let configPath else { return nil }
-        return URL(fileURLWithPath: configPath).deletingLastPathComponent()
-            .appendingPathComponent("roboframe.secrets.json").path
+        let link = URL(fileURLWithPath: configPath)
+        let candidates = [link, link.resolvingSymlinksInPath()].map {
+            $0.deletingLastPathComponent().appendingPathComponent("roboframe.secrets.json").path
+        }
+        return candidates.first { FileManager.default.fileExists(atPath: $0) } ?? candidates[0]
     }
 
     private static func readObject(_ path: String?) throws -> [String: JSONValue] {
