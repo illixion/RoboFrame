@@ -267,7 +267,8 @@ the deadline) is the canary for the wake-advance class of bug.
   three loaders (`packages/shared`, native-kiosk, swift-kiosk) deep-merge it
   over `roboframe.config.json`, so the config is safe to read and grep.
   Never print the secrets file or a token value; to see what it holds, list
-  key names only. `scripts/split-secrets.js` migrates an old config.
+  key names only. `scripts/split-secrets.js` moves them out of a config
+  that holds them.
 - **MQTT bridge auto-disables.** Empty `mqtt.url` makes every method
   on `createMqttBridge` a no-op — the rest of the broker doesn't
   feature-detect.
