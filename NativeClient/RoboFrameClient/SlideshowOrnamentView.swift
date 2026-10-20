@@ -281,6 +281,8 @@ struct SlideshowOrnamentView: View {
             HStack(spacing: 4) {
                 Image(systemName: "photo").font(.title3)
                 Text(currentLabel).font(.callout).foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .fixedSize()
             }
         }
         .menuStyle(.button)
