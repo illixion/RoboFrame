@@ -68,7 +68,12 @@ final class RoboFrameSlideshowProvider: RAVESlideshowContentProvider {
     func loadMedia(for item: RAVESlideshowItem, maxResolution: Int) async throws -> RAVESlideshowLoadedMedia {
         guard let post = RemotePost(slideshowItem: item) else { throw RoboFrameAPIError.badResponse }
         let url = try await api.mediaURL(for: post, profile: profile, record: false)
-        if post.isVideo { return .video(url: url, hlsURL: nil) }
+        if post.isVideo {
+            // Buffered before the engine stages it, as a still's bytes are:
+            // the crossfade then fades in a picture, not an empty player.
+            await SlideshowClipPool.shared.prepare(url)
+            return .video(url: url, hlsURL: nil)
+        }
         return .still(data: try await URLSession.shared.data(from: url).0, displayURL: url)
     }
 
