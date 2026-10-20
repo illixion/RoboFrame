@@ -6,14 +6,15 @@ import Testing
 
 @Suite("Kiosk overlay")
 struct KioskOverlayTests {
-    @Test("Sensors sort by name, swap known words for emoji, and mark unavailable ones")
+    @Test("Sensors sort by name, add an emoji by device class or unit, and mark unavailable ones")
     func sensors() {
         let lines = KioskOverlay.sensorLines([
-            RoboFrameSensorReading(entityId: "sensor.b", state: "45", friendlyName: "Bedroom Humidity", unit: "%"),
-            RoboFrameSensorReading(entityId: "sensor.a", state: "21.5", friendlyName: "Attic Temperature", unit: "°C", isUnavailable: true),
+            RoboFrameSensorReading(entityId: "sensor.b", state: "45", friendlyName: "Bedroom", unit: "%", deviceClass: "humidity"),
+            RoboFrameSensorReading(entityId: "sensor.a", state: "21.5", friendlyName: "Attic", unit: "°C", isUnavailable: true),
             RoboFrameSensorReading(entityId: "sensor.c", state: "", friendlyName: "Cellar", unit: ""),
+            RoboFrameSensorReading(entityId: "sensor.d", state: "80", friendlyName: "Doorbell battery", unit: "%", deviceClass: "battery"),
         ])
-        #expect(lines == ["❗ Attic 🌡️: 21.5°C", "Bedroom 💧: 45%", "Cellar: N/A"])
+        #expect(lines == ["❗ Attic 🌡️: 21.5°C", "Bedroom 💧: 45%", "Cellar: N/A", "Doorbell battery: 80%"])
     }
 
     @Test("Toasts expire after their duration and keep only the newest few")

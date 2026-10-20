@@ -75,6 +75,7 @@ public enum RoboFrameFrames {
                 state: update.state,
                 friendlyName: update.attributes?.friendlyName ?? update.entity,
                 unit: update.attributes?.unit ?? "",
+                deviceClass: update.attributes?.deviceClass,
                 isUnavailable: update.state == "unavailable"
             )))
         case "showText":
@@ -167,8 +168,10 @@ public enum RoboFrameFrames {
         struct Attributes: Decodable {
             let friendlyName: String?
             let unit: String?
+            let deviceClass: String?
             enum CodingKeys: String, CodingKey {
                 case friendlyName = "friendly_name"
+                case deviceClass = "device_class"
                 case unit = "unit_of_measurement"
             }
         }

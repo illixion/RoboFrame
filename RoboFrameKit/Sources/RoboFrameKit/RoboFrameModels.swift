@@ -117,16 +117,48 @@ public struct RoboFrameSensorReading: Identifiable, Equatable, Sendable {
     public var state: String
     public var friendlyName: String
     public var unit: String
+    /// HA's `device_class` attribute (`temperature`, `humidity`, ...).
+    public var deviceClass: String?
     /// HA reported `unavailable`; `state` keeps the last real value.
     public var isUnavailable: Bool
 
     public var id: String { entityId }
 
-    public init(entityId: String, state: String, friendlyName: String, unit: String, isUnavailable: Bool = false) {
+    /// An emoji for the kind of reading, from HA's `device_class` and, when
+    /// that is absent, from units only one kind of sensor uses. `%` alone
+    /// says nothing (humidity, battery, ...), so it never picks one.
+    public var emoji: String? {
+        switch deviceClass {
+        case "temperature": return "🌡️"
+        case "humidity": return "💧"
+        case "pressure", "atmospheric_pressure": return "🌬️"
+        case .some: return nil
+        case nil: break
+        }
+        switch unit {
+        case "°C", "°F", "K": return "🌡️"
+        case "hPa", "mbar", "kPa", "inHg", "mmHg": return "🌬️"
+        default: return nil
+        }
+    }
+
+    /// The friendly name followed by the reading's emoji, when it has one.
+    public var displayName: String {
+        emoji.map { friendlyName + " " + $0 } ?? friendlyName
+    }
+
+    /// Sorting ignores everything outside printable ASCII, so a name that
+    /// starts with an emoji sorts by its words.
+    public var sortKey: String {
+        String(friendlyName.unicodeScalars.filter { $0.value >= 32 && $0.value < 127 })
+    }
+
+    public init(entityId: String, state: String, friendlyName: String, unit: String, deviceClass: String? = nil, isUnavailable: Bool = false) {
         self.entityId = entityId
         self.state = state
         self.friendlyName = friendlyName
         self.unit = unit
+        self.deviceClass = deviceClass
         self.isUnavailable = isUnavailable
     }
 }

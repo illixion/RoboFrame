@@ -18,30 +18,16 @@ import Darwin
 #endif
 
 public enum KioskOverlay {
-    /// Words in a sensor's friendly name drawn as an emoji instead.
-    static let sensorEmoji: [(word: String, emoji: String)] = [
-        ("Temperature", "🌡️"),
-        ("Humidity", "💧"),
-        ("Atmospheric pressure", "🌬️"),
-    ]
-
     /// One line per sensor, sorted by name. A sensor that went unavailable
     /// keeps its last value behind a warning mark.
     public static func sensorLines(_ sensors: some Collection<RoboFrameSensorReading>) -> [String] {
         sensors
-            .sorted { sortKey($0.friendlyName) < sortKey($1.friendlyName) }
+            .sorted { $0.sortKey < $1.sortKey }
             .map { reading in
-                var name = reading.friendlyName
-                for (word, emoji) in sensorEmoji { name = name.replacingOccurrences(of: word, with: emoji) }
+                let name = reading.displayName
                 let value = reading.state.isEmpty ? "N/A" : reading.state + reading.unit
                 return (reading.isUnavailable ? "❗ " : "") + "\(name): \(value)"
             }
-    }
-
-    /// Sorting ignores everything outside printable ASCII, so a name that
-    /// starts with an emoji sorts by its words.
-    private static func sortKey(_ name: String) -> String {
-        String(name.unicodeScalars.filter { $0.value >= 32 && $0.value < 127 })
     }
 
     /// The clock and date lines in local time: `14:05:09` (or `14:05`) and `Mon, Oct 12`.

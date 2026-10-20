@@ -86,7 +86,7 @@ final class SlideshowModel {
         set { engine.visualSettings = newValue.slideshowVisualSettings }
     }
 
-    var sortedSensors: [RoboFrameSensorReading] { sensors.values.sorted { $0.friendlyName < $1.friendlyName } }
+    var sortedSensors: [RoboFrameSensorReading] { sensors.values.sorted { $0.sortKey < $1.sortKey } }
 
     // MARK: - Display setting proxies (Adjustments popover "Viewer" tab + ornament)
 

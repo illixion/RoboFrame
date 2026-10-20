@@ -128,6 +128,8 @@ struct SlideshowOrnamentView: View {
             HStack(spacing: 4) {
                 Image(systemName: "number").font(.title3)
                 Text("\(model.currentList + 1)/\(max(model.tagLists.count, 1))").font(.callout).foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .fixedSize()
             }
         }
         .menuStyle(.button)
