@@ -39,7 +39,9 @@
 // `displaySync` merges every channel into one for the duration of the claim.
 // While merged, the driver's channel broadcasts to every session regardless
 // of deviceId, and the readiness barrier waits on every visible session
-// across all channels. Non-driver channels' timers are paused.
+// across all channels. Non-driver channels' timers are paused. The driver is
+// attended while any merged session is connected, whether or not one of its
+// own is.
 //
 // Sessions and the wire protocol — see docs/protocol.md for the full surface.
 // Each WS connection can host multiple logical *sessions*, addressed by a
@@ -141,9 +143,10 @@ function createOrchestrator({
     // displaySync merge is tracked as a property of the *driver channel*,
     // not a specific ws or session. All sessions on the driver channel are
     // considered equal — any of them can release. Original claimer leaving
-    // doesn't tear down the merge — the driver channel parks with the
-    // claim held. Only an explicit displaySync {enabled:false} or
-    // process shutdown releases it.
+    // doesn't tear down the merge: the driver's audience is every merged
+    // session, so it keeps running for the displays still connected and
+    // parks, claim held, only once all of them have left. Only an explicit
+    // displaySync {enabled:false} or process shutdown releases it.
     let mergeDriverChannel = null;
 
     // Shared-tag-selection mode (config: server.slideshow.sharedTags). When
@@ -891,11 +894,24 @@ function createOrchestrator({
             } else if (!isMergeActive() || channel === mergeDriverChannel) {
                 commitCurrent(channel);
             }
-        } else {
-            // Existing channel — fold the new session into the readiness
-            // barrier for the current image if we're still loading and
-            // the session is present.
-            const target = isMergeActive() ? mergeDriverChannel : channel;
+        }
+        const target = isMergeActive() ? mergeDriverChannel : channel;
+        if (target !== channel && target.parked) {
+            // The first merged display back to a merge nobody was watching:
+            // resume the driver's cadence, as its own first session would.
+            target.parked = false;
+            markAlive(target);
+            if (target.queue.length === 0) {
+                refillQueue(target).then(() => {
+                    if (mergeDriverChannel === target) commitCurrent(target);
+                });
+            } else {
+                commitCurrent(target);
+            }
+        } else if (!isFirstSession || target !== channel) {
+            // Existing channel, or a running merge — fold the new session
+            // into the readiness barrier for the current image if we're
+            // still loading and the session is present.
             if (target.phase === 'loading' && sessionPresent(key)) {
                 target.expectedReady.add(key);
             }
@@ -919,32 +935,42 @@ function createOrchestrator({
         const sess = sessionsByKey.get(key);
         if (!sess) return;
         const { ws, channel } = sess;
-        const wasActive = channelActive(channel);
+        // While merged, the session was part of the driver's audience: the
+        // driver channel is the one whose cadence this departure affects.
+        const target = isMergeActive() ? mergeDriverChannel : channel;
+        const wasActive = channelActive(target);
         sessionsByKey.delete(key);
         sessionPresence.delete(key);
         channel.sessions.delete(key);
-        channel.expectedReady.delete(key);
-        channel.ready.delete(key);
+        for (const c of new Set([channel, target])) {
+            c.expectedReady.delete(key);
+            c.ready.delete(key);
+        }
         const wsKeys = wsSessions.get(ws);
         if (wsKeys) {
             wsKeys.delete(key);
             if (wsKeys.size === 0) wsSessions.delete(ws);
         }
-        if (channel.sessions.size === 0) {
-            // Last session left — park the channel. Every timer stops
-            // so no DB/prefetch/dwell work runs while no one's listening,
-            // but queue / modTags / interval / currentId / merge claim
-            // are preserved verbatim. The next register() for this
+        // A non-driver channel is dormant for the merge's duration; with its
+        // last session gone it is parked for when the merge ends.
+        if (channel !== target && channel.sessions.size === 0) channel.parked = true;
+        if (broadcastTargets(target).length === 0) {
+            // Last of the audience left — park the channel. Every timer
+            // stops so no DB/prefetch/dwell work runs while no one's
+            // listening, but queue / modTags / interval / currentId / merge
+            // claim are preserved verbatim. The next register() for this
             // deviceId rebinds to the same channel and resumes from the
-            // same image; no slideshowConfig replay needed for state.
-            stopDwellTimer(channel);
-            stopReadyTimer(channel);
-            channel.parked = true;
-            if (wasActive) darkAdvance(channel).catch(() => {});
-        } else if (channel.phase === 'loading') {
+            // same image; no slideshowConfig replay needed for state. The
+            // driver of a merge parks only once every merged display has
+            // left: the claimer leaving alone doesn't stop the others.
+            stopDwellTimer(target);
+            stopReadyTimer(target);
+            target.parked = true;
+            if (wasActive) darkAdvance(target).catch(() => {});
+        } else if (target.phase === 'loading') {
             // Disconnect during the readiness barrier — re-check now that
             // the expected set is smaller.
-            startTimerIfReady(channel);
+            startTimerIfReady(target);
         }
     }
 
@@ -1089,8 +1115,10 @@ function createOrchestrator({
     function applyPresenceChange(channel, wasActive, signalPresent) {
         // A parked channel already handled its last session leaving in
         // removeSession(). Later device-level visibility bookkeeping must not
-        // advance or recommit unattended channels.
-        if (channel.sessions.size === 0) return;
+        // advance or recommit unattended channels. A merge driver's audience
+        // is every merged session, so it is attended while any of them is
+        // connected, with or without a session of its own.
+        if (broadcastTargets(channel).length === 0) return;
         markAlive(channel);
         const active = channelActive(channel);
         if (channel.phase === 'loading') {

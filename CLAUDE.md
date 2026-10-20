@@ -171,8 +171,10 @@ updates to track a server change, ship those too:
 - **`displaySync` is a merge.** The claimer's channel broadcasts to
   every WS regardless of `deviceId`; other channels' timers pause until
   release. All sessions on the driver channel are equal — the claimer
-  ws disconnecting does not release the merge; the driver channel
-  parks (timers stopped) and keeps the claim. Only an explicit
+  ws disconnecting does not release the merge; the driver's audience is
+  every merged session, so it keeps running for the displays still
+  connected and parks (timers stopped, claim kept) only once all of them
+  have left. Only an explicit
   `displaySync {enabled:false}` or process shutdown releases it. Anyone can
   `requestNext` / `block` / `setModTags` — no primary gate; the server
   is the only emitter of `playback` so there's no echo loop.

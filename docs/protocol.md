@@ -404,9 +404,13 @@ barrier waits on every visible session across all channels.
 `enabled: false` releases the merge — each channel resumes its own
 cadence and re-broadcasts to its own audience. All sessions on the
 driver channel are equals (any can release), and the original claimer
-disconnecting does *not* release the merge — the driver channel parks
-with the claim held. It is released only by an explicit
-`displaySync {enabled:false}` or process shutdown.
+disconnecting does *not* release the merge. The driver channel's
+audience is every merged session, so it keeps its cadence (dwell,
+`present` dark advance and wake) for the displays still connected, and
+parks only once all of them have left; the first merged display to
+reconnect resumes it. The claim is released only by an explicit
+`displaySync {enabled:false}` or process shutdown. Clients learn who
+holds it from `playback.mergeDriver`.
 
 ### `reportDisplay`, `reportSensor`, `reportWebcam`, `reportSuppress`
 Hardware-state reports from node-display (or any controller) into the

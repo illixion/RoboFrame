@@ -799,11 +799,94 @@ test('displaySync: driver disconnect parks driver channel and keeps merge held',
     // Driver disconnects. Merge stays — all sessions on the driver
     // channel are equal, and a transient disconnect of the original
     // claimer shouldn't disrupt the merge for everyone else. The
-    // driver channel is parked (timers stopped) but persists with the
-    // merge claim until a session on it explicitly releases.
+    // merge persists until a session on the driver channel explicitly
+    // releases.
     orch.unregister(a);
     assert.equal(orch._state().mergeDriverDeviceId, 'screen1',
         'driver ws drop alone does not release the merge');
+});
+
+// Two channels merged under screen1's claim, both displays shown and the
+// first frame confirmed. Returns the non-driver's ws for the merged tests.
+async function mergedPair() {
+    const h = harness({
+        pages: [
+            { results: [1, 2, 3, 4, 5, 6, 7, 8].map((id) => ({ _id: id, file_ext: 'jpg' })), nextCursor: 0 },
+            { results: [10, 11, 12, 13, 14].map((id) => ({ _id: id, file_ext: 'jpg' })), nextCursor: 0 },
+        ],
+    });
+    const { orch } = h;
+    const a = makeFakeWs();
+    const b = makeFakeWs();
+    orch.register(a, { deviceId: 'screen1', interval: 5000 });
+    await tick(); await tick(); await tick();
+    reportAllReady(orch, 'screen1');
+    orch.register(b, { deviceId: 'screen2', interval: 5000 });
+    await tick(); await tick(); await tick();
+    reportAllReady(orch, 'screen2');
+    orch.claimDisplaySync(a, true);
+    const driver = orch._channels.get('screen1');
+    orch.notifyImageReady(b, driver.currentId);
+    return { ...h, a, b, driver };
+}
+
+test('displaySync: the merged cadence keeps running for the other displays when the driver disconnects', async (t) => {
+    const { orch, b, a, driver } = await mergedPair();
+    t.after(() => orch.close());
+    assert.equal(driver.phase, 'displaying');
+
+    const shown = driver.currentId;
+    orch.unregister(a);
+    assert.ok(driver.timer, 'dwell still running for the display that stayed');
+    assert.equal(driver.parked, false);
+    assert.equal(driver.currentId, shown, 'no dark advance while a merged display still shows it');
+});
+
+test('displaySync: a merged display coming back after the driver left gets a fresh post and a running dwell', async (t) => {
+    const { orch, a, b, driver } = await mergedPair();
+    t.after(() => orch.close());
+    orch.unregister(a);
+
+    // The panel goes off: one dark advance, then park.
+    const shown = driver.currentId;
+    orch.notifySessionPresent(b, false);
+    orch.notifyPresent('screen2', false);
+    await tick(); await tick(); await tick();
+    assert.equal(driver.timer, null, 'no dwell while every merged display is dark');
+    assert.notEqual(driver.currentId, shown, 'dark-advanced to a fresh post');
+    const darkId = driver.currentId;
+
+    // Back on: the fresh post is delivered, and confirming it starts the dwell.
+    b.sent.length = 0;
+    orch.notifySessionPresent(b, true);
+    orch.notifyPresent('screen2', true);
+    await tick();
+    const frame = b.sent.find((m) => m.action === 'playback');
+    assert.ok(frame, 'the returning display is sent the parked post');
+    assert.equal(frame.payload.current.id, darkId);
+    assert.equal(driver.phase, 'loading');
+    orch.notifyImageReady(b, darkId);
+    assert.equal(driver.phase, 'displaying');
+    assert.ok(driver.timer, 'dwell running again after the wake');
+});
+
+test('displaySync: a merged display reconnecting to an empty merge resumes the driver channel', async (t) => {
+    const { orch, a, b, driver } = await mergedPair();
+    t.after(() => orch.close());
+    orch.unregister(a);
+    orch.unregister(b);
+    assert.equal(driver.parked, true, 'nobody watching: the merged cadence parks');
+    assert.equal(driver.timer, null);
+
+    const b2 = makeFakeWs();
+    orch.register(b2, { deviceId: 'screen2', interval: 5000 });
+    await tick(); await tick();
+    assert.equal(orch._state().mergeDriverDeviceId, 'screen1', 'the claim is still held');
+    assert.equal(driver.parked, false);
+    assert.equal(driver.phase, 'loading');
+    orch.notifyImageReady(b2, driver.currentId);
+    assert.equal(driver.phase, 'displaying');
+    assert.ok(driver.timer, 'the merged cadence runs again');
 });
 
 test('reconnect to parked channel restores state without slideshowConfig replay', async (t) => {
