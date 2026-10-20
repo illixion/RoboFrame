@@ -15,12 +15,16 @@
 //   6. pirMotion && !suppress  -> ON
 //   7. otherwise               -> OFF
 //
-// Reporting back to HA mirrors the previous behaviour: PIR- and effect-driven
-// transitions report (HA's light entity follows the panel), HA-originated
-// transitions (override, suppress, night-light) stay silent so the entity
-// doesn't echo its own command back.
+// Every transition is reported (`reportDisplay`), so HA's light entity and the
+// kiosk sharing this deviceId follow what the panel actually does, except the
+// override ones: an override is HA's own light command, which the broker has
+// already broadcast as `displayState` and confirmed to the entity, so
+// reporting it would only echo the command back. Suppress, night-light and
+// tempDisabled change the panel without anyone else knowing, so they report:
+// a kiosk left believing a suppressed panel is lit keeps confirming frames
+// nobody sees and takes X's no-output 320x200 screen for its real size.
 
-const REPORTING_REASONS = new Set(['pir', 'pir+nightLight', 'idle', 'effect']);
+const SILENT_REASONS = new Set(['override-on', 'override-off']);
 
 // Exponential backoff for failed turnOn/turnOff calls. Capped so we don't
 // hammer DDC/xrandr forever on a broken bus, but reconcile() can still
@@ -211,7 +215,7 @@ class DisplayController {
     const t = this.computeTarget();
     if (!fromRetry && t.state === this.lastApplied && t.brightness === this.lastBrightness) return;
     const wasOn = this.lastApplied === 'on';
-    const shouldReport = REPORTING_REASONS.has(t.reason);
+    const shouldReport = !SILENT_REASONS.has(t.reason);
     this.log(`evaluate(${cause}): -> ${t.state}${t.brightness !== null ? `@${t.brightness}` : ''} (${t.reason})`);
     this.inFlight = true;
 

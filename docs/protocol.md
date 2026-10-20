@@ -426,7 +426,10 @@ broker → MQTT bridge. Not part of the slideshow loop.
 `displayState { target, state }` frame so peer clients sharing the
 same `deviceId` (e.g. a browser kiosk on a Pi alongside node-display)
 converge on what the panel is actually doing — including PIR-driven
-wakes after an HA-driven `displayState: off`.
+wakes after an HA-driven `displayState: off`. node-display reports every
+panel transition (PIR, idle, effect, suppress, night-light, tempDisabled)
+except those an HA `displayState` command caused, which the broker has
+already broadcast.
 
 ```json
 { "action": "reportSensor", "payload": {

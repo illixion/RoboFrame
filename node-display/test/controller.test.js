@@ -99,13 +99,38 @@ test('HA override on while suppressed wakes; subsequent PIR edge clears override
   ctl.setSuppressWake(true);
   ctl.setOverride('on');
   assert.equal(log.includes('on'), true);
-  // override-on reason is not in REPORTING_REASONS — silent to HA.
+  // override-on is HA's own command — silent, the broker already broadcast it.
   assert.equal(log.includes('report=on'), false);
   log.length = 0;
   // PIR motion arrives — override should clear; suppress still on so panel goes off.
   ctl.setPir(true);
   assert.equal(ctl.snapshot().override, null);
   assert.equal(log.includes('off'), true);
+});
+
+test('suppress turning a lit panel off reports it, so the kiosk and HA follow', () => {
+  const { ctl, log } = makeHarness();
+  ctl.setPir(true);
+  log.length = 0;
+  ctl.setSuppressWake(true);
+  assert.deepEqual(log, ['off', 'report=off']);
+});
+
+test('a PIR edge clearing an override onto a suppressed panel reports the off', () => {
+  const { ctl, log } = makeHarness();
+  ctl.setSuppressWake(true);
+  ctl.setOverride('on');
+  log.length = 0;
+  ctl.setPir(true);
+  assert.deepEqual(log, ['off', 'report=off']);
+});
+
+test('override off is silent: it is HA\'s own command', () => {
+  const { ctl, log } = makeHarness();
+  ctl.setPir(true);
+  log.length = 0;
+  ctl.setOverride('off');
+  assert.deepEqual(log, ['off']);
 });
 
 test('effect punches through suppress AND tempDisabled, holds for duration', () => {
