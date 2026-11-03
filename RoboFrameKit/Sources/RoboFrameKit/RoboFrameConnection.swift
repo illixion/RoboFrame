@@ -210,10 +210,10 @@ public final class RoboFrameConnection {
 
     private func handle(_ event: RAVENetEvent) {
         switch event {
-        case .frame(let text):
+        case .frame(let text, _):
             if !isConnected { promoteToConnected() }
             receive(text)
-        case .stateChanged(let newState):
+        case .stateChanged(let newState, _):
             guard state != newState else { return }
             // Ready is declared here, on a frame, never heard back: a markReady
             // queued for a socket that has since been replaced lands on the new
