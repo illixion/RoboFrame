@@ -647,6 +647,14 @@ WantedBy=multi-user.target
 
 The Pi build of `node-display` uses `ddcutil` for backlight brightness control via DDC/CI. The bus is auto-discovered via `ddcutil detect`; set `DDC_BUS` to override. If `ddcutil` is missing or the attached panel does not respond to DDC/CI, brightness control is disabled and the daemon falls back to DPMS-only on/off (a brightness of `0` powers the panel off, any non-zero value powers it on).
 
+## Support
+
+I'm Ixion. I make RoboFrame, and everything else I publish, as free and open-source software, and I don't expect anything in return. If it's useful to you and you'd like to help me keep building, you can [sponsor me on GitHub](https://github.com/sponsors/illixion). If not, I hope you enjoy it all the same. 💖
+
+<!-- Pose art slot: once https://illixion.com/images/support/synth-wave.png exists, uncomment:
+<p align="center"><img src="https://illixion.com/images/support/synth-wave.png" width="220" alt="Ixion's Synth character waving"></p>
+-->
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
