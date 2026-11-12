@@ -349,6 +349,19 @@ Home Assistant gets an auto-discovered switch
 runtime. For off-LAN access, front the port with tailscale-serve (or similar)
 and set `tokens` so the exposed endpoint isn't open.
 
+When FFmpeg reads an authenticated webcam endpoint (for example from a
+MediaMTX `runOnDemand` hook), keep the token out of the input URL. FFmpeg
+includes input URLs in some error messages, which can put a query-string token
+in the service journal. Pass it as an HTTP header instead:
+
+```sh
+ffmpeg -headers 'Authorization: Bearer <WEBCAM_TOKEN>' \
+  -i http://127.0.0.1:8082/stream.mjpg ...
+```
+
+The endpoint accepts both this header and `?token=`, but the header keeps the
+credential out of URL-based diagnostics.
+
 ## Live scenes (server-rendered pages)
 
 Animation-heavy pages (shader effects, canvas demos, busy custom pages) that
