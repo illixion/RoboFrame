@@ -766,7 +766,11 @@ struct ViewerDestination: View {
     var onConfigChanged: (RoboFrameProfile) -> Void = { _ in }
     var body: some View {
         switch profile.mode {
-        case .slideshow: SlideshowWindowView(profile: profile, onConfigChanged: onConfigChanged)
+        case .slideshow:
+            SlideshowWindowView(profile: profile, onConfigChanged: onConfigChanged)
+                #if os(visionOS)
+                .raveViewerHUDWindow()
+                #endif
         case .webPage: WebPageWindowView(profile: profile)
         }
     }

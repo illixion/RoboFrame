@@ -49,12 +49,14 @@ final class SlideshowModel {
     var toastIsError = false
     private var toastTask: Task<Void, Never>?
 
+    let clipPool = SlideshowClipPool()
+
     init(profile: RoboFrameProfile, sessionID: String? = nil, pool: RemoteSessionPool = .shared) {
         self.profile = profile
         self.sessionID = sessionID ?? profile.id.uuidString
         self.pool = pool
         engine = RAVESlideshowEngine(
-            provider: RoboFrameSlideshowProvider(profile: profile),
+            provider: RoboFrameSlideshowProvider(profile: profile, clips: clipPool),
             displaySettings: .init(
                 delay: profile.interval,
                 showClock: profile.showClock,
@@ -216,6 +218,7 @@ final class SlideshowModel {
         pool.detach(sessionID: sessionID, profile: profile)
         connection = nil
         engine.stop()
+        clipPool.stopAll()
         audioPlayer?.pause()
         audioPlayer = nil
         toastTask?.cancel()

@@ -9,6 +9,7 @@
 import DebugTrace
 import DebugTraceServer
 import DebugTraceUI
+import RAVEUI
 import SwiftUI
 
 @main
@@ -35,6 +36,7 @@ struct RoboFrameApp: App {
         // than a system alert that 3D content or an immersive space can hide.
         #if os(visionOS)
         DebugApprovalWindow()
+        RAVEViewerHUDScene()
         #endif
 
         #if os(visionOS)

@@ -53,10 +53,12 @@ actor RoboFrameAPI {
 final class RoboFrameSlideshowProvider: RAVESlideshowContentProvider {
     private let profile: RoboFrameProfile
     private let api: RoboFrameAPI
+    private let clips: SlideshowClipPool
 
-    init(profile: RoboFrameProfile, api: RoboFrameAPI = RoboFrameAPI()) {
+    init(profile: RoboFrameProfile, clips: SlideshowClipPool, api: RoboFrameAPI = RoboFrameAPI()) {
         self.profile = profile
         self.api = api
+        self.clips = clips
     }
 
     func fetchMoreContent(_ request: RAVESlideshowFetchRequest) async throws -> [RAVESlideshowItem] {
@@ -71,7 +73,7 @@ final class RoboFrameSlideshowProvider: RAVESlideshowContentProvider {
         if post.isVideo {
             // Buffered before the engine stages it, as a still's bytes are:
             // the crossfade then fades in a picture, not an empty player.
-            await SlideshowClipPool.shared.prepare(url)
+            await clips.prepare(url)
             return .video(url: url, hlsURL: nil)
         }
         return .still(data: try await URLSession.shared.data(from: url).0, displayURL: url)

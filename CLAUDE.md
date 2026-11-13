@@ -100,6 +100,18 @@ swift-kiosk, on the shared `RoboFrameKit`).
   validate `posts.duckdb`.
 - `packages/shared/` — config loader (env > file > default).
 
+## Native viewer presentation
+
+visionOS slideshows use RAVEUI's `raveViewerControls` scene ornament and
+`raveViewerHUDWindow` live-view handoff, with `RAVEViewerHUDScene` in the app.
+iOS keeps controls inside its fullscreen viewer. The ornament scrolls to the
+window width and keeps menus/popovers open through the auto-hide timer.
+Brightness/contrast/saturation belong to each media renderer and opacity to
+`RAVESlideshowSurface`; applying them again on the whole viewer doubles them.
+AI 3D stills use `RAVEStereoPhotoView`, like Convolution; depth-cache keys include
+the profile. Each `SlideshowModel` owns its clip pool so one window cannot stop
+another's player. Both presentations keep the same model, engine and players.
+
 ## Run / test
 
 ```bash

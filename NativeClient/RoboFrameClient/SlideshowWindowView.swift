@@ -5,15 +5,8 @@
  apply outside Hypnos's multi-scene window manager: media surface, clock/
  sensor overlays, toast, alert, history, tap-to-reveal auto-hide chrome.
 
- Ornament note: Hypnos attaches its ornament via SwiftUI's `.ornament()`
- modifier onto a `WindowGroup` scene. RoboFrame's viewer is presented with
- `.fullScreenCover`, and `.ornament()`'s "float outside the window bounds"
- behavior is defined in terms of the presenting scene rather than modal
- content, so its behavior there is unverified. Rather than gamble that on an
- unattended pass, the chrome here is a plain bottom-anchored bar using the
- same `chromeBackground()` glass look — same buttons, same layout, just
- anchored inside the window instead of floating past its edge. Revisit with
- `.ornament()` once this can be verified on-device.
+ visionOS uses the same scene ornament and live HUD host as Convolution.
+ iOS keeps its controls inside the single fullscreen viewer.
  */
 
 import Combine
@@ -23,6 +16,9 @@ import SwiftUI
 
 struct SlideshowWindowView: View {
     @Environment(\.scenePhase) private var scenePhase
+    #if os(visionOS)
+    @Environment(\.raveViewerHUD) private var viewerHUD
+    #endif
     let profile: RoboFrameProfile
     let onConfigChanged: (RoboFrameProfile) -> Void
 
@@ -32,6 +28,8 @@ struct SlideshowWindowView: View {
     @State private var autoHideTask: Task<Void, Never>?
     @State private var currentTime = Date()
     @State private var historyStore: RemoteHistoryStore?
+    @State private var viewerSize = CGSize(width: 1400, height: 900)
+    @State private var controlsBusy = false
 
     private let clockTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -48,10 +46,6 @@ struct SlideshowWindowView: View {
             }
 
             RoboFrameSlideshowSurface(model: model)
-                .brightness(model.adjustments.brightness)
-                .contrast(model.adjustments.contrast)
-                .saturation(model.adjustments.saturation)
-                .opacity(model.adjustments.opacity)
                 .ignoresSafeArea()
 
             // Everything drawn over the picture sits in front of an AI 3D
@@ -89,18 +83,34 @@ struct SlideshowWindowView: View {
                 .liftedOverAIDepth(isAIDepth)
             }
 
+            #if !os(visionOS)
             VStack {
                 Spacer()
                 if controlsVisible {
-                    SlideshowOrnamentView(model: model, showHistory: $showHistory)
+                    viewerControls
                         .padding(.bottom, 24)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
             .liftedOverAIDepth(isAIDepth)
+            #endif
         }
+        .background {
+            GeometryReader { geometry in
+                Color.clear
+                    .onAppear { viewerSize = geometry.size }
+                    .onChange(of: geometry.size) { _, size in viewerSize = size }
+            }
+        }
+        #if os(visionOS)
+        .raveViewerControls(visible: controlsVisible) { viewerControls }
+        .onChange(of: viewerHUD?.isInHUD) { _, inHUD in
+            if inHUD == false { controlsVisible = true; resetAutoHideTimer() }
+        }
+        #endif
         .contentShape(.rect)
         .onTapGesture {
+            guard !controlsBusy else { return }
             withAnimation { controlsVisible.toggle() }
             resetAutoHideTimer()
         }
@@ -130,6 +140,7 @@ struct SlideshowWindowView: View {
             model.reportScene(active: newPhase == .active)
         }
         .onChange(of: showHistory) { _, isOpen in
+            resetAutoHideTimer()
             guard isOpen, let historyStore else { return }
             Task { await historyStore.refresh() }
         }
@@ -143,6 +154,15 @@ struct SlideshowWindowView: View {
                 model.depthModelInstalled()
             }
         }
+    }
+
+    private var viewerControls: some View {
+        SlideshowOrnamentView(model: model, showHistory: $showHistory,
+                             availableWidth: max(320, viewerSize.width - 32)) { busy in
+            controlsBusy = busy
+            if busy { autoHideTask?.cancel() } else { resetAutoHideTimer() }
+        }
+        .simultaneousGesture(TapGesture().onEnded { resetAutoHideTimer() })
     }
 
     private var isAIDepth: Bool { model.slideshow3DMode == .aiDepth }
@@ -214,7 +234,10 @@ struct SlideshowWindowView: View {
 
     private func resetAutoHideTimer() {
         autoHideTask?.cancel()
-        guard controlsVisible else { return }
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-UITestKeepControls") { return }
+        #endif
+        guard controlsVisible, !controlsBusy, !showHistory else { return }
         autoHideTask = Task {
             try? await Task.sleep(for: .seconds(ChromeAutoHide.delay))
             guard !Task.isCancelled else { return }
@@ -224,12 +247,12 @@ struct SlideshowWindowView: View {
 }
 
 private extension View {
-    /// In front of an AI 3D picture's mesh and its input layer. visionOS
+    /// In front of the stereo picture's input layer. visionOS
     /// only: elsewhere there is no mesh and no depth.
     @ViewBuilder
     func liftedOverAIDepth(_ isAIDepth: Bool) -> some View {
         #if os(visionOS)
-        offset(z: isAIDepth ? RAVEAIDepthPhotoView.inputTargetZ + 4 : 0)
+        offset(z: isAIDepth ? RAVEStereoPhotoView.inputTargetZ + 4 : 0)
         #else
         self
         #endif

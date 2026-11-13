@@ -58,6 +58,24 @@ final class RoboFrameClientUITests: XCTestCase {
     // registry, and the toolbar buttons that expose it, are both
     // `#if os(visionOS)`) — these two are compiled out on iOS.
     #if os(visionOS)
+    func testSlideshowEntersHUDWithLiveContentAndControls() throws {
+        app.launchArguments = ["-UITestProfile=slideshow", "-UITestKeepControls"]
+        app.launch()
+        app.buttons["roboframe.profile.open"].tap()
+        XCTAssertTrue(app.staticTexts["Waiting for RoboFrame…"].waitForExistence(timeout: 10))
+        let enter = app.buttons["rave.hud.enter"]
+        XCTAssertTrue(enter.waitForExistence(timeout: 10))
+        enter.tap()
+        XCTAssertTrue(app.sliders["HUD size"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["rave.hud.return"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Showing in HUD"].exists)
+        XCTAssertTrue(app.staticTexts["Waiting for RoboFrame…"].exists)
+        // Head-anchored controls move with the simulator's synthetic gaze;
+        // physical pinch/drag is checked on a headset. The portal's repeated
+        // return and state retention are covered by the unit suite.
+        app.terminate()
+    }
+
     func testOpensConsoleWindow() throws {
         app.launchArguments = ["-UITestProfile=empty"]
         app.launch()

@@ -1,6 +1,10 @@
 import XCTest
 import RAVESlideshow
 @testable import RoboFrameClient
+#if os(visionOS)
+@testable import RAVEUI
+import UIKit
+#endif
 
 final class RoboFrameClientTests: XCTestCase {
     func testSlideshowURLPreservesDeploymentSubpathAndToken() {
@@ -40,6 +44,52 @@ final class RoboFrameClientTests: XCTestCase {
         let sessionID = await MainActor.run { SlideshowModel(profile: profile).sessionID }
         XCTAssertEqual(sessionID, profile.id.uuidString)
     }
+    #if os(visionOS)
+    @MainActor
+    func testHUDReturnsTheSameLiveViewAndRetainsItsState() {
+        let portal = RAVEViewerHUDPortal()
+        let home = UIView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let hud = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 400))
+        let liveView = UIView(frame: home.bounds)
+        let editor = UITextField()
+        editor.text = "Retained viewer state"
+        liveView.addSubview(editor)
+        home.addSubview(liveView)
+        portal.home = home
+        portal.source = liveView
+        for _ in 0..<3 {
+            portal.mount(in: hud)
+            XCTAssertTrue(portal.isInHUD)
+            XCTAssertTrue(liveView.superview === hud)
+            XCTAssertTrue(home.subviews.isEmpty)
+            XCTAssertEqual(editor.text, "Retained viewer state")
+            portal.restore()
+            XCTAssertFalse(portal.isInHUD)
+            XCTAssertTrue(liveView.superview === home)
+            XCTAssertEqual(liveView.frame, home.bounds)
+            XCTAssertTrue(hud.subviews.isEmpty)
+            XCTAssertTrue(liveView.subviews.first === editor)
+            XCTAssertEqual(editor.text, "Retained viewer state")
+        }
+    }
+    #endif
+
+    @MainActor
+    func testClosingOneViewerDoesNotStopAnotherViewersVideo() {
+        var profile = RoboFrameProfile()
+        profile.endpoint = "https://frame.example"
+        let first = SlideshowModel(profile: profile)
+        let second = SlideshowModel(profile: profile)
+        let url = URL(fileURLWithPath: "/tmp/roboframe-test-clip.mp4")
+        let firstClip = first.clipPool.clip(for: url)
+        let secondClip = second.clipPool.clip(for: url)
+        XCTAssertFalse(firstClip.player === secondClip.player)
+        first.stop()
+        XCTAssertNil(firstClip.player.currentItem)
+        XCTAssertNotNil(secondClip.player.currentItem)
+        second.stop()
+    }
+
     func testServerDrivenEngineWaitsForAuthoritativePlayback() async {
         let provider = await MainActor.run { TestProvider() }
         let engine = await MainActor.run {

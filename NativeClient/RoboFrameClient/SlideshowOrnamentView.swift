@@ -10,15 +10,28 @@ import SwiftUI
 
 struct SlideshowOrnamentView: View {
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.openWindow) private var openWindow
+    @Environment(\.openWindow) private var sceneOpenWindow
+    #if os(visionOS)
+    @Environment(\.raveWindowShell) private var windowShell
+    private var openWindow: OpenWindowAction { windowShell?.openWindow ?? sceneOpenWindow }
+    #else
+    private var openWindow: OpenWindowAction { sceneOpenWindow }
+    #endif
     let model: SlideshowModel
     @Binding var showHistory: Bool
+    var availableWidth: CGFloat = 1100
+    var onInteraction: (Bool) -> Void = { _ in }
+    @State private var openMenuCount = 0
     @State private var showAdjustments = false
     @State private var showAddPresetPopover = false
     @State private var newPresetText = ""
 
     var body: some View {
+        ScrollView(.horizontal) {
         HStack(spacing: RAVEChromeMetrics.spacing) {
+            #if os(visionOS)
+            RAVEViewerHUDButton().labelStyle(.iconOnly).raveChromeButtonStyle()
+            #endif
             // Back to the profile list — RoboFrame's equivalent of Hypnos's
             // "Grid" button, which returns to the app's main gallery window.
             Button {
@@ -99,7 +112,12 @@ struct SlideshowOrnamentView: View {
         }
         .padding(.horizontal, RAVEChromeMetrics.horizontalPadding)
         .padding(.vertical, RAVEChromeMetrics.verticalPadding)
+        }
+        .scrollIndicators(.hidden)
+        .frame(width: availableWidth, height: 72)
         .chromeBackground()
+        .onChange(of: showAdjustments || showAddPresetPopover || openMenuCount > 0) { _, busy in onInteraction(busy) }
+        .onDisappear { onInteraction(false) }
     }
 
     /// The server holds the claim across disconnects, so the toggle reads
@@ -127,16 +145,20 @@ struct SlideshowOrnamentView: View {
 
     private var tagListMenu: some View {
         Menu {
-            ForEach(model.tagLists.indices, id: \.self) { index in
-                Button {
-                    model.setTagList(index)
-                } label: {
-                    HStack {
-                        Text(tagListLabel(index))
-                        if model.currentList == index { Image(systemName: "checkmark") }
+            Group {
+                ForEach(model.tagLists.indices, id: \.self) { index in
+                    Button {
+                        model.setTagList(index)
+                    } label: {
+                        HStack {
+                            Text(tagListLabel(index))
+                            if model.currentList == index { Image(systemName: "checkmark") }
+                        }
                     }
                 }
             }
+            .onAppear { openMenuCount += 1 }
+            .onDisappear { openMenuCount = max(0, openMenuCount - 1) }
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "number").font(.title3)
@@ -157,28 +179,32 @@ struct SlideshowOrnamentView: View {
 
     private var modTagMenu: some View {
         Menu {
-            Button {
-                ModTagManager.shared.clearActive()
-            } label: {
-                HStack { Text("None"); if ModTagManager.shared.activeIndex == nil { Image(systemName: "checkmark") } }
-            }
-            ForEach(ModTagManager.shared.modTagLists.indices, id: \.self) { index in
+            Group {
                 Button {
-                    ModTagManager.shared.switchToPreset(index)
+                    ModTagManager.shared.clearActive()
                 } label: {
-                    HStack {
-                        Text(modTagLabel(index))
-                        if ModTagManager.shared.activeIndex == index { Image(systemName: "checkmark") }
+                    HStack { Text("None"); if ModTagManager.shared.activeIndex == nil { Image(systemName: "checkmark") } }
+                }
+                ForEach(ModTagManager.shared.modTagLists.indices, id: \.self) { index in
+                    Button {
+                        ModTagManager.shared.switchToPreset(index)
+                    } label: {
+                        HStack {
+                            Text(modTagLabel(index))
+                            if ModTagManager.shared.activeIndex == index { Image(systemName: "checkmark") }
+                        }
                     }
                 }
+                Divider()
+                Button {
+                    newPresetText = ""
+                    showAddPresetPopover = true
+                } label: {
+                    Label("Add Preset…", systemImage: "plus")
+                }
             }
-            Divider()
-            Button {
-                newPresetText = ""
-                showAddPresetPopover = true
-            } label: {
-                Label("Add Preset…", systemImage: "plus")
-            }
+            .onAppear { openMenuCount += 1 }
+            .onDisappear { openMenuCount = max(0, openMenuCount - 1) }
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "tag").font(.title3)
@@ -260,13 +286,17 @@ struct SlideshowOrnamentView: View {
     #if os(visionOS)
     private var slideshow3DMenu: some View {
         Menu {
-            ForEach(Slideshow3DPreference.allCases) { mode in
-                Button {
-                    model.slideshow3DMode = mode
-                } label: {
-                    HStack { Text(mode.label); if model.slideshow3DMode == mode { Image(systemName: "checkmark") } }
+            Group {
+                ForEach(Slideshow3DPreference.allCases) { mode in
+                    Button {
+                        model.slideshow3DMode = mode
+                    } label: {
+                        HStack { Text(mode.label); if model.slideshow3DMode == mode { Image(systemName: "checkmark") } }
+                    }
                 }
             }
+            .onAppear { openMenuCount += 1 }
+            .onDisappear { openMenuCount = max(0, openMenuCount - 1) }
         } label: {
             Image(systemName: model.slideshow3DMode.systemImage)
                 .font(.title3)
@@ -285,13 +315,17 @@ struct SlideshowOrnamentView: View {
         let currentLabel = AppSettings.maxImageResolutionOptions.first(where: { $0.value == currentValue })?.label ?? "Off"
 
         return Menu {
-            ForEach(AppSettings.maxImageResolutionOptions, id: \.value) { option in
-                Button {
-                    if is3D { model.maxImageResolution3D = option.value } else { model.maxImageResolution2D = option.value }
-                } label: {
-                    HStack { Text(option.label); if option.value == currentValue { Image(systemName: "checkmark") } }
+            Group {
+                ForEach(AppSettings.maxImageResolutionOptions, id: \.value) { option in
+                    Button {
+                        if is3D { model.maxImageResolution3D = option.value } else { model.maxImageResolution2D = option.value }
+                    } label: {
+                        HStack { Text(option.label); if option.value == currentValue { Image(systemName: "checkmark") } }
+                    }
                 }
             }
+            .onAppear { openMenuCount += 1 }
+            .onDisappear { openMenuCount = max(0, openMenuCount - 1) }
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "photo").font(.title3)

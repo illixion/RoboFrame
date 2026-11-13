@@ -12,6 +12,7 @@ struct RoboFrameSlideshowSurface: View {
             StillSlideshowMedia(
                 context: context,
                 aiDepth: mode == .aiDepth,
+                contentNamespace: model.profile.id.uuidString,
                 // The surface fades the outgoing layer with SwiftUI opacity,
                 // which an AI 3D mesh doesn't follow; it fades on its own.
                 isOutgoing: context.role == .current && model.engine.incoming != nil
@@ -19,7 +20,7 @@ struct RoboFrameSlideshowSurface: View {
         } animated: { context in
             StillSlideshowMedia(context: context)
         } video: { context in
-            SlideshowVideoMedia(context: context, pseudo3D: mode.convertsVideo)
+            SlideshowVideoMedia(context: context, pseudo3D: mode.convertsVideo, clips: model.clipPool)
         } placeholder: {
             ProgressView("Waiting for RoboFrame…")
                 .tint(.white)
@@ -32,7 +33,7 @@ struct RoboFrameSlideshowSurface: View {
             guard mode == .aiDepth, let peek = model.engine.peekedNext,
                   case .still(let data, _) = peek.media,
                   let image = UIImage(data: data)?.cgImage else { return }
-            _ = await SlideshowDepthCache.shared.depth(for: peek.item.id, image: image)
+            _ = await SlideshowDepthCache.shared.depth(for: model.profile.id.uuidString + ":" + peek.item.id, image: image)
         }
         #endif
     }
@@ -41,6 +42,7 @@ struct RoboFrameSlideshowSurface: View {
 private struct StillSlideshowMedia: View {
     let context: RAVESlideshowRenderContext
     var aiDepth = false
+    var contentNamespace = ""
     var isOutgoing = false
 
     var body: some View {
@@ -58,7 +60,7 @@ private struct StillSlideshowMedia: View {
                     #if os(visionOS)
                     if aiDepth, let cgImage = image.cgImage {
                         AIDepthStill(
-                            itemID: context.media.item.id,
+                            itemID: contentNamespace + ":" + context.media.item.id,
                             image: cgImage,
                             aspectRatio: image.size,
                             visualSettings: context.visualSettings,
@@ -73,6 +75,9 @@ private struct StillSlideshowMedia: View {
             }
         case .animatedImage(_, let url):
             AsyncImage(url: url) { $0.image?.resizable().scaledToFit() }
+                .brightness(context.visualSettings.brightness)
+                .contrast(context.visualSettings.contrast)
+                .saturation(context.visualSettings.saturation)
         case .video:
             EmptyView()
         }
@@ -82,15 +87,19 @@ private struct StillSlideshowMedia: View {
 private struct SlideshowVideoMedia: View {
     let context: RAVESlideshowRenderContext
     let pseudo3D: Bool
+    let clips: SlideshowClipPool
 
     var body: some View {
         guard case .video(let url, _) = context.media.media else { return AnyView(EmptyView()) }
         #if os(visionOS)
         if pseudo3D {
-            return AnyView(Pseudo3DSlideshowVideo(url: url, visualSettings: context.visualSettings))
+            return AnyView(Pseudo3DSlideshowVideo(url: url, visualSettings: context.visualSettings, clips: clips))
         }
         #endif
-        return AnyView(FlatSlideshowVideo(url: url))
+        return AnyView(FlatSlideshowVideo(url: url, clips: clips)
+            .brightness(context.visualSettings.brightness)
+            .contrast(context.visualSettings.contrast)
+            .saturation(context.visualSettings.saturation))
     }
 }
 
@@ -100,20 +109,21 @@ private struct SlideshowVideoMedia: View {
 /// crossfade fades in a picture rather than an empty layer.
 private struct FlatSlideshowVideo: View {
     let url: URL
+    let clips: SlideshowClipPool
 
     var body: some View {
         // Taken while rendering, not in `.task`, so the layer's very first
         // frame already has the prepared player behind it.
-        PlayerLayerView(player: SlideshowClipPool.shared.clip(for: url).player)
+        PlayerLayerView(player: clips.clip(for: url).player)
             // Started as the layer is inserted, so the crossfade fades in a
             // clip that is already moving.
-            .onAppear { SlideshowClipPool.shared.clip(for: url).play() }
+            .onAppear { clips.clip(for: url).play() }
             .task(id: url) {
                 // A clip that never starts says why, instead of sitting on a black tile.
                 try? await Task.sleep(for: .seconds(5))
-                SlideshowClipPool.shared.clip(for: url).reportIfStalled()
+                clips.clip(for: url).reportIfStalled()
             }
-            .onDisappear { SlideshowClipPool.shared.release(url) }
+            .onDisappear { clips.release(url) }
     }
 }
 
@@ -125,7 +135,6 @@ private struct FlatSlideshowVideo: View {
 /// its turn.
 @MainActor
 final class SlideshowClipPool {
-    static let shared = SlideshowClipPool()
     private static let capacity = 8
 
     private var clips: [URL: SlideshowClipPlayer] = [:]
@@ -154,6 +163,12 @@ final class SlideshowClipPool {
     func release(_ url: URL) {
         clips.removeValue(forKey: url)?.stop()
         order.removeAll { $0 == url }
+    }
+
+    func stopAll() {
+        for clip in clips.values { clip.stop() }
+        clips.removeAll()
+        order.removeAll()
     }
 
     private func evict() {
@@ -288,10 +303,8 @@ private struct PlayerLayerView: UIViewRepresentable {
 import RAVEMedia
 import RealityKit
 
-/// AI 3D over one slideshow picture: the depth mesh, laid over the flat
-/// picture once the depth is ready, and an input layer in front of it so
-/// the window's tap still toggles the chrome (the mesh's RealityView would
-/// swallow it).
+/// The same stereo still presentation as Convolution's photo viewer, with
+/// a flat fallback while depth loads and a front layer for chrome gestures.
 private struct AIDepthStill: View {
     let itemID: String
     let image: CGImage
@@ -304,7 +317,7 @@ private struct AIDepthStill: View {
     var body: some View {
         ZStack {
             if let depth {
-                RAVEAIDepthPhotoView(
+                RAVEStereoPhotoView(
                     image: image,
                     depth: depth,
                     contentID: itemID,
@@ -317,7 +330,7 @@ private struct AIDepthStill: View {
                     fadeDuration: fadeDuration
                 )
                 Color.white.opacity(0.001)
-                    .offset(z: RAVEAIDepthPhotoView.inputTargetZ)
+                    .offset(z: RAVEStereoPhotoView.inputTargetZ)
             }
         }
         .aspectRatio(aspectRatio, contentMode: .fit)
@@ -358,13 +371,17 @@ final class SlideshowDepthCache {
 private struct Pseudo3DSlideshowVideo: View {
     let url: URL
     let visualSettings: RAVESlideshowVisualSettings
+    let clips: SlideshowClipPool
     @State private var engine = Pseudo3DStereoEngine()
     @State private var failed = false
 
     var body: some View {
         Group {
             if failed {
-                FlatSlideshowVideo(url: url)
+                FlatSlideshowVideo(url: url, clips: clips)
+                    .brightness(visualSettings.brightness)
+                    .contrast(visualSettings.contrast)
+                    .saturation(visualSettings.saturation)
             } else {
                 GeometryReader3D { _ in
                     RealityView { content in
