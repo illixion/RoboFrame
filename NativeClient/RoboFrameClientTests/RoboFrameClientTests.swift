@@ -50,27 +50,48 @@ final class RoboFrameClientTests: XCTestCase {
         let portal = RAVEViewerHUDPortal()
         let home = UIView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
         let hud = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 400))
-        let liveView = UIView(frame: home.bounds)
+        let homeController = UIViewController()
+        let hudController = UIViewController()
+        homeController.view.addSubview(home)
+        hudController.view.addSubview(hud)
+        let appearance = HUDAppearanceProbe()
+        let contentController = RAVEViewerHUDContainerController(host: appearance)
+        homeController.addChild(contentController)
+        let liveView = contentController.view!
+        liveView.frame = home.bounds
+        portal.controller = contentController
         let editor = UITextField()
         editor.text = "Retained viewer state"
-        liveView.addSubview(editor)
+        appearance.view.addSubview(editor)
         home.addSubview(liveView)
+        contentController.didMove(toParent: homeController)
+        contentController.start()
         portal.home = home
         portal.source = liveView
         for _ in 0..<3 {
+            contentController.beginAppearanceTransition(false, animated: false)
+            contentController.endAppearanceTransition()
             portal.mount(in: hud)
+            contentController.beginAppearanceTransition(true, animated: false)
+            contentController.endAppearanceTransition()
             XCTAssertTrue(portal.isInHUD)
             XCTAssertTrue(liveView.superview === hud)
+            XCTAssertTrue(contentController.parent === hudController)
             XCTAssertTrue(home.subviews.isEmpty)
             XCTAssertEqual(editor.text, "Retained viewer state")
             portal.restore()
             XCTAssertFalse(portal.isInHUD)
             XCTAssertTrue(liveView.superview === home)
+            XCTAssertTrue(contentController.parent === homeController)
             XCTAssertEqual(liveView.frame, home.bounds)
             XCTAssertTrue(hud.subviews.isEmpty)
-            XCTAssertTrue(liveView.subviews.first === editor)
+            XCTAssertTrue(editor.superview === appearance.view)
             XCTAssertEqual(editor.text, "Retained viewer state")
+            XCTAssertEqual(appearance.appearances, 1)
+            XCTAssertEqual(appearance.disappearances, 0)
         }
+        contentController.finish()
+        XCTAssertEqual(appearance.disappearances, 1)
     }
     #endif
 
@@ -116,3 +137,19 @@ private final class TestProvider: RAVESlideshowContentProvider {
         .still(data: Data([0xFF]), displayURL: nil)
     }
 }
+
+#if os(visionOS)
+@MainActor
+private final class HUDAppearanceProbe: UIViewController {
+    var appearances = 0
+    var disappearances = 0
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        appearances += 1
+    }
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        disappearances += 1
+    }
+}
+#endif
