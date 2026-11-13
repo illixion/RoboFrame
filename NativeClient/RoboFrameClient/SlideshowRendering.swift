@@ -1,5 +1,6 @@
 import AVKit
 import DebugTrace
+import RAVEMedia
 import RAVESlideshow
 import SwiftUI
 
@@ -48,10 +49,13 @@ private struct StillSlideshowMedia: View {
     var body: some View {
         switch context.media.media {
         case .still(let data, _):
-            if let image = UIImage(data: data) {
+            if let image = Self.image(from: data) {
                 ZStack {
                     Image(uiImage: image)
                         .resizable()
+                        // An HDR photo (a gain map) shows its highlights; an
+                        // SDR one is unchanged.
+                        .allowedDynamicRange(.high)
                         .scaledToFit()
                         .brightness(context.visualSettings.brightness)
                         .contrast(context.visualSettings.contrast)
@@ -62,6 +66,7 @@ private struct StillSlideshowMedia: View {
                         AIDepthStill(
                             itemID: contentNamespace + ":" + context.media.item.id,
                             image: cgImage,
+                            data: data,
                             aspectRatio: image.size,
                             visualSettings: context.visualSettings,
                             isOutgoing: isOutgoing,
@@ -81,6 +86,14 @@ private struct StillSlideshowMedia: View {
         case .video:
             EmptyView()
         }
+    }
+
+    /// The photo with its HDR rendition when it has one. `UIImage(data:)`
+    /// alone reads only the SDR base of a gain-map photo.
+    private static func image(from data: Data) -> UIImage? {
+        var configuration = UIImageReader.Configuration()
+        configuration.prefersHighDynamicRange = true
+        return UIImageReader(configuration: configuration).image(data: data) ?? UIImage(data: data)
     }
 }
 
@@ -290,6 +303,8 @@ private struct PlayerLayerView: UIViewRepresentable {
     func makeUIView(context: Context) -> LayerView {
         let view = LayerView()
         view.playerLayer.videoGravity = .resizeAspect
+        // On iOS 26 a layer tone-maps HDR video to SDR unless it asks for more.
+        RAVEHDRLayer.allowHDR(on: view.playerLayer)
         view.playerLayer.player = player
         return view
     }
@@ -300,25 +315,31 @@ private struct PlayerLayerView: UIViewRepresentable {
 }
 
 #if os(visionOS)
-import RAVEMedia
 import RealityKit
 
 /// The same stereo still presentation as Convolution's photo viewer, with
 /// a flat fallback while depth loads and a front layer for chrome gestures.
 private struct AIDepthStill: View {
     let itemID: String
+    /// The SDR picture: what the depth is estimated from, and what shows
+    /// until (or unless) an HDR rendition is decoded.
     let image: CGImage
+    /// The encoded photo, to decode its HDR rendition from.
+    let data: Data
     let aspectRatio: CGSize
     let visualSettings: RAVESlideshowVisualSettings
     let isOutgoing: Bool
     let fadeDuration: TimeInterval
     @State private var depth: StillDepthMap?
+    /// The photo's HDR rendition (half float, highlights above SDR white),
+    /// which `RAVEStereoPhotoView` shows as HDR. Nil for an SDR photo.
+    @State private var hdr: RAVEHDRStill.Image?
 
     var body: some View {
         ZStack {
             if let depth {
                 RAVEStereoPhotoView(
-                    image: image,
+                    image: hdr?.image ?? image,
                     depth: depth,
                     contentID: itemID,
                     adjustments: .init(
@@ -327,7 +348,8 @@ private struct AIDepthStill: View {
                         saturation: visualSettings.saturation
                     ),
                     opacity: isOutgoing ? 0 : 1,
-                    fadeDuration: fadeDuration
+                    fadeDuration: fadeDuration,
+                    headroom: hdr?.headroom ?? 1
                 )
                 Color.white.opacity(0.001)
                     .offset(z: RAVEStereoPhotoView.inputTargetZ)
@@ -335,6 +357,8 @@ private struct AIDepthStill: View {
         }
         .aspectRatio(aspectRatio, contentMode: .fit)
         .task(id: itemID) {
+            let data = data
+            hdr = await Task.detached(priority: .userInitiated) { RAVEHDRStill.decode(data) }.value
             depth = await SlideshowDepthCache.shared.depth(for: itemID, image: image)
         }
     }
