@@ -16,7 +16,7 @@ TEAM_ID="XXXXXXXXXX"
 BUILD_BUNDLE_ID="com.illixion.roboframe.client"
 
 # --- Deployment ---
-DEVICE_NAME="Apple Vision Pro"
+DEVICE_NAME="AVP"
 
 # --- Extra xcodebuild settings (bash array) ---
 # EXTRA_BUILD_SETTINGS=()
