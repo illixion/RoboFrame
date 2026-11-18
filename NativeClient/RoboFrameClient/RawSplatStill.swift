@@ -27,6 +27,7 @@ import ImageIO
 import RAVESlideshow
 import RealityKit
 import SwiftUI
+import simd
 
 /// `Spatial3DImage` isn't `Sendable`; every use here is on the main actor, so
 /// a task may hand it back.
@@ -125,6 +126,9 @@ struct RawSplatStill: View {
     let visualSettings: RAVESlideshowVisualSettings
     let isOutgoing: Bool
     let fadeDuration: TimeInterval
+    /// The window's controls are showing: the splat is kept behind the glass
+    /// so it can't cover them, and only comes forward once they hide.
+    let controlsVisible: Bool
     /// A tap on the picture: visionOS hit-tests RealityKit entities ahead of
     /// SwiftUI's z-order, so the window's own tap gesture never sees it.
     let onTap: () -> Void
@@ -135,6 +139,9 @@ struct RawSplatStill: View {
     /// in, so a picture never shows half built.
     @State private var shown: Float = 0
     @State private var fadeTask: Task<Void, Never>?
+    /// The depth the splat is currently recessed by, in metres of scene depth.
+    @State private var recessAnimation: AnimationPlaybackController?
+    @State private var recessTarget: Float?
 
     private static let logger = DebugLogger(subsystem: "com.illixion.roboframe.client", category: "raw-splat")
 
@@ -143,17 +150,19 @@ struct RawSplatStill: View {
         let opacity = shown
         GeometryReader3D { geometry in
             RealityView { content in
-                Self.installTapTarget(on: entity)
                 content.add(entity)
                 scaleEntityToFit(content: content, geometry: geometry)
                 Self.applyOpacity(opacity, to: entity)
+                placeBehindGlassIfNeeded()
             } update: { content in
                 scaleEntityToFit(content: content, geometry: geometry)
                 Self.applyOpacity(opacity, to: entity)
+                placeBehindGlassIfNeeded()
             }
             .gesture(TapGesture().targetedToAnyEntity().onEnded { _ in onTap() })
         }
         .task(id: sceneKey) { await load() }
+        .onChange(of: controlsVisible) { _, _ in recessTarget = nil }
         .onChange(of: isOutgoing) { _, _ in fade(to: targetOpacity) }
         .onChange(of: visualSettings.opacity) { _, _ in fade(to: targetOpacity, duration: 0) }
         .onChange(of: immersive) { _, newValue in
@@ -216,11 +225,13 @@ struct RawSplatStill: View {
         let user = Float(distance)
         guard !immersive else {
             entity.scale = SIMD3<Float>(user, user, user)
+            Self.fitTapTarget(of: entity, to: SIMD2<Float>(4, 4))
             return
         }
         guard let ipc = entity.components[ImagePresentationComponent.self] else { return }
         let size = ipc.presentationScreenSize
         guard size.x > 0, size.y > 0 else { return }
+        Self.fitTapTarget(of: entity, to: size)
         let bounds = content.convert(geometry.frame(in: .local), from: .local, to: .scene)
         let fit = min(bounds.extents.x / size.x, bounds.extents.y / size.y)
         // A raw splat is a volume: its depth follows Distance too.
@@ -228,12 +239,43 @@ struct RawSplatStill: View {
     }
 
     /// `InputTargetComponent` + `CollisionComponent` make the picture
-    /// tappable through a targeted-entity gesture. The 1x1x0.01 m box scales
-    /// with the entity, so the hit region follows the visible picture.
-    private static func installTapTarget(on entity: Entity) {
-        guard entity.components[InputTargetComponent.self] == nil else { return }
-        entity.components.set(InputTargetComponent())
-        entity.components.set(CollisionComponent(shapes: [.generateBox(size: SIMD3<Float>(1, 1, 0.01))]))
+    /// tappable through a targeted-entity gesture. The box covers the whole
+    /// picture, in the entity's own units (the entity's scale is the fit, so a
+    /// fixed box would be smaller than the picture), and is deep enough to
+    /// catch a tap on a splat that comes out of the window. A tap that misses
+    /// it lands on the splat, which blocks the window's own gesture.
+    private static func fitTapTarget(of entity: Entity, to size: SIMD2<Float>) {
+        let box = SIMD3<Float>(size.x, size.y, 0.5)
+        if entity.components[InputTargetComponent.self] == nil {
+            entity.components.set(InputTargetComponent())
+        }
+        if let existing = entity.components[CollisionComponent.self]?.shapes.first?.bounds.extents,
+           simd_distance(existing, box) < 0.001 { return }
+        entity.components.set(CollisionComponent(shapes: [.generateBox(size: box)]))
+    }
+
+    /// While the controls show, slide the splat back until nothing of it is in
+    /// front of the window, so it can't hide them (a window pushed far away
+    /// makes this worse, the splat being a fixed size in space). It comes
+    /// forward again, eased, when they hide. Immersive has no window to cover.
+    @MainActor
+    private func placeBehindGlassIfNeeded() {
+        guard !immersive, entity.components[ImagePresentationComponent.self] != nil else { return }
+        let bounds = entity.visualBounds(relativeTo: nil)
+        guard bounds.extents != .zero else { return }
+        let z = entity.position(relativeTo: nil).z
+        // Where the picture's front would be with the entity at z = 0.
+        let frontAtRest = bounds.max.z - z
+        let target: Float = controlsVisible ? -max(0, frontAtRest) : 0
+        guard recessTarget != target else { return }
+        recessTarget = target
+        recessAnimation?.stop()
+        let position = entity.position(relativeTo: nil)
+        recessAnimation = entity.move(
+            to: Transform(scale: entity.scale(relativeTo: nil),
+                          rotation: entity.orientation(relativeTo: nil),
+                          translation: SIMD3<Float>(position.x, position.y, target)),
+            relativeTo: nil, duration: 0.35, timingFunction: .easeInOut)
     }
 
     /// On every entity under the picture: the renderer builds its mesh below

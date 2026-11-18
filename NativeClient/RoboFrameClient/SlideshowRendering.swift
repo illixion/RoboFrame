@@ -9,6 +9,8 @@ struct RoboFrameSlideshowSurface: View {
     /// A tap on a Raw Splat picture, which the window's own tap gesture can't
     /// see (RealityKit entities are hit-tested ahead of SwiftUI).
     var onTap: () -> Void = {}
+    /// The window's controls are showing.
+    var controlsVisible = true
 
     var body: some View {
         let mode = model.profile.slideshow3DMode.resolvedForBuild
@@ -19,6 +21,7 @@ struct RoboFrameSlideshowSurface: View {
                 splat: mode.isRawSplat ? SplatPresentation(
                     immersive: mode.isImmersive,
                     distance: mode.isImmersive ? model.splatImmersiveDistance : model.splatDistance,
+                    controlsVisible: controlsVisible,
                     onTap: onTap
                 ) : nil,
                 contentNamespace: model.profile.id.uuidString,
@@ -63,6 +66,7 @@ struct RoboFrameSlideshowSurface: View {
 struct SplatPresentation {
     let immersive: Bool
     let distance: Double
+    let controlsVisible: Bool
     let onTap: () -> Void
 }
 
@@ -86,6 +90,7 @@ private struct StillSlideshowMedia: View {
                     visualSettings: context.visualSettings,
                     isOutgoing: isOutgoing,
                     fadeDuration: context.displaySettings.reduceMotion ? 0 : context.displaySettings.transitionDuration * 0.6,
+                    controlsVisible: splat.controlsVisible,
                     onTap: splat.onTap
                 )
             } else {

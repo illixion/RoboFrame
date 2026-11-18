@@ -45,7 +45,7 @@ struct SlideshowWindowView: View {
                 Color.black.ignoresSafeArea()
             }
 
-            RoboFrameSlideshowSurface(model: model, onTap: toggleControls)
+            RoboFrameSlideshowSurface(model: model, onTap: toggleControls, controlsVisible: controlsVisible)
                 .ignoresSafeArea()
 
             // Everything drawn over the picture sits in front of an AI 3D
