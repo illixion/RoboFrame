@@ -20,3 +20,6 @@ DEVICE_NAME="Apple Vision Pro"
 
 # --- Extra xcodebuild settings (bash array) ---
 # EXTRA_BUILD_SETTINGS=()
+
+# Optional: Raw Splat 3D in the slideshow (private RealityKit API, sideload builds only).
+# EXTRA_BUILD_SETTINGS=('PRIVATE_API_CONDITION=ROBOFRAME_PRIVATE_API')

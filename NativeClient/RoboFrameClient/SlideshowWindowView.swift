@@ -45,7 +45,7 @@ struct SlideshowWindowView: View {
                 Color.black.ignoresSafeArea()
             }
 
-            RoboFrameSlideshowSurface(model: model)
+            RoboFrameSlideshowSurface(model: model, onTap: toggleControls)
                 .ignoresSafeArea()
 
             // Everything drawn over the picture sits in front of an AI 3D
@@ -109,11 +109,7 @@ struct SlideshowWindowView: View {
         }
         #endif
         .contentShape(.rect)
-        .onTapGesture {
-            guard !controlsBusy else { return }
-            withAnimation { controlsVisible.toggle() }
-            resetAutoHideTimer()
-        }
+        .onTapGesture(perform: toggleControls)
         #if os(visionOS)
         // The plain, resizable "slideshow-viewer" window: visionOS resets
         // persistentSystemOverlays on every user resize regardless of this
@@ -230,6 +226,12 @@ struct SlideshowWindowView: View {
         }
         .transition(.opacity.combined(with: .move(edge: .bottom)))
         .animation(.easeInOut, value: model.toastMessage)
+    }
+
+    private func toggleControls() {
+        guard !controlsBusy else { return }
+        withAnimation { controlsVisible.toggle() }
+        resetAutoHideTimer()
     }
 
     private func resetAutoHideTimer() {

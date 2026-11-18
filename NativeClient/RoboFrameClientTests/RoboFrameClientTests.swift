@@ -128,6 +128,37 @@ final class RoboFrameClientTests: XCTestCase {
         XCTAssertEqual(after, "17")
         await MainActor.run { engine.stop() }
     }
+
+    func testRawSplatModesMapOntoTheEngineAndKeepTheirPlaceInTheMenus() {
+        XCTAssertEqual(Slideshow3DPreference.rawSplat.engineMode, .spatial3D)
+        XCTAssertEqual(Slideshow3DPreference.rawSplatImmersive.engineMode, .immersive3D)
+        XCTAssertEqual(Slideshow3DPreference.spatial.engineMode, .spatial3D)
+        XCTAssertEqual(Slideshow3DPreference.aiDepth.engineMode, .off)
+        XCTAssertTrue(Slideshow3DPreference.rawSplatImmersive.isImmersive)
+        XCTAssertFalse(Slideshow3DPreference.rawSplat.isImmersive)
+        // Ken Burns moves neither an AI 3D mesh nor a splat.
+        XCTAssertFalse(Slideshow3DPreference.rawSplat.allowsKenBurns)
+        XCTAssertFalse(Slideshow3DPreference.aiDepth.allowsKenBurns)
+        XCTAssertTrue(Slideshow3DPreference.spatial.allowsKenBurns)
+    }
+
+    @MainActor
+    func testRawSplatIsOfferedOnlyWhereTheBuildCanShowIt() {
+        let offered = Slideshow3DPreference.selectable.contains(.rawSplat)
+        XCTAssertEqual(offered, RawSplatSupport.isAvailable)
+        if !RawSplatSupport.isAvailable {
+            XCTAssertEqual(Slideshow3DPreference.rawSplat.resolvedForBuild, .spatial)
+            XCTAssertEqual(Slideshow3DPreference.rawSplatImmersive.resolvedForBuild, .spatial)
+        }
+        XCTAssertEqual(Slideshow3DPreference.aiDepth.resolvedForBuild, .aiDepth)
+    }
+
+    func testSavedRawSplatModeSurvivesProfileCoding() throws {
+        var profile = RoboFrameProfile()
+        profile.slideshow3DMode = .rawSplatImmersive
+        let decoded = try JSONDecoder().decode(RoboFrameProfile.self, from: JSONEncoder().encode(profile))
+        XCTAssertEqual(decoded.slideshow3DMode, .rawSplatImmersive)
+    }
 }
 
 @MainActor

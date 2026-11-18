@@ -86,6 +86,9 @@ struct ProfileManagerView: View {
             List {
                 savedProfilesSection
                 backupSection
+                #if ROBOFRAME_PRIVATE_API && os(visionOS)
+                PrivateSpatial3DTuningSection()
+                #endif
                 editingSection
 
                 Section {
@@ -647,7 +650,7 @@ struct ProfileManagerView: View {
 
             #if os(visionOS)
             Picker("3D Mode", selection: $editingProfile.slideshow3DMode) {
-                ForEach(Slideshow3DPreference.allCases) { mode in
+                ForEach(Slideshow3DPreference.selectable) { mode in
                     Text(mode.label).tag(mode)
                 }
             }

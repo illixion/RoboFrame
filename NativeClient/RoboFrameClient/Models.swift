@@ -1,4 +1,5 @@
 import Foundation
+import RAVESlideshow
 import RoboFrameKit
 
 enum ProfileMode: String, Codable, CaseIterable, Identifiable {
@@ -141,6 +142,11 @@ enum Slideshow3DPreference: String, Codable, CaseIterable, Identifiable {
     /// (`RAVEAIDepthPhotoView`), videos converted in real time, as in
     /// Hypnos's AI 3D. Always last in the menu.
     case aiDepth
+    /// RealityKit 3D drawn as the raw splat scene (two-pass rendering off), as
+    /// Hypnos's Raw Splat 3D. Sideload builds only (`RawSplatSupport`). Videos
+    /// stay flat.
+    case rawSplat
+    case rawSplatImmersive
 
     var id: String { rawValue }
     var label: String {
@@ -149,7 +155,36 @@ enum Slideshow3DPreference: String, Codable, CaseIterable, Identifiable {
         case .spatial: "Spatial Images"
         case .pseudo3D: "Real-Time 3D Video"
         case .aiDepth: "AI 3D"
+        case .rawSplat: "Raw Splat 3D"
+        case .rawSplatImmersive: "Raw Splat 3D (Immersive)"
         }
+    }
+
+    /// Ken Burns doesn't move an AI 3D mesh or a splat.
+    var allowsKenBurns: Bool { self != .aiDepth && !isRawSplat }
+
+    /// What the shared slideshow engine is told: the Raw Splat modes take the
+    /// 3D resolution cap, like RealityKit 3D in Hypnos.
+    var engineMode: RAVESlideshow3DMode {
+        switch self {
+        case .spatial, .rawSplat: .spatial3D
+        case .rawSplatImmersive: .immersive3D
+        case .off, .pseudo3D, .aiDepth: .off
+        }
+    }
+
+    var isRawSplat: Bool { self == .rawSplat || self == .rawSplatImmersive }
+    var isImmersive: Bool { self == .rawSplatImmersive }
+
+    /// The modes the menus offer in this build.
+    @MainActor static var selectable: [Slideshow3DPreference] {
+        allCases.filter { !$0.isRawSplat || RawSplatSupport.isAvailable }
+    }
+
+    /// This mode as this build can show it: Raw Splat becomes Spatial Images
+    /// where it is unavailable.
+    @MainActor var resolvedForBuild: Slideshow3DPreference {
+        isRawSplat && !RawSplatSupport.isAvailable ? .spatial : self
     }
 
     /// Runs the real-time depth model, so needs one installed.
@@ -166,6 +201,8 @@ enum Slideshow3DPreference: String, Codable, CaseIterable, Identifiable {
         case .spatial: "spatial.capture.fill"
         case .pseudo3D: "move.3d"
         case .aiDepth: "wand.and.sparkles"
+        case .rawSplat: "spatial.capture.fill"
+        case .rawSplatImmersive: "inset.filled.pano"
         }
     }
 }

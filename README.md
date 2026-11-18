@@ -66,6 +66,16 @@ requires an installed RAVEMedia depth model and falls back to the flat player
 when depth or decode setup is unavailable. iOS always resolves those modes to
 the standard 2D rendering path.
 
+**Raw Splat 3D** (and **Raw Splat 3D (Immersive)**) is Convolution's sideload-only
+mode: the picture's RealityKit 3D scene drawn as raw gaussian splats, which stays
+sharp from the side. It reaches RealityKit through private symbols, so it exists
+only in a build that defines `ROBOFRAME_PRIVATE_API`
+(`xcodebuild ... PRIVATE_API_CONDITION=ROBOFRAME_PRIVATE_API`); every other build
+hides it and reads a saved one as Spatial Images. The Adjustments popover adds a
+**Distance** slider for it (size and depth, kept across pictures), the next
+picture's scene is generated while the current one shows, and the same build adds
+a **Spatial 3D Tuning** section in the profile list for the renderer's own knobs.
+
 `RoboFrameClientUITests` covers deterministic profile creation, configured
 slideshow presentation, and the hidden pinned-web-page reveal catcher. Run it
 on an iOS simulator with:

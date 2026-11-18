@@ -287,7 +287,7 @@ struct SlideshowOrnamentView: View {
     private var slideshow3DMenu: some View {
         Menu {
             Group {
-                ForEach(Slideshow3DPreference.allCases) { mode in
+                ForEach(Slideshow3DPreference.selectable) { mode in
                     Button {
                         model.slideshow3DMode = mode
                     } label: {

@@ -50,9 +50,19 @@ struct SlideshowAdjustmentsPopover: View {
             adjustmentSlider(label: "Saturation", value: $model.adjustments.saturation, range: 0.0...5.0, defaultValue: 1.0)
             adjustmentSlider(label: "Opacity", value: $model.adjustments.opacity, range: 0.01...1.0, defaultValue: 1.0, linear: true)
 
-            Button("Reset") { model.adjustments.reset() }
+            // Raw Splat 3D: how big (and deep) the picture is. The same for
+            // every picture, windowed and immersive kept apart.
+            if model.slideshow3DMode.isRawSplat {
+                let immersive = model.slideshow3DMode.isImmersive
+                adjustmentSlider(
+                    label: "Distance",
+                    value: immersive ? $model.splatImmersiveDistance : $model.splatDistance,
+                    range: 1.0...4.0, defaultValue: 1.0, linear: true)
+            }
+
+            Button("Reset") { model.adjustments.reset(); model.splatDistance = 1; model.splatImmersiveDistance = 1 }
                 .buttonStyle(.bordered)
-                .disabled(!model.adjustments.isModified)
+                .disabled(!model.adjustments.isModified && model.splatDistance == 1 && model.splatImmersiveDistance == 1)
         }
     }
 

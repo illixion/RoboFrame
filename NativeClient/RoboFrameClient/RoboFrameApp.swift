@@ -22,6 +22,11 @@ struct RoboFrameApp: App {
         DebugTrace.configure(.init(subsystems: ["com.illixion.roboframe.client"]))
         // Only in a `build-and-sign --mcp` launch; a no-op otherwise.
         DebugTraceServer.startIfRequested()
+        // Before anything RealityKit starts: the renderer reads most of its
+        // overrides once, when it is created.
+        #if ROBOFRAME_PRIVATE_API && os(visionOS)
+        PrivateSpatial3DTuningStore.installAtLaunch()
+        #endif
     }
 
     var body: some Scene {

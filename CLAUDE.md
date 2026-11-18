@@ -151,6 +151,22 @@ updates to track a server change, ship those too:
   - swift-kiosk: `Sources/KioskCore/KioskSession.swift`.
 - node-display: [`node-display/server.js`](node-display/server.js).
 
+**Raw Splat 3D (sideload-only, 2026-11-18, not yet seen on a headset).** Ported from
+Hypnos's slideshow: `Slideshow3DPreference.rawSplat` / `.rawSplatImmersive`, compiled
+in only with `PRIVATE_API_CONDITION=ROBOFRAME_PRIVATE_API` (the project's empty
+default; `EXTRA_BUILD_SETTINGS` in the gitignored `scripts/build-signing.conf`
+sets it for device builds). Other builds hide the modes (`selectable`) and read a
+saved one as `.spatial` (`resolvedForBuild`). `RawSplatStill` draws a still as an
+`ImagePresentationComponent` with two-pass off; `RawSplatSceneCache` generates the
+next picture's `Spatial3DImage` from the engine's peeked item. RealityKit ignores
+SwiftUI opacity, so the crossfade is an `OpacityComponent` stepped on every entity
+under the picture, and a tap goes through a targeted-entity gesture
+(`RoboFrameSlideshowSurface.onTap`). Distance (`SlideshowModel.splatDistance`,
+windowed and immersive apart) scales the picture and a splat's depth. There is no
+window-size calibration nudge here, which Hypnos skips for a splat too. The tuning
+store (`PrivateSpatial3DTuning.swift`) and page are a copy of Hypnos's: change them in
+both, or move them into a shared package once the flag can be passed to one.
+
 ## Orchestrator model (one-screen summary)
 
 - **Channel per `(deviceId, sessionId)`.** `deviceId` stays stable for MQTT,

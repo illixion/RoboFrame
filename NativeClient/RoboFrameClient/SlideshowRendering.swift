@@ -6,13 +6,21 @@ import SwiftUI
 
 struct RoboFrameSlideshowSurface: View {
     let model: SlideshowModel
+    /// A tap on a Raw Splat picture, which the window's own tap gesture can't
+    /// see (RealityKit entities are hit-tested ahead of SwiftUI).
+    var onTap: () -> Void = {}
 
     var body: some View {
-        let mode = model.profile.slideshow3DMode
+        let mode = model.profile.slideshow3DMode.resolvedForBuild
         RAVESlideshowSurface(engine: model.engine) { context in
             StillSlideshowMedia(
                 context: context,
                 aiDepth: mode == .aiDepth,
+                splat: mode.isRawSplat ? SplatPresentation(
+                    immersive: mode.isImmersive,
+                    distance: mode.isImmersive ? model.splatImmersiveDistance : model.splatDistance,
+                    onTap: onTap
+                ) : nil,
                 contentNamespace: model.profile.id.uuidString,
                 // The surface fades the outgoing layer with SwiftUI opacity,
                 // which an AI 3D mesh doesn't follow; it fades on its own.
@@ -28,6 +36,16 @@ struct RoboFrameSlideshowSurface: View {
                 .foregroundStyle(.white)
         }
         #if os(visionOS)
+        // A Raw Splat scene for the next picture, generated while this one is
+        // on screen.
+        .task(id: mode.isRawSplat ? model.engine.peekedNext?.item.id : nil) {
+            guard mode.isRawSplat, let peek = model.engine.peekedNext,
+                  case .still(let data, _) = peek.media else { return }
+            let settings = model.engine.visualSettings
+            RawSplatSceneCache.shared.prefetch(
+                key: RawSplatSceneCache.key(itemID: model.profile.id.uuidString + ":" + peek.item.id, settings: settings),
+                data: data, settings: settings)
+        }
         // Depth for the next picture while this one is on screen, so it
         // arrives with its mesh.
         .task(id: mode == .aiDepth ? model.engine.peekedNext?.item.id : nil) {
@@ -40,44 +58,42 @@ struct RoboFrameSlideshowSurface: View {
     }
 }
 
+/// How a Raw Splat picture is shown: the 3D menu's choice and the Distance
+/// setting, both kept across pictures.
+struct SplatPresentation {
+    let immersive: Bool
+    let distance: Double
+    let onTap: () -> Void
+}
+
 private struct StillSlideshowMedia: View {
     let context: RAVESlideshowRenderContext
     var aiDepth = false
+    var splat: SplatPresentation?
     var contentNamespace = ""
     var isOutgoing = false
 
     var body: some View {
         switch context.media.media {
         case .still(let data, _):
-            if let image = Self.image(from: data) {
-                ZStack {
-                    Image(uiImage: image)
-                        .resizable()
-                        // An HDR photo (a gain map) shows its highlights; an
-                        // SDR one is unchanged.
-                        .allowedDynamicRange(.high)
-                        .scaledToFit()
-                        .brightness(context.visualSettings.brightness)
-                        .contrast(context.visualSettings.contrast)
-                        .saturation(context.visualSettings.saturation)
-                        .modifier(SpatialImageTreatment(enabled: context.displaySettings.mode3D == .spatial3D))
-                    #if os(visionOS)
-                    if aiDepth, let cgImage = image.cgImage {
-                        AIDepthStill(
-                            itemID: contentNamespace + ":" + context.media.item.id,
-                            image: cgImage,
-                            data: data,
-                            aspectRatio: image.size,
-                            visualSettings: context.visualSettings,
-                            isOutgoing: isOutgoing,
-                            fadeDuration: context.displaySettings.reduceMotion ? 0 : context.displaySettings.transitionDuration * 0.6
-                        )
-                    }
-                    #endif
-                }
+            #if os(visionOS)
+            if let splat {
+                RawSplatStill(
+                    itemID: contentNamespace + ":" + context.media.item.id,
+                    data: data,
+                    immersive: splat.immersive,
+                    distance: splat.distance,
+                    visualSettings: context.visualSettings,
+                    isOutgoing: isOutgoing,
+                    fadeDuration: context.displaySettings.reduceMotion ? 0 : context.displaySettings.transitionDuration * 0.6,
+                    onTap: splat.onTap
+                )
             } else {
-                ContentUnavailableView("Media unavailable", systemImage: "exclamationmark.triangle")
+                stillBody(data: data)
             }
+            #else
+            stillBody(data: data)
+            #endif
         case .animatedImage(_, let url):
             AsyncImage(url: url) { $0.image?.resizable().scaledToFit() }
                 .brightness(context.visualSettings.brightness)
@@ -85,6 +101,39 @@ private struct StillSlideshowMedia: View {
                 .saturation(context.visualSettings.saturation)
         case .video:
             EmptyView()
+        }
+    }
+
+    @ViewBuilder
+    private func stillBody(data: Data) -> some View {
+        if let image = Self.image(from: data) {
+            ZStack {
+                Image(uiImage: image)
+                    .resizable()
+                    // An HDR photo (a gain map) shows its highlights; an
+                    // SDR one is unchanged.
+                    .allowedDynamicRange(.high)
+                    .scaledToFit()
+                    .brightness(context.visualSettings.brightness)
+                    .contrast(context.visualSettings.contrast)
+                    .saturation(context.visualSettings.saturation)
+                    .modifier(SpatialImageTreatment(enabled: context.displaySettings.mode3D == .spatial3D))
+                #if os(visionOS)
+                if aiDepth, let cgImage = image.cgImage {
+                    AIDepthStill(
+                        itemID: contentNamespace + ":" + context.media.item.id,
+                        image: cgImage,
+                        data: data,
+                        aspectRatio: image.size,
+                        visualSettings: context.visualSettings,
+                        isOutgoing: isOutgoing,
+                        fadeDuration: context.displaySettings.reduceMotion ? 0 : context.displaySettings.transitionDuration * 0.6
+                    )
+                }
+                #endif
+            }
+        } else {
+            ContentUnavailableView("Media unavailable", systemImage: "exclamationmark.triangle")
         }
     }
 

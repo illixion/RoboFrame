@@ -62,12 +62,12 @@ final class SlideshowModel {
                 showClock: profile.showClock,
                 showSensors: profile.showSensors,
                 useAspectRatio: profile.useAspectRatio,
-                // Ken Burns doesn't move an AI 3D picture's mesh.
-                enableKenBurns: profile.enableKenBurns && profile.slideshow3DMode != .aiDepth,
+                // Ken Burns doesn't move an AI 3D picture's mesh or a splat.
+                enableKenBurns: profile.enableKenBurns && profile.slideshow3DMode.allowsKenBurns,
                 enableDynamicBrightness: profile.enableDynamicBrightness,
                 transparentBackground: profile.transparentBackground,
                 textScale: profile.textSize,
-                mode3D: profile.slideshow3DMode == .spatial ? .spatial3D : .off,
+                mode3D: profile.slideshow3DMode.engineMode,
                 maxImageResolution2D: profile.maxImageResolution2D ?? AppSettings.shared.defaultMaxImageResolution2D,
                 maxImageResolution3D: profile.maxImageResolution3D ?? AppSettings.shared.defaultMaxImageResolution3D
             ),
@@ -114,7 +114,7 @@ final class SlideshowModel {
     var displayEnableKenBurns: Bool {
         get { profile.enableKenBurns }
         set {
-            updateDisplaySettings { $0.enableKenBurns = newValue && profile.slideshow3DMode != .aiDepth }
+            updateDisplaySettings { $0.enableKenBurns = newValue && profile.slideshow3DMode.allowsKenBurns }
             profile.enableKenBurns = newValue
             persistConfig()
         }
@@ -148,11 +148,17 @@ final class SlideshowModel {
         }
     }
 
+    /// "Distance", the Raw Splat modes' size (and depth) multiplier. The same
+    /// for every picture of the session; windowed and immersive are kept
+    /// apart, as in Hypnos's photo viewer.
+    var splatDistance = 1.0
+    var splatImmersiveDistance = 1.0
+
     private func apply3DMode(_ mode: Slideshow3DPreference) {
         profile.slideshow3DMode = mode
         updateDisplaySettings {
-            $0.mode3D = mode == .spatial ? .spatial3D : .off
-            $0.enableKenBurns = profile.enableKenBurns && mode != .aiDepth
+            $0.mode3D = mode.engineMode
+            $0.enableKenBurns = profile.enableKenBurns && mode.allowsKenBurns
         }
         persistConfig()
     }
