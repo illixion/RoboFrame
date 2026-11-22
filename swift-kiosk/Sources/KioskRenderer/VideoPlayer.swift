@@ -18,6 +18,22 @@
  the new file's, a stale restart faded in a black target and a stale end
  skipped a clip that hadn't started.
 
+ Nothing here waits on mpv's core from the caller's thread, the kiosk's
+ render loop. Commands and property reads run on a serial queue of their
+ own: on the Pi the core thread is also the decoder's, and once the
+ firmware's video service stops answering, a V4L2 call there sleeps in the
+ kernel for good. A synchronous call from the render loop then froze the
+ screen on whatever it last drew, with the panel coming and going around
+ it. A command that has been running for `hangLimit` marks the player hung;
+ the renderer stops handing it videos, and the Pi's decoder watchdog
+ reboots (nothing short of that brings the decoder back).
+
+ A load is also never interrupted while it opens. A `stop` or a new `load`
+ that arrives before the current one has shown its first frame or failed
+ waits for it (up to `settleLimit`): stopping the V4L2 decoder while it is
+ still allocating its buffers is what wedged the firmware, and panel cuts,
+ which stop the video and load it again on wake, made that common.
+
  mpv needs LC_NUMERIC=C, set once before the first instance.
  */
 
@@ -26,7 +42,9 @@ import CSDL2
 import Foundation
 import Glibc
 
-final class VideoPlayer {
+/// Unchecked: the state under `lock` is what the control queue touches; the
+/// rest belongs to the caller's thread.
+final class VideoPlayer: @unchecked Sendable {
     enum Event: Equatable {
         /// The first frame of the file is up (or it resumed after a seek).
         case started
@@ -46,17 +64,57 @@ final class VideoPlayer {
         var holdLastFrame = false
     }
 
+    /// What mpv says about the file that started.
+    struct Info {
+        var codec: String?
+        var width: String?
+        var height: String?
+        var hwdec: String?
+        var duration: Double?
+    }
+
+    private enum Request {
+        case load(URL, Options)
+        case stop
+    }
+
+    /// An event of a file, kept until the load it may belong to has its
+    /// playlist entry id.
+    private enum FileEvent {
+        case start(Int64)
+        case restart
+        case end(Int64, mpv_end_file_reason, Int32)
+    }
+
+    /// How long a command may run before the player counts as hung.
+    static let hangLimit: TimeInterval = 20
+    /// How long a stop or a new load waits for the opening one to settle.
+    static let settleLimit: TimeInterval = 20
+
     private let handle: OpaquePointer
     private var renderContext: OpaquePointer?
-    private var loading = false
-    private var paused = false
-    /// The playlist entry of the last `load`, and whether mpv has started it.
-    private var entryID: Int64?
-    private var entryStarted = false
-    /// mpv didn't say which entry the load made (it always has so far):
-    /// take every event as the current file's, as before ids were matched.
-    private var entryUnknown = false
+    private let control = DispatchQueue(label: "roboframe.kiosk.mpv")
     private let log: (String) -> Void
+
+    // Shared with the control queue, under `lock`.
+    private let lock = NSLock()
+    /// The playlist entry the last `load` made, once `loadfile` has returned.
+    /// Nil while resolved means mpv didn't say: every event is taken as the
+    /// current file's, as before ids were matched.
+    private var entryID: Int64?
+    private var entryResolved = true
+    private var commandSince: TimeInterval?
+
+    // The caller's thread only.
+    /// A load was sent and hasn't shown a frame or failed.
+    private var loading = false
+    private var loadSentAt: TimeInterval = 0
+    private var entryStarted = false
+    private var backlog: [FileEvent] = []
+    private var deferred: Request?
+    private var paused = false
+
+    private static var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
 
     /// `video: false` makes an audio-only player with no render context.
     init?(hwdec: String, video: Bool, log: @escaping (String) -> Void) {
@@ -122,11 +180,73 @@ final class VideoPlayer {
         mpv_set_option_string(handle, name, value)
     }
 
-    private func setProperty(_ name: String, _ value: String) {
-        mpv_set_property_string(handle, name, value)
+    /// Runs `work` on the control queue, timing it for `isHung`.
+    private func perform(_ work: @escaping @Sendable (OpaquePointer) -> Void) {
+        control.async { [self] in
+            lock.withLock { commandSince = Self.now }
+            work(handle)
+            lock.withLock { commandSince = nil }
+        }
     }
 
-    private func command(_ arguments: [String]) {
+    /// A command to mpv has been running for `hangLimit`: its core is stuck
+    /// (on the Pi, in the decoder driver) and nothing sent to it will run.
+    var isHung: Bool {
+        lock.withLock { commandSince.map { Self.now - $0 >= Self.hangLimit } ?? false }
+    }
+
+    func load(_ url: URL, options: Options) {
+        request(.load(url, options))
+    }
+
+    func stop() {
+        request(.stop)
+    }
+
+    private func request(_ request: Request) {
+        if loading, Self.now - loadSentAt < Self.settleLimit {
+            deferred = request
+            return
+        }
+        deferred = nil
+        send(request)
+    }
+
+    private func send(_ request: Request) {
+        backlog = []
+        switch request {
+        case .stop:
+            loading = false
+            entryStarted = false
+            lock.withLock { entryID = nil; entryResolved = true }
+            perform { handle in Self.command(handle, ["stop"]) }
+        case .load(let url, let options):
+            paused = false
+            loading = true
+            loadSentAt = Self.now
+            entryStarted = false
+            lock.withLock { entryID = nil; entryResolved = false }
+            perform { [self] handle in
+                mpv_set_property_string(handle, "loop-file", options.loop ? "inf" : "no")
+                mpv_set_property_string(handle, "aid", options.audio ? "auto" : "no")
+                mpv_set_property_string(handle, "cache", options.lowLatency ? "no" : "auto")
+                mpv_set_property_string(handle, "rtsp-transport", "tcp")
+                mpv_set_property_string(handle, "keep-open", options.holdLastFrame ? "yes" : "no")
+                mpv_set_property_string(handle, "pause", "no")
+                Self.command(handle, ["loadfile", url.absoluteString, "replace"])
+                // `replace` leaves the new file as the playlist's only entry,
+                // and the command has run by the time mpv_command returns.
+                var id: Int64 = 0
+                let known = mpv_get_property(handle, "playlist/0/id", MPV_FORMAT_INT64, &id) >= 0
+                lock.withLock {
+                    entryID = known ? id : nil
+                    entryResolved = true
+                }
+            }
+        }
+    }
+
+    private static func command(_ handle: OpaquePointer, _ arguments: [String]) {
         var cStrings = arguments.map { strdup($0) }
         defer { cStrings.forEach { free($0) } }
         cStrings.append(nil)
@@ -137,78 +257,42 @@ final class VideoPlayer {
         }
     }
 
-    func load(_ url: URL, options: Options) {
-        setProperty("loop-file", options.loop ? "inf" : "no")
-        setProperty("aid", options.audio ? "auto" : "no")
-        setProperty("cache", options.lowLatency ? "no" : "auto")
-        setProperty("rtsp-transport", "tcp")
-        setProperty("keep-open", options.holdLastFrame ? "yes" : "no")
-        setProperty("pause", "no")
-        paused = false
-        loading = true
-        command(["loadfile", url.absoluteString, "replace"])
-        // `replace` leaves the new file as the playlist's only entry, and the
-        // command has run by the time mpv_command returns.
-        entryID = int64Property("playlist/0/id")
-        entryUnknown = entryID == nil
-        entryStarted = entryUnknown
-    }
-
-    private func isCurrent(_ playlistEntryID: Int64) -> Bool {
-        entryUnknown || playlistEntryID == entryID
-    }
-
-    private func int64Property(_ name: String) -> Int64? {
-        var value: Int64 = 0
-        return mpv_get_property(handle, name, MPV_FORMAT_INT64, &value) >= 0 ? value : nil
-    }
-
-    /// A property as text (`hwdec-current`, `video-codec`), or nil if unset.
-    func property(_ name: String) -> String? {
-        guard let value = mpv_get_property_string(handle, name) else { return nil }
-        defer { mpv_free(value) }
-        return String(cString: value)
-    }
-
-    func stop() {
-        loading = false
-        entryID = nil
-        entryUnknown = false
-        command(["stop"])
-    }
-
     func setPaused(_ paused: Bool) {
         guard paused != self.paused else { return }
         self.paused = paused
-        setProperty("pause", paused ? "yes" : "no")
+        perform { handle in mpv_set_property_string(handle, "pause", paused ? "yes" : "no") }
+    }
+
+    /// The started file's codec, size, decoder and length, read off the
+    /// render loop and handed to `completion` on the main queue.
+    func info(_ completion: @escaping @MainActor @Sendable (Info) -> Void) {
+        perform { handle in
+            func string(_ name: String) -> String? {
+                guard let value = mpv_get_property_string(handle, name) else { return nil }
+                defer { mpv_free(value) }
+                return String(cString: value)
+            }
+            let info = Info(
+                codec: string("video-codec"), width: string("width"), height: string("height"),
+                hwdec: string("hwdec-current"),
+                duration: string("duration").flatMap(Double.init).flatMap { $0.isFinite && $0 > 0 ? $0 : nil })
+            DispatchQueue.main.async { MainActor.assumeIsolated { completion(info) } }
+        }
     }
 
     /// Everything mpv reported since the last call. Never blocks.
     func events() -> [Event] {
-        var events: [Event] = []
         while let event = mpv_wait_event(handle, 0), event.pointee.event_id != MPV_EVENT_NONE {
             switch event.pointee.event_id {
             case MPV_EVENT_START_FILE:
                 guard let data = event.pointee.data else { break }
-                let start = data.assumingMemoryBound(to: mpv_event_start_file.self).pointee
-                if isCurrent(start.playlist_entry_id) { entryStarted = true }
+                backlog.append(.start(data.assumingMemoryBound(to: mpv_event_start_file.self).pointee.playlist_entry_id))
             case MPV_EVENT_PLAYBACK_RESTART:
-                // Only once this load's file has started: anything before
-                // that is the previous file's.
-                if loading, entryStarted {
-                    loading = false
-                    events.append(.started)
-                }
+                backlog.append(.restart)
             case MPV_EVENT_END_FILE:
                 guard let data = event.pointee.data else { break }
                 let end = data.assumingMemoryBound(to: mpv_event_end_file.self).pointee
-                guard isCurrent(end.playlist_entry_id) else { break }
-                if end.reason == MPV_END_FILE_REASON_ERROR {
-                    loading = false
-                    events.append(.failed(String(cString: mpv_error_string(end.error))))
-                } else if end.reason == MPV_END_FILE_REASON_EOF {
-                    events.append(.finished)
-                }
+                backlog.append(.end(end.playlist_entry_id, end.reason, end.error))
             case MPV_EVENT_LOG_MESSAGE:
                 guard let data = event.pointee.data else { break }
                 let message = data.assumingMemoryBound(to: mpv_event_log_message.self).pointee
@@ -218,6 +302,44 @@ final class VideoPlayer {
             default:
                 break
             }
+        }
+
+        var events: [Event] = []
+        let (resolved, current) = lock.withLock { (entryResolved, entryID) }
+        // Until `loadfile` has returned, nothing can be told apart from the
+        // previous file's events; they wait.
+        if resolved {
+            let isCurrent: (Int64) -> Bool = { id in current == nil || id == current }
+            for event in backlog {
+                switch event {
+                case .start(let id):
+                    if isCurrent(id) { entryStarted = true }
+                case .restart:
+                    // Only once this load's file has started: anything
+                    // before that is the previous file's.
+                    if loading, entryStarted {
+                        loading = false
+                        events.append(.started)
+                    }
+                case .end(let id, let reason, let error):
+                    guard isCurrent(id) else { break }
+                    if reason == MPV_END_FILE_REASON_ERROR {
+                        loading = false
+                        events.append(.failed(String(cString: mpv_error_string(error))))
+                    } else if reason == MPV_END_FILE_REASON_EOF {
+                        events.append(.finished)
+                    }
+                }
+            }
+            backlog = []
+        }
+
+        // A stop or load held while the last load opened goes now. Whatever
+        // that load did is no longer what the caller is waiting for.
+        if let held = deferred, !loading || Self.now - loadSentAt >= Self.settleLimit {
+            deferred = nil
+            send(held)
+            return []
         }
         return events
     }

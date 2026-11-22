@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Installs the kiosk on a Pi: dist/roboframe-kiosk (from build-linux.sh) and
-# pi/run-kiosk go to /opt/swift-kiosk, which is on the SD card's real
-# filesystem even under overlayroot. Each file lands beside its old copy and
-# is renamed over it, so a running kiosk keeps its binary until it restarts.
+# Installs the kiosk on a Pi: dist/roboframe-kiosk (from build-linux.sh),
+# pi/run-kiosk and pi/decoder-watchdog go to /opt/swift-kiosk, which is on the
+# SD card's real filesystem even under overlayroot. Each file lands beside its
+# old copy and is renamed over it, so a running kiosk keeps its binary until
+# it restarts. The watchdog's unit is installed and enabled in both layers
+# (under overlayroot, /etc is RAM; /media/root-ro is the card) and restarted.
 #
 #   scripts/deploy-pi.sh root@kiosk-pi3            install; takes effect next session
 #   scripts/deploy-pi.sh root@kiosk-pi3 --restart  and restart the session onto it
@@ -30,9 +32,11 @@ fi
 ssh "${ssh_opts[@]}" "$host" 'mkdir -p /opt/swift-kiosk'
 scp -q "${ssh_opts[@]}" "$binary" "$host:/opt/swift-kiosk/roboframe-kiosk.new"
 scp -q "${ssh_opts[@]}" "$kiosk/pi/run-kiosk" "$host:/opt/swift-kiosk/run-kiosk.new"
+scp -q "${ssh_opts[@]}" "$kiosk/pi/decoder-watchdog" "$host:/opt/swift-kiosk/decoder-watchdog.new"
+scp -q "${ssh_opts[@]}" "$kiosk/pi/decoder-watchdog.service" "$host:/opt/swift-kiosk/decoder-watchdog.service"
 ssh "${ssh_opts[@]}" "$host" 'set -e
     cd /opt/swift-kiosk
-    chmod 755 roboframe-kiosk.new run-kiosk.new
+    chmod 755 roboframe-kiosk.new run-kiosk.new decoder-watchdog.new
     # ldd fails outright on a binary this machine cannot run (the wrong
     # architecture), which would otherwise pass as "nothing missing".
     if ! libraries=$(ldd roboframe-kiosk.new 2>&1); then
@@ -49,6 +53,15 @@ ssh "${ssh_opts[@]}" "$host" 'set -e
     fi
     mv roboframe-kiosk.new roboframe-kiosk
     mv run-kiosk.new run-kiosk
+    mv decoder-watchdog.new decoder-watchdog
+    for root in / /media/root-ro/; do
+        [ -d "${root}etc/systemd/system" ] || continue
+        install -m 644 decoder-watchdog.service "${root}etc/systemd/system/decoder-watchdog.service"
+        mkdir -p "${root}etc/systemd/system/multi-user.target.wants"
+        ln -sf /etc/systemd/system/decoder-watchdog.service "${root}etc/systemd/system/multi-user.target.wants/decoder-watchdog.service"
+    done
+    systemctl daemon-reload
+    systemctl restart decoder-watchdog
     # The settings menu saves here, as the session user (kiosk).
     if id kiosk >/dev/null 2>&1; then install -d -o kiosk -g kiosk -m 755 state; else mkdir -p state; fi
     echo "deploy-pi: installed $(du -h roboframe-kiosk | cut -f1) in /opt/swift-kiosk"

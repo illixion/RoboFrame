@@ -140,7 +140,7 @@ unset).
 scripts/build-linux.sh && scripts/deploy-pi.sh root@kiosk-pi3 --restart
 ```
 
-`deploy-pi.sh` copies the binary and `pi/run-kiosk` to `/opt/swift-kiosk`
+`deploy-pi.sh` copies the binary, `pi/run-kiosk` and `pi/decoder-watchdog` to `/opt/swift-kiosk`
 (on the SD card's real filesystem, so it survives overlayroot), refuses a
 binary the Pi lacks a library for, and with `--restart` restarts the X
 session onto it. A running kiosk keeps its old binary until then.
@@ -174,6 +174,19 @@ and 140 MB of RAM, flat. Two things about the board shape the renderer:
 - **The keypad needs no evdev grab.** native-kiosk grabs the input devices
   because its mpv window could take X focus. Here video is drawn inside the
   kiosk's own window, so the keys reach it like any other X input.
+- **The hardware decoder can wedge, and only a reboot clears it.** It is a
+  client of the firmware's MMAL service; once that stops answering, every
+  decoder call times out and one eventually sleeps in the kernel for good,
+  in a thread that can't be killed (its process can't even exit). The
+  kiosk keeps that from freezing the screen: every mpv call runs on a queue
+  of its own, a stop or reload waits for a video that is still opening (stopping
+  the decoder mid-setup is what tipped the firmware over, and panel cuts did
+  it constantly), and a player whose commands stop returning is dropped, so
+  videos are skipped and photos go on. `pi/decoder-watchdog` (a systemd
+  service `deploy-pi.sh` installs and enables) then reboots the Pi on the
+  kernel's MMAL timeout or a thread stuck in the decoder driver for a
+  minute, not before ten minutes of uptime;
+  `touch /opt/swift-kiosk/decoder-watchdog.disabled` keeps a wedged Pi up.
 
 ## Linux gotchas
 

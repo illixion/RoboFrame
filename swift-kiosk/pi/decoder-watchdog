@@ -1,0 +1,72 @@
+#!/bin/bash
+# Reboots the Pi when its hardware video decoder wedges.
+#
+# The V4L2 decoder (bcm2835-codec) is a client of the firmware's MMAL
+# service. Once that service stops answering, every later decoder call
+# times out, mpv drops to software decoding, and sooner or later a call
+# blocks in the kernel for good: the thread can't be killed, its process
+# can't exit, and the kiosk freezes on its last frame. Only a reboot brings
+# the firmware back, so this does one as soon as either sign shows:
+#   - the kernel logs an MMAL sync timeout or a failed decoder stop;
+#   - a thread sits in the decoder driver in uninterruptible sleep for a
+#     minute (the hang can come without a log line).
+#
+# The reboot skips the orderly shutdown: that waits on the stuck process and
+# only ends when the hardware watchdog fires minutes later. The root is a
+# RAM overlay, and /opt is synced first.
+#
+# It waits until the Pi has been up ten minutes, so a wedge at boot can't
+# reboot it in a tight loop. `touch /opt/swift-kiosk/decoder-watchdog.disabled`
+# turns it off (to keep a wedged Pi up for debugging).
+set -u
+
+interval=15
+stuck_limit=4          # consecutive scans, about a minute
+min_uptime=600
+cursor=/run/decoder-watchdog.cursor
+disabled=$(dirname "$(readlink -f "$0")")/decoder-watchdog.disabled
+
+say() { echo "$*"; }
+
+reboot_now() {
+    say "rebooting: $1"
+    while [ "$(cut -d. -f1 /proc/uptime)" -lt "$min_uptime" ]; do sleep "$interval"; done
+    if [ -e "$disabled" ]; then
+        say "not rebooting: $disabled is set"
+        return
+    fi
+    sleep 2    # let log-forward ship the line above
+    sync
+    systemctl reboot --force --force
+}
+
+# A thread of any process blocked in the decoder or MMAL driver.
+stuck_in_decoder() {
+    local stat state
+    for stat in /proc/[0-9]*/task/[0-9]*/stat; do
+        state=$(cut -d' ' -f3 "$stat" 2>/dev/null) || continue
+        [ "$state" = D ] || continue
+        grep -qE 'bcm2835_codec|mmal_vchiq|vchiq_' "${stat%/stat}/stack" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+stuck=0
+while true; do
+    # The first pass reads the whole boot's kernel log, so a wedge from
+    # before this started counts too.
+    if journalctl -k -q --no-pager -o cat --cursor-file="$cursor" \
+        | grep -qE 'bcm2835_mmal_vchiq: timed out waiting for sync completion|bcm2835_codec_stop_streaming: Failed'; then
+        reboot_now "the firmware's video service stopped answering (kernel: MMAL timeout)"
+    fi
+    if stuck_in_decoder; then
+        stuck=$((stuck + 1))
+        if [ "$stuck" -ge "$stuck_limit" ]; then
+            reboot_now "a thread has been stuck in the video decoder driver for $((stuck * interval))s"
+            stuck=0
+        fi
+    else
+        stuck=0
+    fi
+    sleep "$interval"
+done

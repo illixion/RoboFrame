@@ -1,0 +1,12 @@
+[Unit]
+Description=Reboot when the hardware video decoder wedges (RoboFrame kiosk)
+
+[Service]
+ExecStart=/opt/swift-kiosk/decoder-watchdog
+Restart=always
+RestartSec=10
+OOMScoreAdjust=-900
+SyslogIdentifier=decoder-watchdog
+
+[Install]
+WantedBy=multi-user.target

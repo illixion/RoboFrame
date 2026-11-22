@@ -81,6 +81,7 @@ public final class KioskRenderer {
     private let compositor: GLCompositor
     private let text = TextSetter()
     private let player: VideoPlayer?
+    private var reportedHung = false
     private var audioPlayer: VideoPlayer?
     private let maxTextureSize: Int
 
@@ -365,8 +366,8 @@ public final class KioskRenderer {
             pendingVideo = nil
             begin(Layer(id: id, content: .photo(slot), start: now))
         case .video(let url, _):
-            guard pendingVideo?.id != id, effect == nil, let player else {
-                if self.player == nil {
+            guard pendingVideo?.id != id, effect == nil, let player = livePlayer else {
+                if livePlayer == nil {
                     // No mpv: nothing will start it, so confirm the frame as it is.
                     unplayable.insert(id)
                     session.videoStarted(id, durationMs: nil)
@@ -505,6 +506,23 @@ public final class KioskRenderer {
         owner = .none
     }
 
+    /// The video player, unless it has none or mpv stopped answering. A hung
+    /// player can't show anything again in this process (its core sleeps in
+    /// the decoder driver, and the process can't even exit until that
+    /// returns), so videos are confirmed as they are, as with no mpv, and
+    /// the photos keep going until the decoder watchdog reboots the Pi.
+    private var livePlayer: VideoPlayer? {
+        guard let player else { return nil }
+        if player.isHung {
+            if !reportedHung {
+                reportedHung = true
+                logger.log(.error, "mpv stopped answering (the video decoder is stuck); videos are skipped")
+            }
+            return nil
+        }
+        return player
+    }
+
     private func handlePlayerEvents() {
         if let player {
             for event in player.events() {
@@ -512,10 +530,12 @@ public final class KioskRenderer {
                 case (.slideshow(let id), .started):
                     guard let pending = pendingVideo, pending.id == id else { break }
                     pendingVideo = nil
-                    logger.log(.info, "video for post \(id) playing: \(player.property("video-codec") ?? "?", privacy: .public) \(player.property("width") ?? "?", privacy: .public)x\(player.property("height") ?? "?", privacy: .public), hwdec=\(player.property("hwdec-current") ?? "no", privacy: .public)")
                     begin(Layer(id: id, content: .video(pending.target, pending.url), start: now))
-                    let seconds = player.property("duration").flatMap(Double.init).flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
-                    session.videoStarted(id, durationMs: seconds.map { Int(($0 * 1_000).rounded()) })
+                    player.info { [weak self] info in
+                        guard let self else { return }
+                        logger.log(.info, "video for post \(id) playing: \(info.codec ?? "?", privacy: .public) \(info.width ?? "?", privacy: .public)x\(info.height ?? "?", privacy: .public), hwdec=\(info.hwdec ?? "no", privacy: .public)")
+                        session.videoStarted(id, durationMs: info.duration.map { Int(($0 * 1_000).rounded()) })
+                    }
                 case (.slideshow(let id), .failed(let reason)):
                     logger.log(.warning, "video for post \(id) failed: \(reason)")
                     if pendingVideo?.id == id { pendingVideo = nil }
@@ -553,11 +573,11 @@ public final class KioskRenderer {
                 stopPlayer()
                 resumeSlideshowVideo()
             }
-            if session.effect != nil, player == nil {
+            if session.effect != nil, livePlayer == nil {
                 // Nothing can play it; let the session drop it rather than
                 // asking again every frame.
                 session.effectEnded()
-            } else if let value = session.effect, let player, let target = freeVideoTarget() {
+            } else if let value = session.effect, let player = livePlayer, let target = freeVideoTarget() {
                 effect = (value, target, nil)
                 owner = .effect
                 pendingVideo = nil
