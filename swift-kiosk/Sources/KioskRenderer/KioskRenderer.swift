@@ -94,6 +94,11 @@ public final class KioskRenderer {
     private var photoSlots: [GLPhotoSlot] = []
     private var videoTargets: [GLRenderTarget] = []
     private var videoTargetRetryAt: TimeInterval = 0
+    /// When the panel last went on or off, or X changed the screen size: a
+    /// modeset. Video waits `decoderSettle` after one (see `syncSlideshow`).
+    private var displayChangedAt: TimeInterval = -.infinity
+    private var panelWasOn = true
+    static let decoderSettle: TimeInterval = 2.5
     private var decoding: Set<String> = []
     private var unplayable: Set<String> = []
     private var front: Layer?
@@ -206,6 +211,10 @@ public final class KioskRenderer {
     private func tick() {
         pollInput()
         session.expireToasts()
+        if session.isPanelOn != panelWasOn {
+            panelWasOn = session.isPanelOn
+            displayChangedAt = now
+        }
         handlePlayerEvents()
         syncEffects()
         syncSlideshow()
@@ -374,6 +383,12 @@ public final class KioskRenderer {
                 }
                 return
             }
+            // The Pi's firmware video service can stop answering for good
+            // when the decoder opens while HDMI is being reconfigured, which
+            // node-display's panel cut and wake both do. Opening it only once
+            // the display has been steady for a moment keeps a wake's video
+            // clear of the wake's own modeset.
+            guard now - displayChangedAt >= Self.decoderSettle else { return }
             guard let target = freeVideoTarget() else { return }
             pendingVideo = (id, url, target)
             owner = .slideshow(id)
@@ -872,6 +887,7 @@ public final class KioskRenderer {
         guard Int(drawableWidth) != width || Int(drawableHeight) != height, drawableWidth > 0, drawableHeight > 0 else { return }
         width = Int(drawableWidth)
         height = Int(drawableHeight)
+        displayChangedAt = now
         logger.log(.info, "screen is now \(width)x\(height)")
         clockText = ("", "")
         sensorLines = []

@@ -179,10 +179,12 @@ and 140 MB of RAM, flat. Two things about the board shape the renderer:
   decoder call times out and one eventually sleeps in the kernel for good,
   in a thread that can't be killed (its process can't even exit). The
   kiosk keeps that from freezing the screen: every mpv call runs on a queue
-  of its own, a stop or reload waits for a video that is still opening (stopping
-  the decoder mid-setup is what tipped the firmware over, and panel cuts did
-  it constantly), and a player whose commands stop returning is dropped, so
-  videos are skipped and photos go on. `pi/decoder-watchdog` (a systemd
+  of its own, a stop or reload waits for a video that is still opening, and a
+  player whose commands stop returning is dropped, so videos are skipped and
+  photos go on. What tips the firmware over is the decoder opening while HDMI
+  is reconfigured (node-display's panel cut or wake, about one in a few
+  hundred close overlaps under a stress test), so a video opens only once the
+  display has been steady for 2.5 s. `pi/decoder-watchdog` (a systemd
   service `deploy-pi.sh` installs and enables) then reboots the Pi on the
   kernel's MMAL timeout or a thread stuck in the decoder driver for a
   minute, not before ten minutes of uptime;
