@@ -183,7 +183,14 @@ function connectWebSocket() {
   }
 
   console.log(`Attempting to connect to ${WS_URL}...`);
-  ws = new WebSocket(WS_URL_WITH_TOKEN);
+  // The heartbeat only starts on 'open', so a handshake nobody answers would
+  // otherwise stay CONNECTING forever and every reconnect would dedupe on
+  // it. That happens at boot on the Pi: the connect leaves over the LAN
+  // before tailscaled is up, tailscaled then takes the route, and the
+  // upgrade request is never acked. The display keeps working locally but
+  // no reportDisplay reaches the server, so the kiosk never hears the panel
+  // come back on.
+  ws = new WebSocket(WS_URL_WITH_TOKEN, { handshakeTimeout: 10000 });
 
   ws.on('open', () => {
     console.log('Connected to WebSocket server');
