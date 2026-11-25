@@ -7,7 +7,7 @@ import { state } from './state.js';
 import { tags } from './tags.js';
 import { showToast } from './toast.js';
 import { disable } from './visibility.js';
-import { blockPost, saveFileRemote, requestNext, requestPrev, requestReshuffle } from './slideshow.js';
+import { blockPost, saveFileRemote, requestNext, requestPrev, requestReshuffle, markNavIntent } from './slideshow.js';
 import { sendDisplaySync } from './ws-client.js';
 import { openSettings, isSettingsOpen, setOpacity } from './settings.js';
 
@@ -144,6 +144,7 @@ function installKeyboard() {
 
         if (awaitingTagList) {
             if (key >= '0' && key <= '9') {
+                markNavIntent(); // the new list's first frame is one the user asked for
                 tags.set(parseInt(key, 10));
             } else {
                 showToast(`Please press a number (0-${(tags.tagsList || []).length - 1}) for the tag list.`);

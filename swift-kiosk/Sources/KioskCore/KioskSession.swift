@@ -139,6 +139,8 @@ public final class KioskSession {
     private var holdTask: Task<Void, Never>?
     private var historySeeded = false
     private var targetTask: Task<Void, Never>?
+    /// Frames still to land that the person asked for, and the deadline that bounds them.
+    private var navIntents = 0
     private var navIntentUntil: TimeInterval = 0
     private var ticker: Task<Void, Never>?
     private var lastConnected: TimeInterval
@@ -301,9 +303,23 @@ public final class KioskSession {
         connection.sendRequestNext(sessionId: Self.sessionId)
     }
 
-    /// The next frame was asked for (it replaces a post the person moved
-    /// past, blocked or reshuffled away), so it is the target at once.
-    private func markNavIntent() { navIntentUntil = now + Self.navIntentWindow }
+    /// One more frame was asked for (it replaces a post the person moved
+    /// past, blocked or reshuffled away), so it is the target at once. Each
+    /// press counts, so quick presses give every frame the bypass.
+    private func markNavIntent() {
+        navIntents = (now < navIntentUntil ? navIntents : 0) + 1
+        navIntentUntil = now + Self.navIntentWindow
+    }
+
+    private func takeNavIntent() -> Bool {
+        guard navIntents > 0, now < navIntentUntil else {
+            navIntents = 0
+            return false
+        }
+        navIntents -= 1
+        return true
+    }
+
     public func reshuffle() {
         markNavIntent()
         connection.sendReshuffle(sessionId: Self.sessionId)
@@ -570,8 +586,7 @@ public final class KioskSession {
     private func retarget(_ displayed: RAVESlideshowDisplayedMedia) {
         targetTask?.cancel()
         targetTask = nil
-        let asked = now < navIntentUntil
-        if asked { navIntentUntil = 0 }
+        let asked = takeNavIntent()
         guard target != nil, !asked else {
             target = displayed
             return

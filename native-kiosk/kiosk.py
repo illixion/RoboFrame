@@ -794,18 +794,21 @@ class Kiosk:
         # save just as an image switches still targets the post they were
         # looking at — mirrors the web kiosk's state.currentPost being set
         # ~1s after crossfade start (slideshow.js finishLoad). A post the
-        # user asked for (NEXT/PREVIOUS) promotes immediately instead — see
-        # `_nav_intent_until`. `kind` is one of "still" | "video" |
+        # user asked for (NEXT/PREVIOUS, block, reshuffle, tag list) promotes
+        # immediately instead — see `_mark_nav_intent`. `kind` is one of "still" | "video" |
         # "animated" (a still image, a true video post, or an animated
         # source played as a clip) — it picks how the save toast fetches its
         # preview thumbnail.
         self.save_target = (None, "still")
         self._save_id_timer = None
-        # Deadline (monotonic) until which the next post to land counts as
-        # user-requested. A NEXT/PREVIOUS press arms it, so SPACE straight
-        # after the press hits the post now on screen rather than the one
-        # navigated away from. Bounded so a nav whose frame never arrives
-        # can't strip the grace window off a later automatic advance.
+        # How many of the next posts to land count as user-requested, and the
+        # monotonic deadline that bounds them. Each press that changes the
+        # post (NEXT/PREVIOUS, block, reshuffle, tag list) adds one, so SPACE
+        # straight after hits the post now on screen rather than the one
+        # navigated away from, however many presses came in quick succession.
+        # Bounded so a request whose frame never arrives can't strip the grace
+        # window off a later automatic advance.
+        self._nav_intents = 0
         self._nav_intent_until = 0.0
         self.server_off = False          # server displayState=off
         self.force_off = False           # local 'p'-key toggle (panel off)
@@ -2341,15 +2344,21 @@ class Kiosk:
         self._roll_save_id(pid, kind="still")
 
     def _mark_nav_intent(self):
-        """Arm the next post to land as user-requested, so `_roll_save_id`
+        """Arm one more post to land as user-requested, so `_roll_save_id`
         promotes the save target the moment it renders instead of waiting out
-        the grace window. Called from the NEXT/PREVIOUS key handlers."""
-        self._nav_intent_until = time.monotonic() + self.NAV_INTENT_WINDOW
+        the grace window. Called from every key handler that makes the server
+        (or this client) put a different post on screen."""
+        now = time.monotonic()
+        live = self._nav_intents if now < self._nav_intent_until else 0
+        self._nav_intents = live + 1
+        self._nav_intent_until = now + self.NAV_INTENT_WINDOW
 
     def _take_nav_intent(self):
-        live = self._nav_intent_until > time.monotonic()
-        self._nav_intent_until = 0.0
-        return live
+        if self._nav_intents <= 0 or time.monotonic() >= self._nav_intent_until:
+            self._nav_intents = 0
+            return False
+        self._nav_intents -= 1
+        return True
 
     def _roll_save_id(self, pid, kind="still"):
         """Advance the SPACE-key save target to `pid` after a grace window —
@@ -2395,6 +2404,7 @@ class Kiosk:
             if pygame.K_0 <= k <= pygame.K_9:
                 n = k - pygame.K_0
                 if self.tag_lists_count and n < self.tag_lists_count:
+                    self._mark_nav_intent()
                     self.conn.send({"sessionId": KIOSK_SESSION_ID,
                                     "action": "setTagList",
                                     "payload": {"listNumber": n}})
@@ -2411,6 +2421,9 @@ class Kiosk:
             os.execv(sys.executable, [sys.executable, *sys.argv])
         elif k == pygame.K_b:
             if self.current_id:
+                # The server advances off the blocked post; that frame is one
+                # the user asked for.
+                self._mark_nav_intent()
                 self.conn.send({"action": "block",
                                 "payload": {"id": self.current_id}})
                 self.toast(f"Blocked {self.current_id}")
@@ -2433,6 +2446,7 @@ class Kiosk:
                 threading.Thread(target=self._save_remote,
                                  args=(pid, kind), daemon=True).start()
         elif k == pygame.K_t:
+            self._mark_nav_intent()
             self.conn.send({"sessionId": KIOSK_SESSION_ID, "action": "reshuffle"})
             self.toast("Reshuffling")
         elif k == pygame.K_RIGHT:

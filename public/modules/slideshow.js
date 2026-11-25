@@ -103,23 +103,30 @@ let inFlightPostId = null;
 // a rendered frame on an automatic advance: a save pressed just as the post
 // switches still targets the one the user was looking at.
 const CURRENT_POST_GRACE_MS = 1000;
-// A post the user asked for (ArrowRight / ArrowLeft) skips that grace window:
-// they navigated to it deliberately, so a save pressed right after the press
-// must hit it, not the post they navigated away from. The deadline bounds the
-// wait for the server's `playback` reply, so a nav whose frame never lands
-// can't strip the grace off a later automatic advance. Mirrors native-kiosk's
-// _nav_intent_until.
+// A post the user asked for (ArrowRight / ArrowLeft, block, reshuffle, tag
+// list) skips that grace window: they navigated to it deliberately, so a save
+// pressed right after the press must hit it, not the post they navigated away
+// from. Each press counts once, so several quick presses give every frame
+// they ask for the bypass, not just the first. The deadline (reset by every
+// press) bounds the wait for the server's `playback` replies, so a request
+// whose frame never lands can't strip the grace off a later automatic advance.
+// Mirrors native-kiosk's _nav_intents.
 const NAV_INTENT_WINDOW_MS = 10000;
+let navIntents = 0;
 let navIntentUntil = 0;
 
-function markNavIntent() {
+export function markNavIntent() {
+    navIntents = Date.now() < navIntentUntil ? navIntents + 1 : 1;
     navIntentUntil = Date.now() + NAV_INTENT_WINDOW_MS;
 }
 
 function takeNavIntent() {
-    const live = Date.now() < navIntentUntil;
-    navIntentUntil = 0;
-    return live;
+    if (navIntents <= 0 || Date.now() >= navIntentUntil) {
+        navIntents = 0;
+        return false;
+    }
+    navIntents -= 1;
+    return true;
 }
 
 // Drop every cached blob and abort in-flight prefetch. Used when a
@@ -485,6 +492,7 @@ export function requestPrev() {
 }
 
 export function requestReshuffle() {
+    markNavIntent();
     if (state.socket && state.socket.readyState === WebSocket.OPEN) {
         state.socket.send(JSON.stringify({ sessionId: KIOSK_SESSION_ID, action: 'reshuffle' }));
     }
@@ -532,6 +540,9 @@ export function blockPost() {
     // this post, and the preview is fetched by id either way.
     const blocked = state.currentPost;
     const preview = previewUrlFor(blocked);
+    // The server advances the channel off the blocked post, and that frame is
+    // one the user asked for.
+    markNavIntent();
     if (state.socket && state.socket.readyState === WebSocket.OPEN) {
         state.socket.send(JSON.stringify({ action: 'block', payload: { id: blocked } }));
     }
