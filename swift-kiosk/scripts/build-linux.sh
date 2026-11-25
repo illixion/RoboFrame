@@ -30,7 +30,7 @@ mkdir -p "$cache/src/RoboFrame" "$cache/build"
 sync() {
     [ -d "$1" ] || { echo "build-linux: $1 not found (expected beside RoboFrame)" >&2; exit 1; }
     rsync -a --delete --exclude .git --exclude .build --exclude build --exclude dist \
-        --exclude DerivedData --exclude node_modules "$1/" "$2/"
+        --exclude DerivedData --exclude node_modules --exclude /target "$1/" "$2/"
 }
 for package in RAVESDK DebugTrace vergence; do
     sync "$projects/$package" "$cache/src/$package"
